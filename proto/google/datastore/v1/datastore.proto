@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+package google.datastore.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+service Datastore {
+  // Just starting with a simple Ping method for testing connection
+  rpc Ping(PingRequest) returns (PingResponse);
+  
+  // The basic Datastore methods we'll implement later
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc Lookup(LookupRequest) returns (LookupResponse);
+  rpc RunQuery(RunQueryRequest) returns (RunQueryResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+}
+
+// Custom message for testing connection
+message PingRequest {
+  string message = 1;
+}
+
+message PingResponse {
+  string message = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// Basic messages needed for BeginTransaction
+message BeginTransactionRequest {
+  string project_id = 1;
+  string database_id = 2;
+  TransactionOptions transaction_options = 3;
+}
+
+message BeginTransactionResponse {
+  bytes transaction = 1;
+}
+
+message TransactionOptions {
+  oneof mode {
+    ReadWrite read_write = 1;
+    ReadOnly read_only = 2;
+  }
+  
+  message ReadWrite {
+    bytes previous_transaction = 1;
+  }
+  
+  message ReadOnly {
+    google.protobuf.Timestamp read_time = 1;
+  }
+}
+
+// Placeholder for other message types we'll implement later
+message LookupRequest {
+  string project_id = 1;
+  string database_id = 2;
+  repeated Key keys = 3;
+}
+
+message LookupResponse {
+  repeated EntityResult found = 1;
+  repeated EntityResult missing = 2;
+  repeated Key deferred = 3;
+}
+
+// Simplified versions of core data types
+message Key {
+  PartitionId partition_id = 1;
+  repeated PathElement path = 2;
+  
+  message PathElement {
+    string kind = 1;
+    oneof id_type {
+      int64 id = 2;
+      string name = 3;
+    }
+  }
+}
+
+message PartitionId {
+  string project_id = 1;
+  string database_id = 2;
+  string namespace_id = 3;
+}
+
+message EntityResult {
+  Entity entity = 1;
+  enum ResultType {
+    RESULT_TYPE_UNSPECIFIED = 0;
+    FULL = 1;
+    PROJECTION = 2;
+    KEY_ONLY = 3;
+  }
+  ResultType result_type = 2;
+}
+
+message Entity {
+  Key key = 1;
+  map<string, Value> properties = 2;
+}
+
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+message Value {
+  oneof value_type {
+    NullValue null_value = 1;  // Now just use the simple name
+    bool boolean_value = 2;
+    int64 integer_value = 3;
+    double double_value = 4;
+    google.protobuf.Timestamp timestamp_value = 5;
+    Key key_value = 6;
+    string string_value = 7;
+    bytes blob_value = 8;
+    Entity entity_value = 9;
+    ArrayValue array_value = 10;
+  }
+}
+
+message ArrayValue {
+  repeated Value values = 1;
+}
+
+// Placeholders for RunQuery
+message RunQueryRequest {
+  string project_id = 1;
+  string database_id = 2;
+  oneof query_type {
+    Query query = 3;
+    GqlQuery gql_query = 4;
+  }
+}
+
+message Query {
+  repeated KindExpression kind = 1;
+  Filter filter = 2;
+}
+
+message KindExpression {
+  string name = 1;
+}
+
+message Filter {
+  oneof filter_type {
+    CompositeFilter composite_filter = 1;
+    PropertyFilter property_filter = 2;
+  }
+}
+
+message CompositeFilter {
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;
+    AND = 1;
+    OR = 2;
+  }
+  Operator op = 1;
+  repeated Filter filters = 2;
+}
+
+message PropertyFilter {
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;
+    LESS_THAN = 1;
+    LESS_THAN_OR_EQUAL = 2;
+    GREATER_THAN = 3;
+    GREATER_THAN_OR_EQUAL = 4;
+    EQUAL = 5;
+    HAS_ANCESTOR = 6;
+  }
+  PropertyReference property = 1;
+  Operator op = 2;
+  Value value = 3;
+}
+
+message PropertyReference {
+  string name = 1;
+}
+
+message GqlQuery {
+  string query_string = 1;
+  bool allow_literals = 2;
+  map<string, GqlQueryParameter> named_bindings = 3;
+  repeated GqlQueryParameter positional_bindings = 4;
+}
+
+message GqlQueryParameter {
+  oneof parameter_type {
+    Value value = 1;
+    bytes cursor = 2;
+  }
+}
+
+message RunQueryResponse {
+  QueryResultBatch batch = 1;
+}
+
+message QueryResultBatch {
+  repeated EntityResult entity_results = 1;
+  enum MoreResultsType {
+    MORE_RESULTS_TYPE_UNSPECIFIED = 0;
+    NOT_FINISHED = 1;
+    MORE_RESULTS_AFTER_LIMIT = 2;
+    NO_MORE_RESULTS = 3;
+  }
+  MoreResultsType more_results = 2;
+  bytes end_cursor = 3;
+}
+
+// Basic Commit
+message CommitRequest {
+  string project_id = 1;
+  string database_id = 2;
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    TRANSACTIONAL = 1;
+    NON_TRANSACTIONAL = 2;
+  }
+  Mode mode = 3;
+  repeated Mutation mutations = 4;
+  oneof transaction_selector {
+    bytes transaction = 5;
+    TransactionOptions single_use_transaction = 6;
+  }
+}
+
+message Mutation {
+  oneof operation {
+    Entity insert = 1;
+    Entity update = 2;
+    Entity upsert = 3;
+    Key delete = 4;
+  }
+}
+
+message CommitResponse {
+  repeated MutationResult mutation_results = 1;
+  int32 index_updates = 2;
+}
+
+message MutationResult {
+  Key key = 1;
+}
+
+// Rollback
+message RollbackRequest {
+  string project_id = 1;
+  string database_id = 2;
+  bytes transaction = 3;
+}
+
+message RollbackResponse {
+  // Empty response
+}

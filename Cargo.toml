@@ -1,0 +1,21 @@
+[package]
+name = "datastore-emulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tonic = "0.9"
+prost = "0.11"
+prost-types = "0.11"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+uuid = { version = "1.3", features = ["v4"] }
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.10"
+
+[build-dependencies]
+tonic-build = "0.9"
