@@ -114,7 +114,15 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
-        println!("RunQuery request for project: {}", req.project_id);
+
+        println!("RunQuery request for project: {}, database_id: {}, partition_id: {:?}, read_options: {:?}, property_mask: {:?}, query_type: {:?}",
+            req.project_id,
+            req.database_id,
+            req.partition_id,
+            req.read_options,
+            req.property_mask,
+            req.query_type,
+            );
         
         // Return an empty result batch for now
         let batch = google::datastore::v1::QueryResultBatch {

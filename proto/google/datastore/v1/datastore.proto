@@ -5,6 +5,26 @@ package google.datastore.v1;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
 
+
+import "google/protobuf/descriptor.proto";
+
+
+extend google.protobuf.FieldOptions {
+  repeated FieldBehavior field_behavior = 1052 [packed = false];
+}
+
+enum FieldBehavior {
+  FIELD_BEHAVIOR_UNSPECIFIED = 0;
+  OPTIONAL = 1;
+  REQUIRED = 2;
+  OUTPUT_ONLY = 3;
+  INPUT_ONLY = 4;
+  IMMUTABLE = 5;
+  UNORDERED_LIST = 6;
+  NON_EMPTY_DEFAULT = 7;
+  IDENTIFIER = 8;
+}
+
 service Datastore {
   // Just starting with a simple Ping method for testing connection
   rpc Ping(PingRequest) returns (PingResponse);
@@ -125,14 +145,46 @@ message ArrayValue {
   repeated Value values = 1;
 }
 
-// Placeholders for RunQuery
+message ReadOptions {
+  enum ReadConsistency {
+    // Unspecified. This value must not be used.
+    READ_CONSISTENCY_UNSPECIFIED = 0;
+
+    // Strong consistency.
+    STRONG = 1;
+
+    // Eventual consistency.
+    EVENTUAL = 2;
+  }
+
+  oneof consistency_type {
+    ReadConsistency read_consistency = 1;
+    bytes transaction = 2;
+    TransactionOptions new_transaction = 3;
+    google.protobuf.Timestamp read_time = 4;
+  }
+}
+
+message PropertyMask {
+  repeated string paths = 1;
+}
+
+message ExplainOptions {
+  bool analyze = 1;
+}
+
 message RunQueryRequest {
-  string project_id = 1;
-  string database_id = 2;
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  PartitionId partition_id = 2;
+  ReadOptions read_options = 1;
+
   oneof query_type {
     Query query = 3;
-    GqlQuery gql_query = 4;
+    GqlQuery gql_query = 7;
   }
+  PropertyMask property_mask = 10;
+  ExplainOptions explain_options = 12 [(field_behavior) = OPTIONAL];
 }
 
 message Query {
@@ -245,7 +297,6 @@ message MutationResult {
   Key key = 1;
 }
 
-// Rollback
 message RollbackRequest {
   string project_id = 1;
   string database_id = 2;
@@ -253,5 +304,5 @@ message RollbackRequest {
 }
 
 message RollbackResponse {
-  // Empty response
 }
+
