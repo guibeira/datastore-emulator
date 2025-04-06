@@ -12,10 +12,13 @@
 # limitations under the License.
 
 import argparse
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pprint import pprint
 
+os.environ["GRPC_VERBOSITY"] = "DEBUG"
+os.environ["GRPC_TRACE"] = "all"
 from google.cloud import datastore  # noqa: I100
 from google.cloud.datastore.query import PropertyFilter
 
@@ -30,18 +33,6 @@ def _preamble():
 
     # [END datastore_size_coloration_query]
     assert client is not None
-
-
-def in_query(client):
-    # [START datastore_in_query]
-    query = client.query(kind="Task")
-    # query.add_filter("tag", "IN", ["learn", "study"])
-
-    query.add_filter(filter=PropertyFilter("organizer_id", "=", "learn"))
-    # query.add_filter(property_name="tag", operator="IN", value=["learn", "study"])
-    # [END datastore_in_query]
-
-    return list(query.fetch())
 
 
 def not_equals_query(client):
@@ -69,7 +60,6 @@ def query_with_readtime(client):
 
     # Fetch an entity with read_time
     task_key = client.key("Task", "sampletask")
-    __import__("pdb").set_trace()
     entity = client.get(task_key, read_time=read_time)
 
     # Query Task entities with read_time
@@ -452,6 +442,17 @@ def explain_analyze_aggregation(client):
     # [END datastore_query_explain_analyze_aggregation]
 
 
+def in_query(client):
+    # [START datastore_in_query]
+    query = client.query(kind="Task")
+    # query.add_filter("tag", "IN", ["learn", "study"])
+    query.add_filter(filter=PropertyFilter("confirmed", "=", True))
+    # query.add_filter(property_name="tag", operator="IN", value=["learn", "study"])
+    # [END datastore_in_query]
+
+    return list(query.fetch())
+
+
 def insert_examples(client):
     # [START datastore_insert_examples]
     # Example 1: Insert an entity with a specified key
@@ -467,46 +468,46 @@ def insert_examples(client):
     )
     client.put(task1)
 
-    # Example 2: Insert an entity with auto-generated ID
-    task2 = datastore.Entity(client.key("Task"))  # Incomplete key - ID will be auto-assigned
-    task2.update(
-        {
-            "description": "Finish project",
-            "created": datetime.now(timezone.utc),
-            "done": False,
-            "priority": 5,
-            "tags": ["work", "urgent"],
-        }
-    )
-    client.put(task2)
-    print(f"Auto-assigned ID: {task2.key.id}")
+    # # Example 2: Insert an entity with auto-generated ID
+    # task2 = datastore.Entity(client.key("Task"))  # Incomplete key - ID will be auto-assigned
+    # task2.update(
+    #     {
+    #         "description": "Finish project",
+    #         "created": datetime.now(timezone.utc),
+    #         "done": False,
+    #         "priority": 5,
+    #         "tags": ["work", "urgent"],
+    #     }
+    # )
+    # client.put(task2)
+    # print(f"Auto-assigned ID: {task2.key.id}")
 
-    # Example 3: Batch insert multiple entities
-    task3 = datastore.Entity(client.key("Task", "sample_task_3"))
-    task3["description"] = "Schedule meeting"
-    task3["priority"] = 3
+    # # Example 3: Batch insert multiple entities
+    # task3 = datastore.Entity(client.key("Task", "sample_task_3"))
+    # task3["description"] = "Schedule meeting"
+    # task3["priority"] = 3
 
-    task4 = datastore.Entity(client.key("Task", "sample_task_4"))
-    task4["description"] = "Call plumber"
-    task4["priority"] = 2
+    # task4 = datastore.Entity(client.key("Task", "sample_task_4"))
+    # task4["description"] = "Call plumber"
+    # task4["priority"] = 2
 
-    batch = [task3, task4]
-    client.put_multi(batch)
+    # batch = [task3, task4]
+    # client.put_multi(batch)
 
-    # Example 4: Insert entity with nested data
-    task5 = datastore.Entity(client.key("Task", "sample_task_5"))
-    task5.update(
-        {
-            "description": "Plan vacation",
-            "details": {"location": "Hawaii", "duration_days": 7, "budget": 3000},
-            "participants": ["Alice", "Bob"],
-            "confirmed": True,
-        }
-    )
-    client.put(task5)
+    # # Example 4: Insert entity with nested data
+    # task5 = datastore.Entity(client.key("Task", "sample_task_5"))
+    # task5.update(
+    #     {
+    #         "description": "Plan vacation",
+    #         "details": {"location": "Hawaii", "duration_days": 7, "budget": 3000},
+    #         "participants": ["Alice", "Bob"],
+    #         "confirmed": True,
+    #     }
+    # )
+    # client.put(task5)
     # [END datastore_insert_examples]
 
-    return [task1, task2, task3, task4, task5]
+    # return [task1, task2, task3, task4, task5]
 
 
 def explain_aggregation(client):
@@ -529,8 +530,8 @@ def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
-        # insert_examples
-        in_query,
+        insert_examples,
+        # in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,

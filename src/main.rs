@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 use uuid::Uuid;
 
 // Import the generated code
@@ -17,11 +17,8 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    BeginTransactionRequest, BeginTransactionResponse,
-    CommitRequest, CommitResponse,
-    LookupRequest, LookupResponse,
-    PingRequest, PingResponse,
-    RollbackRequest, RollbackResponse,
+    BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse,
+    LookupRequest, LookupResponse, PingRequest, PingResponse, RollbackRequest, RollbackResponse,
     RunQueryRequest, RunQueryResponse,
 };
 
@@ -47,24 +44,22 @@ impl Default for DatastoreEmulator {
 
 #[tonic::async_trait]
 impl DatastoreService for DatastoreEmulator {
-    async fn ping(
-        &self,
-        request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         let req = request.into_inner();
         let now = SystemTime::now();
         let timestamp = prost_types::Timestamp {
-            seconds: now.duration_since(SystemTime::UNIX_EPOCH)
+            seconds: now
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
             nanos: 0,
         };
-        
+
         let response = PingResponse {
             message: format!("Hello {}! Datastore emulator is running.", req.message),
             server_time: Some(timestamp),
         };
-        
+
         Ok(Response::new(response))
     }
 
@@ -74,17 +69,17 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         let req = request.into_inner();
         println!("Beginning transaction for project: {}", req.project_id);
-        
+
         // Generate a unique transaction ID
         let transaction_id = Uuid::new_v4().to_string();
         let transaction_bytes = transaction_id.clone().into_bytes();
-        
+
         // Store the transaction
         {
             let mut storage = self.storage.lock().unwrap();
             storage.transactions.insert(transaction_id, Vec::new());
         }
-        
+
         Ok(Response::new(BeginTransactionResponse {
             transaction: transaction_bytes,
         }))
@@ -96,10 +91,10 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
         println!("Lookup request for project: {}", req.project_id);
-        
+
         // This is just a placeholder implementation that returns an empty response
         // We'll implement the actual lookup logic later
-        
+
         Ok(Response::new(LookupResponse {
             found: Vec::new(),
             missing: Vec::new(),
@@ -114,16 +109,8 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
+        dbg!(&req);
 
-        println!("RunQuery request for project: {}, database_id: {}, partition_id: {:?}, read_options: {:?}, property_mask: {:?}, query_type: {:?}",
-            req.project_id,
-            req.database_id,
-            req.partition_id,
-            req.read_options,
-            req.property_mask,
-            req.query_type,
-            );
-        
         // Return an empty result batch for now
         let batch = google::datastore::v1::QueryResultBatch {
             entity_results: Vec::new(),
@@ -135,7 +122,7 @@ impl DatastoreService for DatastoreEmulator {
             // snapshot_version: 0,
             // read_time: None,
         };
-        
+
         Ok(Response::new(RunQueryResponse {
             batch: Some(batch),
             // query: None,
@@ -148,16 +135,15 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
+        dbg!(&request);
         let req = request.into_inner();
-        println!("Commit request for project: {}", req.project_id);
-        
-        // For now, just acknowledge the mutations without actually processing them
-        let mutation_results = req.mutations.iter().map(|_| {
-            google::datastore::v1::MutationResult {
-                key: None,
-            }
-        }).collect();
-        
+        //For now, just acknowledge the mutations without actually processing them
+        let mutation_results = req
+            .mutations
+            .iter()
+            .map(|_| google::datastore::v1::MutationResult { key: None })
+            .collect();
+
         Ok(Response::new(CommitResponse {
             mutation_results,
             index_updates: 0,
@@ -170,16 +156,16 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<RollbackResponse>, Status> {
         let req = request.into_inner();
         println!("Rollback request for project: {}", req.project_id);
-        
+
         // Convert transaction ID bytes back to string
         let transaction_id = String::from_utf8_lossy(&req.transaction);
-        
+
         // Remove the transaction from storage
         {
             let mut storage = self.storage.lock().unwrap();
             storage.transactions.remove(&transaction_id.to_string());
         }
-        
+
         Ok(Response::new(RollbackResponse {}))
     }
 
@@ -211,13 +197,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     let emulator = DatastoreEmulator::default();
-    
+
     println!("Datastore emulator listening on {}", addr);
-    
+
     Server::builder()
         .add_service(DatastoreServer::new(emulator))
-        .serve(addr)                           
+        .serve(addr)
         .await?;
-    
+
     Ok(())
 }
