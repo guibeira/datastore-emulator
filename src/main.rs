@@ -90,7 +90,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
-        println!("Lookup request for project: {}", req.project_id);
+        dbg!(&req);
 
         // This is just a placeholder implementation that returns an empty response
         // We'll implement the actual lookup logic later

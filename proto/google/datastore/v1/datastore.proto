@@ -75,9 +75,11 @@ message TransactionOptions {
 
 // Placeholder for other message types we'll implement later
 message LookupRequest {
-  string project_id = 1;
-  string database_id = 2;
-  repeated Key keys = 3;
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  ReadOptions read_options = 1;
+  repeated Key keys = 3 [(field_behavior) = REQUIRED];
+  PropertyMask property_mask = 5;
 }
 
 message LookupResponse {
