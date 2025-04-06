@@ -322,7 +322,10 @@ message PropertyFilter {
     GREATER_THAN = 3;
     GREATER_THAN_OR_EQUAL = 4;
     EQUAL = 5;
-    HAS_ANCESTOR = 6;
+    IN = 6;
+    NOT_EQUAL = 9;
+    HAS_ANCESTOR = 11;
+    NOT_IN = 13;
   }
   PropertyReference property = 1;
   Operator op = 2;
