@@ -19,7 +19,7 @@ use google::datastore::v1::datastore_server::{Datastore as DatastoreService, Dat
 use google::datastore::v1::{
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse,
     LookupRequest, LookupResponse, PingRequest, PingResponse, RollbackRequest, RollbackResponse,
-    RunQueryRequest, RunQueryResponse,
+    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
 
 // The in-memory storage for our emulator
@@ -68,6 +68,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         let req = request.into_inner();
+        dbg!(&req);
         println!("Beginning transaction for project: {}", req.project_id);
 
         // Generate a unique transaction ID
@@ -136,8 +137,8 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
-        println!("---");
+        // dbg!(&req);
+        // println!("---");
         //For now, just acknowledge the mutations without actually processing them
         let mutation_results = req
             .mutations
@@ -185,12 +186,31 @@ impl DatastoreService for DatastoreEmulator {
     //     Err(Status::unimplemented("Not yet implemented"))
     // }
 
-    // async fn run_aggregation_query(
-    //     &self,
-    //     _request: Request<google::datastore::v1::RunAggregationQueryRequest>,
-    // ) -> Result<Response<google::datastore::v1::RunAggregationQueryResponse>, Status> {
-    //     Err(Status::unimplemented("Not yet implemented"))
-    // }
+    async fn run_aggregation_query(
+        &self,
+        request: Request<RunAggregationQueryRequest>,
+    ) -> Result<Response<RunAggregationQueryResponse>, Status> {
+        let req = request.into_inner();
+        dbg!(&req);
+
+        // Return an empty result batch for now
+        let batch = google::datastore::v1::AggregationResultBatch {
+            aggregation_results: Vec::new(),
+            more_results: 3, // NO_MORE_RESULTS
+            // skipped_results: 0,
+            // skipped_cursor: Vec::new(),
+            // entity_result_type: 0,
+            // snapshot_version: 0,
+            read_time: None,
+        };
+
+        Ok(Response::new(RunAggregationQueryResponse {
+            batch: Some(batch),
+            query: None,
+            transaction: Vec::new(),
+            explain_metrics: None,
+        }))
+    }
 }
 
 #[tokio::main]

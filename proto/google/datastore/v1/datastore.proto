@@ -4,9 +4,9 @@ package google.datastore.v1;
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
-
-
+import "google/protobuf/struct.proto";
 import "google/protobuf/descriptor.proto";
+import "google/protobuf/duration.proto";
 
 
 extend google.protobuf.FieldOptions {
@@ -35,6 +35,7 @@ service Datastore {
   rpc RunQuery(RunQueryRequest) returns (RunQueryResponse);
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc RunAggregationQuery(RunAggregationQueryRequest) returns (RunAggregationQueryResponse);
 }
 
 // Custom message for testing connection
@@ -47,11 +48,278 @@ message PingResponse {
   google.protobuf.Timestamp server_time = 2;
 }
 
+message RunAggregationQueryRequest {
+  // Required. The ID of the project against which to make the request.
+  string project_id = 8 [(field_behavior) = REQUIRED];
+
+  // The ID of the database against which to make the request.
+  //
+  // '(default)' is not allowed; please use empty string '' to refer the default
+  // database.
+  string database_id = 9;
+
+  // Entities are partitioned into subsets, identified by a partition ID.
+  // Queries are scoped to a single partition.
+  // This partition ID is normalized with the standard default context
+  // partition ID.
+  PartitionId partition_id = 2;
+
+  // The options for this query.
+  ReadOptions read_options = 1;
+
+  // The type of query.
+  oneof query_type {
+    // The query to run.
+    AggregationQuery aggregation_query = 3;
+
+    // The GQL query to run. This query must be an aggregation query.
+    GqlQuery gql_query = 7;
+  }
+
+  // Optional. Explain options for the query. If set, additional query
+  // statistics will be returned. If not, only query results will be returned.
+  ExplainOptions explain_options = 11 [(field_behavior) = OPTIONAL];
+}
+message AggregationResult {
+  // The result of the aggregation functions, ex: `COUNT(*) AS total_entities`.
+  //
+  // The key is the
+  // [alias][google.datastore.v1.AggregationQuery.Aggregation.alias] assigned to
+  // the aggregation function on input and the size of this map equals the
+  // number of aggregation functions in the query.
+  map<string, Value> aggregate_properties = 2;
+}
+
+// A batch of aggregation results produced by an aggregation query.
+message AggregationResultBatch {
+  // The aggregation results for this batch.
+  repeated AggregationResult aggregation_results = 1;
+
+  // The state of the query after the current batch.
+  // Only COUNT(*) aggregations are supported in the initial launch. Therefore,
+  // expected result type is limited to `NO_MORE_RESULTS`.
+  QueryResultBatch.MoreResultsType more_results = 2;
+
+  // Read timestamp this batch was returned from.
+  //
+  // In a single transaction, subsequent query result batches for the same query
+  // can have a greater timestamp. Each batch's read timestamp
+  // is valid for all preceding batches.
+  google.protobuf.Timestamp read_time = 3;
+}
+
+message AggregationQuery {
+  // Defines an aggregation that produces a single result.
+  message Aggregation {
+    // Count of entities that match the query.
+    //
+    // The `COUNT(*)` aggregation function operates on the entire entity
+    // so it does not require a field reference.
+    message Count {
+      // Optional. Optional constraint on the maximum number of entities to
+      // count.
+      //
+      // This provides a way to set an upper bound on the number of entities
+      // to scan, limiting latency, and cost.
+      //
+      // Unspecified is interpreted as no bound.
+      //
+      // If a zero value is provided, a count result of zero should always be
+      // expected.
+      //
+      // High-Level Example:
+      //
+      // ```
+      // AGGREGATE COUNT_UP_TO(1000) OVER ( SELECT * FROM k );
+      // ```
+      //
+      // Requires:
+      //
+      // * Must be non-negative when present.
+      google.protobuf.Int64Value up_to = 1
+          [(field_behavior) = OPTIONAL];
+    }
+
+    // Sum of the values of the requested property.
+    //
+    // * Only numeric values will be aggregated. All non-numeric values
+    // including `NULL` are skipped.
+    //
+    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
+    // follows IEEE-754 standards.
+    //
+    // * If the aggregated value set is empty, returns 0.
+    //
+    // * Returns a 64-bit integer if all aggregated numbers are integers and the
+    // sum result does not overflow. Otherwise, the result is returned as a
+    // double. Note that even if all the aggregated values are integers, the
+    // result is returned as a double if it cannot fit within a 64-bit signed
+    // integer. When this occurs, the returned value will lose precision.
+    //
+    // * When underflow occurs, floating-point aggregation is non-deterministic.
+    // This means that running the same query repeatedly without any changes to
+    // the underlying values could produce slightly different results each
+    // time. In those cases, values should be stored as integers over
+    // floating-point numbers.
+    message Sum {
+      // The property to aggregate on.
+      PropertyReference property = 1;
+    }
+
+    // Average of the values of the requested property.
+    //
+    // * Only numeric values will be aggregated. All non-numeric values
+    // including `NULL` are skipped.
+    //
+    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
+    // follows IEEE-754 standards.
+    //
+    // * If the aggregated value set is empty, returns `NULL`.
+    //
+    // * Always returns the result as a double.
+    message Avg {
+      // The property to aggregate on.
+      PropertyReference property = 1;
+    }
+
+    // The type of aggregation to perform, required.
+    oneof operator {
+      // Count aggregator.
+      Count count = 1;
+
+      // Sum aggregator.
+      Sum sum = 2;
+
+      // Average aggregator.
+      Avg avg = 3;
+    }
+
+    // Optional. Optional name of the property to store the result of the
+    // aggregation.
+    //
+    // If not provided, Datastore will pick a default name following the format
+    // `property_<incremental_id++>`. For example:
+    //
+    // ```
+    // AGGREGATE
+    //   COUNT_UP_TO(1) AS count_up_to_1,
+    //   COUNT_UP_TO(2),
+    //   COUNT_UP_TO(3) AS count_up_to_3,
+    //   COUNT(*)
+    // OVER (
+    //   ...
+    // );
+    // ```
+    //
+    // becomes:
+    //
+    // ```
+    // AGGREGATE
+    //   COUNT_UP_TO(1) AS count_up_to_1,
+    //   COUNT_UP_TO(2) AS property_1,
+    //   COUNT_UP_TO(3) AS count_up_to_3,
+    //   COUNT(*) AS property_2
+    // OVER (
+    //   ...
+    // );
+    // ```
+    //
+    // Requires:
+    //
+    // * Must be unique across all aggregation aliases.
+    // * Conform to [entity property
+    // name][google.datastore.v1.Entity.properties] limitations.
+    string alias = 7 [(field_behavior) = OPTIONAL];
+  }
+
+  // The base query to aggregate over.
+  oneof query_type {
+    // Nested query for aggregation
+    Query nested_query = 1;
+  }
+
+  // Optional. Series of aggregations to apply over the results of the
+  // `nested_query`.
+  //
+  // Requires:
+  //
+  // * A minimum of one and maximum of five aggregations per query.
+  repeated Aggregation aggregations = 3
+      [(field_behavior) = OPTIONAL];
+}
+
+message PlanSummary {
+  // The indexes selected for the query. For example:
+  //  [
+  //    {"query_scope": "Collection", "properties": "(foo ASC, __name__ ASC)"},
+  //    {"query_scope": "Collection", "properties": "(bar ASC, __name__ ASC)"}
+  //  ]
+  repeated google.protobuf.Struct indexes_used = 1;
+}
+
+message ExecutionStats {
+  // Total number of results returned, including documents, projections,
+  // aggregation results, keys.
+  int64 results_returned = 1;
+
+  // Total time to execute the query in the backend.
+  google.protobuf.Duration execution_duration = 3;
+
+  // Total billable read operations.
+  int64 read_operations = 4;
+
+  // Debugging statistics from the execution of the query. Note that the
+  // debugging stats are subject to change as Firestore evolves. It could
+  // include:
+  //  {
+  //    "indexes_entries_scanned": "1000",
+  //    "documents_scanned": "20",
+  //    "billing_details" : {
+  //       "documents_billable": "20",
+  //       "index_entries_billable": "1000",
+  //       "min_query_cost": "0"
+  //    }
+  //  }
+  google.protobuf.Struct debug_stats = 5;
+}
+message ExplainMetrics {
+  // Planning phase information for the query.
+  PlanSummary plan_summary = 1;
+
+  // Aggregated stats from the execution of the query. Only present when
+  // [ExplainOptions.analyze][google.datastore.v1.ExplainOptions.analyze] is set
+  // to true.
+  ExecutionStats execution_stats = 2;
+}
+// A representation of a kind.
+// The response for
+// [Datastore.RunAggregationQuery][google.datastore.v1.Datastore.RunAggregationQuery].
+message RunAggregationQueryResponse {
+  // A batch of aggregation results. Always present.
+  AggregationResultBatch batch = 1;
+
+  // The parsed form of the `GqlQuery` from the request, if it was set.
+  AggregationQuery query = 2;
+
+  // The identifier of the transaction that was started as part of this
+  // RunAggregationQuery request.
+  //
+  // Set only when
+  // [ReadOptions.new_transaction][google.datastore.v1.ReadOptions.new_transaction]
+  // was set in
+  // [RunAggregationQueryRequest.read_options][google.datastore.v1.RunAggregationQueryRequest.read_options].
+  bytes transaction = 5;
+
+  // Query explain metrics. This is only present when the
+  // [RunAggregationQueryRequest.explain_options][google.datastore.v1.RunAggregationQueryRequest.explain_options]
+  // is provided, and it is sent only once with the last response in the stream.
+  ExplainMetrics explain_metrics = 9;
+}
 // Basic messages needed for BeginTransaction
 message BeginTransactionRequest {
-  string project_id = 1;
-  string database_id = 2;
-  TransactionOptions transaction_options = 3;
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  TransactionOptions transaction_options = 10;
 }
 
 message BeginTransactionResponse {
@@ -59,19 +327,21 @@ message BeginTransactionResponse {
 }
 
 message TransactionOptions {
+
+  message ReadWrite {
+    bytes previous_transaction = 1;
+  }
+
+  message ReadOnly {
+    google.protobuf.Timestamp read_time = 1;
+  }
+  
   oneof mode {
     ReadWrite read_write = 1;
     ReadOnly read_only = 2;
   }
-  
-  message ReadWrite {
-    bytes previous_transaction = 1;
-  }
-  
-  message ReadOnly {
-    google.protobuf.Timestamp read_time = 1;
-  }
 }
+
 
 // Placeholder for other message types we'll implement later
 message LookupRequest {

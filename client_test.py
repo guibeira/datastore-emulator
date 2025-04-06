@@ -17,8 +17,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pprint import pprint
 
-os.environ["GRPC_VERBOSITY"] = "DEBUG"
-os.environ["GRPC_TRACE"] = "all"
+# os.environ["GRPC_VERBOSITY"] = "DEBUG"
+# os.environ["GRPC_TRACE"] = "all"
 os.environ["DATASTORE_EMULATOR_HOST"] = "localhost:8080"
 from google.cloud import datastore  # noqa: I100
 from google.cloud.datastore.query import PropertyFilter
@@ -531,11 +531,11 @@ def main(project_id):
 
     functions_to_call = [
         # insert_examples,
-        in_query,
+        # in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,
-        # count_query_in_transaction,
+        count_query_in_transaction,
         # count_query_on_kind,
         # count_query_with_limit,
         # count_query_property_filter,
