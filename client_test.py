@@ -446,7 +446,7 @@ def explain_analyze_aggregation(client):
 def in_query(client):
     # [START datastore_in_query]
     query = client.query(kind="Task")
-    # query.add_filter("tag", "IN", ["learn", "study"])
+    query.add_filter("tag", "IN", ["learn", "study"])
     query.add_filter(filter=PropertyFilter("confirmed", "=", True))
     # query.add_filter(property_name="tag", operator="IN", value=["learn", "study"])
     # [END datastore_in_query]
@@ -507,7 +507,6 @@ def insert_examples(client):
     # )
     # client.put(task5)
     # [END datastore_insert_examples]
-
     # return [task1, task2, task3, task4, task5]
 
 
@@ -531,8 +530,8 @@ def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
-        insert_examples,
-        # in_query,
+        # insert_examples,
+        in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,

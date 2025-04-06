@@ -135,8 +135,9 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        dbg!(&request);
         let req = request.into_inner();
+        dbg!(&req);
+        println!("---");
         //For now, just acknowledge the mutations without actually processing them
         let mutation_results = req
             .mutations
