@@ -1,5 +1,7 @@
 use google::datastore::v1::aggregation_query::aggregation::Count;
 use google::datastore::v1::aggregation_query::{Aggregation, QueryType};
+use google::datastore::v1::key::path_element::IdType;
+use google::datastore::v1::key::PathElement;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
@@ -21,7 +23,7 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
+    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
 };
 
 // The in-memory storage for our emulator
@@ -98,12 +100,75 @@ impl DatastoreService for DatastoreEmulator {
         // This is just a placeholder implementation that returns an empty response
         // We'll implement the actual lookup logic later
 
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            google::datastore::v1::Value {
+                exclude_from_indexes: false,
+                meaning: 0,
+                value_type: Some(google::datastore::v1::value::ValueType::StringValue(
+                    "example_name".to_string(),
+                )),
+            },
+        );
+
+
+        let partition_id = PartitionId {
+            database_id: req.database_id.clone(),
+            project_id: "something".to_string(),
+            namespace_id: "".to_string(), 
+        };
+
+
+        let key = Key {
+            partition_id: Some(partition_id),
+            path: vec![
+                    PathElement{kind: "Task".to_string(), id_type: Some(IdType::Id(12345))}
+            ],
+        };
+
+        let results = vec![
+            EntityResult {
+                entity: Some(Entity {
+                    key: Some(key.clone()),
+                    properties: properties.clone(),
+                }),
+                create_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                update_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                cursor: vec![],
+                version: 0,
+
+            },
+            // EntityResult {
+            //     entity: Some(Entity {
+            //         key: Some(key.clone()),
+            //         properties: properties.clone(),
+            //     }),
+            //     result_type: 0,
+            // },
+            // EntityResult {
+            //     entity: Some(Entity {
+            //         key: Some(key.clone()),
+            //         properties: properties.clone(),
+            //     }),
+            //     result_type: 0,
+            // },
+        ];
         Ok(Response::new(LookupResponse {
-            found: Vec::new(),
+            found: results,
             missing: Vec::new(),
-            deferred: Vec::new(),
-            // transaction: Vec::new(),
-            // read_time: None,
+            deferred: vec![],
+            transaction: Vec::new(), 
+            read_time: Some(prost_types::Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
         }))
     }
 
@@ -136,21 +201,48 @@ impl DatastoreService for DatastoreEmulator {
                     key: Some(key.clone()),
                     properties: properties.clone(),
                 }),
-                result_type: 0,
+                create_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                update_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                cursor: vec![],
+                version: 1,
             },
             EntityResult {
                 entity: Some(Entity {
                     key: Some(key.clone()),
                     properties: properties.clone(),
                 }),
-                result_type: 0,
+                create_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                update_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                cursor: vec![],
+                version: 2,
             },
             EntityResult {
                 entity: Some(Entity {
                     key: Some(key.clone()),
                     properties: properties.clone(),
                 }),
-                result_type: 0,
+                create_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                update_time: Some(prost_types::Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                cursor: vec![],
+                version: 3,
             },
         ];
         let batch = google::datastore::v1::QueryResultBatch {

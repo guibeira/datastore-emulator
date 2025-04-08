@@ -338,13 +338,12 @@ message LookupResponse {
   repeated EntityResult found = 1;
   repeated EntityResult missing = 2;
   repeated Key deferred = 3;
+  bytes transaction = 5;
+  google.protobuf.Timestamp read_time = 7;
 }
 
 // Simplified versions of core data types
 message Key {
-  PartitionId partition_id = 1;
-  repeated PathElement path = 2;
-  
   message PathElement {
     string kind = 1;
     oneof id_type {
@@ -352,23 +351,28 @@ message Key {
       string name = 3;
     }
   }
+  PartitionId partition_id = 1;
+  repeated PathElement path = 2;
 }
 
 message PartitionId {
-  string project_id = 1;
-  string database_id = 2;
-  string namespace_id = 3;
+  string project_id = 2;
+  string database_id = 3;
+  string namespace_id = 4;
 }
 
 message EntityResult {
-  Entity entity = 1;
   enum ResultType {
     RESULT_TYPE_UNSPECIFIED = 0;
     FULL = 1;
     PROJECTION = 2;
     KEY_ONLY = 3;
   }
-  ResultType result_type = 2;
+  Entity entity = 1;
+  int64 version = 4;
+  google.protobuf.Timestamp create_time = 6;
+  google.protobuf.Timestamp update_time = 5;
+  bytes cursor = 3;
 }
 
 message Entity {

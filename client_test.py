@@ -61,6 +61,7 @@ def query_with_readtime(client):
 
     # Fetch an entity with read_time
     task_key = client.key("Task", "sampletask")
+
     entity = client.get(task_key, read_time=read_time)
 
     # Query Task entities with read_time
@@ -533,7 +534,7 @@ def main(project_id):
         # in_query,
         # not_equals_query,
         # not_in_query,
-        # query_with_readtime,
+        query_with_readtime,
         # count_query_in_transaction,
         # count_query_on_kind,
         # count_query_with_limit,
@@ -544,7 +545,7 @@ def main(project_id):
         # avg_query_on_kind,
         # avg_query_property_filter,
         # multiple_aggregations_query,
-        explain_analyze_entity,
+        # explain_analyze_entity,
         # explain_entity,
         # explain_analyze_aggregation,
         # explain_aggregation,
