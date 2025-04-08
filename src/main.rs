@@ -21,10 +21,7 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest,
-    CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest,
-    LookupResponse, PingRequest, PingResponse, PlanSummary, RollbackRequest, RollbackResponse,
-    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
+    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
 };
 
 // The in-memory storage for our emulator
@@ -169,14 +166,30 @@ impl DatastoreService for DatastoreEmulator {
                 kind: Some(Kind::StringValue("Some value".to_string())),
             },
         );
-        let debug_stats = Struct { fields };
+        let debug_stats = Struct { fields: fields.clone() };
+        let query = Query {
+            projection: vec![],
+            kind: vec![],
+            filter: None,
+            order: vec![],
+            distinct_on: vec![],
+            start_cursor: Vec::new(),
+            end_cursor: Vec::new(),
+            offset: 1,
+            limit: Some(2),
+            find_nearest: None,
+        };
         Ok(Response::new(RunQueryResponse {
             transaction: vec![],
-            query: None,
+            query: Some(query),
             batch: Some(batch),
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
-                    indexes_used: Vec::new(),
+                    indexes_used: vec![
+                        Struct {
+                            fields: fields.clone(),
+                        }
+                    ]
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: 10,
@@ -275,16 +288,25 @@ impl DatastoreService for DatastoreEmulator {
             query_type: None,
         };
 
-        let fields = BTreeMap::new();
-        let debug_stats = Struct { fields };
-
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "Some key".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("Some value".to_string())),
+            },
+        );
+        let debug_stats = Struct { fields: fields.clone() };
         Ok(Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
             query: Some(query_with_fake_data),
             transaction: transaction_with_fake_data,
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
-                    indexes_used: Vec::new(),
+                    indexes_used: vec![
+                        Struct {
+                            fields: fields.clone(),
+                        }
+                    ]
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: 10,
