@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use google::datastore::v1::aggregation_query::aggregation::Count;
+use google::datastore::v1::aggregation_query::{Aggregation, QueryType};
+use prost_types::value::Kind;
+use prost_types::{Duration, Struct, Value as ValueProps};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -17,8 +21,9 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse,
-    LookupRequest, LookupResponse, PingRequest, PingResponse, RollbackRequest, RollbackResponse,
+    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest,
+    CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest,
+    LookupResponse, PingRequest, PingResponse, PlanSummary, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
 
@@ -113,22 +118,76 @@ impl DatastoreService for DatastoreEmulator {
         dbg!(&req);
 
         // Return an empty result batch for now
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            google::datastore::v1::Value {
+                exclude_from_indexes: false,
+                meaning: 0,
+                value_type: Some(google::datastore::v1::value::ValueType::StringValue(
+                    "example_name".to_string(),
+                )),
+            },
+        );
+        let key = Key {
+            partition_id: req.partition_id.clone(),
+            path: vec![],
+        };
+        let results = vec![
+            EntityResult {
+                entity: Some(Entity {
+                    key: Some(key.clone()),
+                    properties: properties.clone(),
+                }),
+                result_type: 0,
+            },
+            EntityResult {
+                entity: Some(Entity {
+                    key: Some(key.clone()),
+                    properties: properties.clone(),
+                }),
+                result_type: 0,
+            },
+            EntityResult {
+                entity: Some(Entity {
+                    key: Some(key.clone()),
+                    properties: properties.clone(),
+                }),
+                result_type: 0,
+            },
+        ];
         let batch = google::datastore::v1::QueryResultBatch {
-            entity_results: Vec::new(),
+            entity_results: results,
             more_results: 3, // NO_MORE_RESULTS
             end_cursor: Vec::new(),
-            // skipped_results: 0,
-            // skipped_cursor: Vec::new(),
-            // entity_result_type: 0,
-            // snapshot_version: 0,
-            // read_time: None,
         };
 
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "Some key".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("Some value".to_string())),
+            },
+        );
+        let debug_stats = Struct { fields };
         Ok(Response::new(RunQueryResponse {
+            transaction: vec![],
+            query: None,
             batch: Some(batch),
-            // query: None,
-            // transaction: Vec::new(),
-            // explain_metrics: None,
+            explain_metrics: Some(ExplainMetrics {
+                plan_summary: Some(PlanSummary {
+                    indexes_used: Vec::new(),
+                }),
+                execution_stats: Some(ExecutionStats {
+                    results_returned: 10,
+                    execution_duration: Some(Duration {
+                        seconds: 10,
+                        nanos: 0,
+                    }),
+                    read_operations: 10,
+                    debug_stats: Some(debug_stats),
+                }),
+            }),
         }))
     }
 
@@ -196,19 +255,47 @@ impl DatastoreService for DatastoreEmulator {
         // Return an empty result batch for now
         let batch = google::datastore::v1::AggregationResultBatch {
             aggregation_results: Vec::new(),
-            more_results: 3, // NO_MORE_RESULTS
-            // skipped_results: 0,
-            // skipped_cursor: Vec::new(),
-            // entity_result_type: 0,
-            // snapshot_version: 0,
-            read_time: None,
+            more_results: 0, // NO_MORE_RESULTS
+            read_time: Some(prost_types::Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
         };
+
+        let transaction_with_fake_data = vec![0; 0];
+        let query_with_fake_data = AggregationQuery {
+            aggregations: vec![Aggregation {
+                alias: "fake_alias".to_string(),
+                operator: Some(
+                    google::datastore::v1::aggregation_query::aggregation::Operator::Count(Count {
+                        up_to: Some(200_i64),
+                    }),
+                ),
+            }],
+            query_type: None,
+        };
+
+        let fields = BTreeMap::new();
+        let debug_stats = Struct { fields };
 
         Ok(Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
-            query: None,
-            transaction: Vec::new(),
-            explain_metrics: None,
+            query: Some(query_with_fake_data),
+            transaction: transaction_with_fake_data,
+            explain_metrics: Some(ExplainMetrics {
+                plan_summary: Some(PlanSummary {
+                    indexes_used: Vec::new(),
+                }),
+                execution_stats: Some(ExecutionStats {
+                    results_returned: 10,
+                    execution_duration: Some(Duration {
+                        seconds: 10,
+                        nanos: 0,
+                    }),
+                    read_operations: 10,
+                    debug_stats: Some(debug_stats),
+                }),
+            }),
         }))
     }
 }

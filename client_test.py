@@ -178,7 +178,6 @@ def count_query_with_stale_read(client):
 
     tasks = [task for task in client.query(kind="Task").fetch()]
     client.delete_multi(tasks)  # ensure the database is empty before starting
-
     # [START datastore_count_query_with_stale_read]
     task1 = datastore.Entity(client.key("Task", "task1"))
     task2 = datastore.Entity(client.key("Task", "task2"))
@@ -535,7 +534,7 @@ def main(project_id):
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,
-        count_query_in_transaction,
+        # count_query_in_transaction,
         # count_query_on_kind,
         # count_query_with_limit,
         # count_query_property_filter,
@@ -545,7 +544,7 @@ def main(project_id):
         # avg_query_on_kind,
         # avg_query_property_filter,
         # multiple_aggregations_query,
-        # explain_analyze_entity,
+        explain_analyze_entity,
         # explain_entity,
         # explain_analyze_aggregation,
         # explain_aggregation,
