@@ -21,6 +21,7 @@ from pprint import pprint
 # os.environ["GRPC_TRACE"] = "all"
 os.environ["DATASTORE_EMULATOR_HOST"] = "localhost:8080"
 from google.cloud import datastore  # noqa: I100
+from google.cloud.datastore.key import Key
 from google.cloud.datastore.query import PropertyFilter
 
 
@@ -34,6 +35,47 @@ def _preamble():
 
     # [END datastore_size_coloration_query]
     assert client is not None
+
+
+def transaction_rollback_example(client):
+    # [START datastore_transaction_rollback]
+    # Create initial budget tasks
+    task1 = datastore.Entity(client.key("Task", "budget_task1"))
+    task2 = datastore.Entity(client.key("Task", "budget_task2"))
+
+    task1["category"] = "expense"
+    task1["amount"] = 400
+    task2["category"] = "expense"
+    task2["amount"] = 300
+
+    tasks = [task1, task2]
+    client.put_multi(tasks)
+
+    try:
+        with client.transaction() as transaction:
+            # Query for current expenses
+            expense_query = client.query(kind="Task")
+            expense_query.add_filter("category", "=", "expense")
+
+            # Calculate total current expenses
+            expenses = list(expense_query.fetch())
+            current_total = sum(task["amount"] for task in expenses if "amount" in task)
+
+            # Create a new expense that would exceed our budget limit
+            new_expense = datastore.Entity(client.key("Task", "budget_task3"))
+            new_expense["category"] = "expense"
+            new_expense["amount"] = 500
+            transaction.put(new_expense)
+            tasks.append(new_expense)
+
+            # Check against budget limit
+            raise ValueError("Budget exceeded")
+    except ValueError as e:
+        print(f"Error: {e}")
+
+    # Verify final state after transaction
+    resulting_tasks = list(client.query(kind="Task").fetch())
+    return resulting_tasks
 
 
 def not_equals_query(client):
@@ -105,6 +147,46 @@ def count_query_in_transaction(client):
                 client.entities_to_delete.extend(tasks)
                 raise ValueError("User 'John' cannot have more than 2 tasks")
     # [END datastore_count_in_transaction]
+
+
+def allocate_ids_example(client):
+    # [START datastore_allocate_ids_example]
+    # Create incomplete keys (without IDs) for which we want IDs allocated
+    incomplete_key1 = client.key("Task")
+    incomplete_key2 = client.key("Task")
+    incomplete_key3 = client.key("Task")
+
+    # Request the allocation of IDs for these incomplete keys
+    imcomplete_key = Key("Parent", "foo", "Child", project=client.project)
+    keys = client.allocate_ids(imcomplete_key, 2)
+    print(f"Allocated {len(keys)} keys")
+
+    # Create entities using the allocated keys
+    entities = []
+    for i, key in enumerate(keys):
+        entity = datastore.Entity(key)
+        entity.update(
+            {
+                "description": f"Task with allocated ID {key.id}",
+                "created": datetime.now(timezone.utc),
+                "priority": i + 1,
+                "done": False,
+            }
+        )
+        entities.append(entity)
+
+    # Save the entities to Datastore
+    client.put_multi(entities)
+
+    # Now we can retrieve one of the entities to verify it was saved
+    first_key = keys[0]
+    retrieved_entity = client.get(first_key)
+
+    print(f"Retrieved entity with key {first_key}")
+    print(f"Description: {retrieved_entity['description']}")
+    print(f"Priority: {retrieved_entity['priority']}")
+
+    return entities
 
 
 def count_query_on_kind(client):
@@ -534,7 +616,7 @@ def main(project_id):
         # in_query,
         # not_equals_query,
         # not_in_query,
-        query_with_readtime,
+        # query_with_readtime,
         # count_query_in_transaction,
         # count_query_on_kind,
         # count_query_with_limit,
@@ -549,6 +631,8 @@ def main(project_id):
         # explain_entity,
         # explain_analyze_aggregation,
         # explain_aggregation,
+        # transaction_rollback_example,
+        allocate_ids_example
     ]
 
     for function in functions_to_call:

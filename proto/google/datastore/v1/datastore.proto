@@ -36,6 +36,7 @@ service Datastore {
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc RunAggregationQuery(RunAggregationQueryRequest) returns (RunAggregationQueryResponse);
+  rpc AllocateIds(AllocateIdsRequest) returns (AllocateIdsResponse);
 }
 
 // Custom message for testing connection
@@ -298,10 +299,12 @@ message RunAggregationQueryResponse {
 }
 
 // Basic messages needed for BeginTransaction
+
 message BeginTransactionRequest {
   string project_id = 8 [(field_behavior) = REQUIRED];
   string database_id = 9;
   TransactionOptions transaction_options = 10;
+
 }
 
 message BeginTransactionResponse {
@@ -309,21 +312,17 @@ message BeginTransactionResponse {
 }
 
 message TransactionOptions {
-
   message ReadWrite {
     bytes previous_transaction = 1;
   }
-
   message ReadOnly {
     google.protobuf.Timestamp read_time = 1;
   }
-  
   oneof mode {
     ReadWrite read_write = 1;
     ReadOnly read_only = 2;
   }
 }
-
 
 // Placeholder for other message types we'll implement later
 message LookupRequest {
@@ -692,11 +691,20 @@ message MutationResult {
 }
 
 message RollbackRequest {
-  string project_id = 1;
-  string database_id = 2;
-  bytes transaction = 3;
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  bytes transaction = 1 [(field_behavior) = REQUIRED];
 }
 
 message RollbackResponse {
 }
 
+message AllocateIdsRequest {
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  repeated Key keys = 1 [(field_behavior) = REQUIRED];
+}
+
+message AllocateIdsResponse {
+  repeated Key keys = 1;
+}

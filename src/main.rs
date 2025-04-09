@@ -23,7 +23,7 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
+    AggregationQuery, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
 };
 
 // The in-memory storage for our emulator
@@ -67,35 +67,12 @@ impl DatastoreService for DatastoreEmulator {
         Ok(Response::new(response))
     }
 
-    async fn begin_transaction(
-        &self,
-        request: Request<BeginTransactionRequest>,
-    ) -> Result<Response<BeginTransactionResponse>, Status> {
-        let req = request.into_inner();
-        dbg!(&req);
-        println!("Beginning transaction for project: {}", req.project_id);
-
-        // Generate a unique transaction ID
-        let transaction_id = Uuid::new_v4().to_string();
-        let transaction_bytes = transaction_id.clone().into_bytes();
-
-        // Store the transaction
-        {
-            let mut storage = self.storage.lock().unwrap();
-            storage.transactions.insert(transaction_id, Vec::new());
-        }
-
-        Ok(Response::new(BeginTransactionResponse {
-            transaction: transaction_bytes,
-        }))
-    }
 
     async fn lookup(
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
 
         // This is just a placeholder implementation that returns an empty response
         // We'll implement the actual lookup logic later
@@ -145,20 +122,6 @@ impl DatastoreService for DatastoreEmulator {
                 version: 0,
 
             },
-            // EntityResult {
-            //     entity: Some(Entity {
-            //         key: Some(key.clone()),
-            //         properties: properties.clone(),
-            //     }),
-            //     result_type: 0,
-            // },
-            // EntityResult {
-            //     entity: Some(Entity {
-            //         key: Some(key.clone()),
-            //         properties: properties.clone(),
-            //     }),
-            //     result_type: 0,
-            // },
         ];
         Ok(Response::new(LookupResponse {
             found: results,
@@ -177,7 +140,6 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
 
         // Return an empty result batch for now
         let mut properties = HashMap::new();
@@ -301,7 +263,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
-        // dbg!(&req);
+        dbg!(&req);
         // println!("---");
         //For now, just acknowledge the mutations without actually processing them
         let mutation_results = req
@@ -316,12 +278,40 @@ impl DatastoreService for DatastoreEmulator {
         }))
     }
 
+    async fn begin_transaction(
+        &self,
+        request: Request<BeginTransactionRequest>,
+    ) -> Result<Response<BeginTransactionResponse>, Status> {
+        let req = request.into_inner();
+        dbg!(&req);
+
+        // Generate a unique transaction ID
+        let transaction_id = 1;
+        let transaction_bytes = transaction_id.to_string().into_bytes();
+        // wait 1 second
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Store the transaction
+        // {
+        //     let mut storage = self.storage.lock().unwrap();
+        //     storage.transactions.insert(transaction_id, Vec::new());
+        // }
+
+        println!("End beggining transaction");
+        Ok(Response::new(BeginTransactionResponse {
+            transaction: transaction_bytes,
+        }))
+    }
+    
     async fn rollback(
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         let req = request.into_inner();
-        println!("Rollback request for project: {}", req.project_id);
+        dbg!(&req);
+        let transaction_id = req.transaction.clone();
+        // Convert transaction ID bytes to string
+        let transaction_id = String::from_utf8_lossy(&transaction_id);
+        println!("Transaction ID: {}", transaction_id);
 
         // Convert transaction ID bytes back to string
         let transaction_id = String::from_utf8_lossy(&req.transaction);
@@ -332,16 +322,20 @@ impl DatastoreService for DatastoreEmulator {
             storage.transactions.remove(&transaction_id.to_string());
         }
 
+        println!("End rollback transaction");
         Ok(Response::new(RollbackResponse {}))
     }
 
-    // We'll implement these other methods later
-    // async fn allocate_ids(
-    //     &self,
-    //     _request: Request<google::datastore::v1::AllocateIdsRequest>,
-    // ) -> Result<Response<google::datastore::v1::AllocateIdsResponse>, Status> {
-    //     Err(Status::unimplemented("Not yet implemented"))
-    // }
+    async fn allocate_ids(
+        &self,
+        request: Request<AllocateIdsRequest>,
+    ) -> Result<Response<AllocateIdsResponse>, Status> {
+        dbg!(request);
+
+        Ok(Response::new(AllocateIdsResponse {
+            keys: vec![],
+        }))
+    }
 
     // async fn reserve_ids(
     //     &self,
