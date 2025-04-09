@@ -149,6 +149,11 @@ def count_query_in_transaction(client):
     # [END datastore_count_in_transaction]
 
 
+def reserve_ids(client):
+    parent_key = client.key("Parent", 1111)
+    client.reserve_ids(parent_key, 2)
+
+
 def allocate_ids_example(client):
     # [START datastore_allocate_ids_example]
     # Create incomplete keys (without IDs) for which we want IDs allocated
@@ -181,10 +186,8 @@ def allocate_ids_example(client):
     # Now we can retrieve one of the entities to verify it was saved
     first_key = keys[0]
     retrieved_entity = client.get(first_key)
-
     print(f"Retrieved entity with key {first_key}")
-    print(f"Description: {retrieved_entity['description']}")
-    print(f"Priority: {retrieved_entity['priority']}")
+    print(f"Name: {retrieved_entity['name']}")
 
     return entities
 
@@ -612,27 +615,28 @@ def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
-        # insert_examples,
-        # in_query,
-        # not_equals_query,
-        # not_in_query,
-        # query_with_readtime,
-        # count_query_in_transaction,
-        # count_query_on_kind,
-        # count_query_with_limit,
-        # count_query_property_filter,
-        # count_query_with_stale_read,
-        # sum_query_on_kind,
-        # sum_query_property_filter,
-        # avg_query_on_kind,
-        # avg_query_property_filter,
-        # multiple_aggregations_query,
-        # explain_analyze_entity,
-        # explain_entity,
-        # explain_analyze_aggregation,
-        # explain_aggregation,
-        # transaction_rollback_example,
-        allocate_ids_example
+        insert_examples,
+        in_query,
+        not_equals_query,
+        not_in_query,
+        query_with_readtime,
+        count_query_in_transaction,
+        count_query_on_kind,
+        count_query_with_limit,
+        count_query_property_filter,
+        count_query_with_stale_read,
+        sum_query_on_kind,
+        sum_query_property_filter,
+        avg_query_on_kind,
+        avg_query_property_filter,
+        multiple_aggregations_query,
+        explain_analyze_entity,
+        explain_entity,
+        explain_analyze_aggregation,
+        explain_aggregation,
+        transaction_rollback_example,
+        allocate_ids_example,
+        reserve_ids,
     ]
 
     for function in functions_to_call:

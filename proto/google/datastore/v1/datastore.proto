@@ -37,6 +37,7 @@ service Datastore {
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
   rpc RunAggregationQuery(RunAggregationQueryRequest) returns (RunAggregationQueryResponse);
   rpc AllocateIds(AllocateIdsRequest) returns (AllocateIdsResponse);
+  rpc ReserveIds(ReserveIdsRequest) returns (ReserveIdsResponse);
 }
 
 // Custom message for testing connection
@@ -708,3 +709,11 @@ message AllocateIdsRequest {
 message AllocateIdsResponse {
   repeated Key keys = 1;
 }
+
+message ReserveIdsRequest {
+  string project_id = 8 [(field_behavior) = REQUIRED];
+  string database_id = 9;
+  repeated Key keys = 1 [(field_behavior) = REQUIRED];
+}
+
+message ReserveIdsResponse {}

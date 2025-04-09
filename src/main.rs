@@ -1,7 +1,7 @@
 use google::datastore::v1::aggregation_query::aggregation::Count;
 use google::datastore::v1::aggregation_query::{Aggregation, QueryType};
-use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::key::PathElement;
+use google::datastore::v1::key::path_element::IdType;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
@@ -23,7 +23,11 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse, PlanSummary, Query, RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse
+    AggregationQuery, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest, AggregationResultBatch,
+    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
+    ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse,
+    PlanSummary, Query, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
+    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
 
 // The in-memory storage for our emulator
@@ -67,15 +71,11 @@ impl DatastoreService for DatastoreEmulator {
         Ok(Response::new(response))
     }
 
-
     async fn lookup(
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
-
-        // This is just a placeholder implementation that returns an empty response
-        // We'll implement the actual lookup logic later
 
         let mut properties = HashMap::new();
         properties.insert(
@@ -89,45 +89,41 @@ impl DatastoreService for DatastoreEmulator {
             },
         );
 
-
         let partition_id = PartitionId {
             database_id: req.database_id.clone(),
             project_id: "something".to_string(),
-            namespace_id: "".to_string(), 
+            namespace_id: "".to_string(),
         };
-
 
         let key = Key {
             partition_id: Some(partition_id),
-            path: vec![
-                    PathElement{kind: "Task".to_string(), id_type: Some(IdType::Id(12345))}
-            ],
+            path: vec![PathElement {
+                kind: "Task".to_string(),
+                id_type: Some(IdType::Id(12345)),
+            }],
         };
 
-        let results = vec![
-            EntityResult {
-                entity: Some(Entity {
-                    key: Some(key.clone()),
-                    properties: properties.clone(),
-                }),
-                create_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                update_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                cursor: vec![],
-                version: 0,
-
-            },
-        ];
+        let results = vec![EntityResult {
+            entity: Some(Entity {
+                key: Some(key.clone()),
+                properties: properties.clone(),
+            }),
+            create_time: Some(prost_types::Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
+            update_time: Some(prost_types::Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
+            cursor: vec![],
+            version: 0,
+        }];
         Ok(Response::new(LookupResponse {
             found: results,
             missing: Vec::new(),
             deferred: vec![],
-            transaction: Vec::new(), 
+            transaction: Vec::new(),
             read_time: Some(prost_types::Timestamp {
                 seconds: 10,
                 nanos: 0,
@@ -141,7 +137,6 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
 
-        // Return an empty result batch for now
         let mut properties = HashMap::new();
         properties.insert(
             "name".to_string(),
@@ -153,10 +148,12 @@ impl DatastoreService for DatastoreEmulator {
                 )),
             },
         );
+
         let key = Key {
             partition_id: req.partition_id.clone(),
             path: vec![],
         };
+
         let results = vec![
             EntityResult {
                 entity: Some(Entity {
@@ -220,7 +217,9 @@ impl DatastoreService for DatastoreEmulator {
                 kind: Some(Kind::StringValue("Some value".to_string())),
             },
         );
-        let debug_stats = Struct { fields: fields.clone() };
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
         let query = Query {
             projection: vec![],
             kind: vec![],
@@ -239,11 +238,9 @@ impl DatastoreService for DatastoreEmulator {
             batch: Some(batch),
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
-                    indexes_used: vec![
-                        Struct {
-                            fields: fields.clone(),
-                        }
-                    ]
+                    indexes_used: vec![Struct {
+                        fields: fields.clone(),
+                    }],
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: 10,
@@ -264,8 +261,7 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
         dbg!(&req);
-        // println!("---");
-        //For now, just acknowledge the mutations without actually processing them
+
         let mutation_results = req
             .mutations
             .iter()
@@ -285,23 +281,14 @@ impl DatastoreService for DatastoreEmulator {
         let req = request.into_inner();
         dbg!(&req);
 
-        // Generate a unique transaction ID
         let transaction_id = 1;
         let transaction_bytes = transaction_id.to_string().into_bytes();
-        // wait 1 second
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        // Store the transaction
-        // {
-        //     let mut storage = self.storage.lock().unwrap();
-        //     storage.transactions.insert(transaction_id, Vec::new());
-        // }
 
-        println!("End beggining transaction");
         Ok(Response::new(BeginTransactionResponse {
             transaction: transaction_bytes,
         }))
     }
-    
+
     async fn rollback(
         &self,
         request: Request<RollbackRequest>,
@@ -311,8 +298,6 @@ impl DatastoreService for DatastoreEmulator {
         let transaction_id = req.transaction.clone();
         // Convert transaction ID bytes to string
         let transaction_id = String::from_utf8_lossy(&transaction_id);
-        println!("Transaction ID: {}", transaction_id);
-
         // Convert transaction ID bytes back to string
         let transaction_id = String::from_utf8_lossy(&req.transaction);
 
@@ -333,16 +318,27 @@ impl DatastoreService for DatastoreEmulator {
         dbg!(request);
 
         Ok(Response::new(AllocateIdsResponse {
-            keys: vec![],
+            keys: vec![Key {
+                partition_id: Some(PartitionId {
+                    database_id: "database_id".to_string(),
+                    project_id: "something".to_string(),
+                    namespace_id: "".to_string(),
+                }),
+                path: vec![PathElement {
+                    kind: "Task".to_string(),
+                    id_type: Some(IdType::Id(12345)),
+                }],
+            }],
         }))
     }
 
-    // async fn reserve_ids(
-    //     &self,
-    //     _request: Request<google::datastore::v1::ReserveIdsRequest>,
-    // ) -> Result<Response<google::datastore::v1::ReserveIdsResponse>, Status> {
-    //     Err(Status::unimplemented("Not yet implemented"))
-    // }
+    async fn reserve_ids(
+        &self,
+        request: Request<ReserveIdsRequest>,
+    ) -> Result<Response<ReserveIdsResponse>, Status> {
+        dbg!(request);
+        Ok(Response::new(ReserveIdsResponse {}))
+    }
 
     async fn run_aggregation_query(
         &self,
@@ -352,7 +348,7 @@ impl DatastoreService for DatastoreEmulator {
         dbg!(&req);
 
         // Return an empty result batch for now
-        let batch = google::datastore::v1::AggregationResultBatch {
+        let batch = AggregationResultBatch {
             aggregation_results: Vec::new(),
             more_results: 0, // NO_MORE_RESULTS
             read_time: Some(prost_types::Timestamp {
@@ -381,18 +377,18 @@ impl DatastoreService for DatastoreEmulator {
                 kind: Some(Kind::StringValue("Some value".to_string())),
             },
         );
-        let debug_stats = Struct { fields: fields.clone() };
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
         Ok(Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
             query: Some(query_with_fake_data),
             transaction: transaction_with_fake_data,
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
-                    indexes_used: vec![
-                        Struct {
-                            fields: fields.clone(),
-                        }
-                    ]
+                    indexes_used: vec![Struct {
+                        fields: fields.clone(),
+                    }],
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: 10,
