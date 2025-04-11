@@ -1,16 +1,16 @@
+use google::datastore::v1::aggregation_query::Aggregation;
 use google::datastore::v1::aggregation_query::aggregation::Count;
-use google::datastore::v1::aggregation_query::{Aggregation, QueryType};
 use google::datastore::v1::key::PathElement;
 use google::datastore::v1::key::path_element::IdType;
+use google::datastore::v1::mutation::Operation;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, transport::Server};
-use uuid::Uuid;
 
 // Import the generated code
 pub mod google {
@@ -23,18 +23,103 @@ pub mod google {
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest, AggregationResultBatch,
-    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
-    ExplainMetrics, Key, LookupRequest, LookupResponse, PartitionId, PingRequest, PingResponse,
-    PlanSummary, Query, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
-    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
+    AggregationQuery, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
+    BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
+    EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation,
+    PartitionId, PingRequest, PingResponse, PlanSummary, Query, ReserveIdsRequest,
+    ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
+    RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
 
-// The in-memory storage for our emulator
 #[derive(Default, Debug)]
 struct DatastoreStorage {
-    entities: HashMap<String, google::datastore::v1::Entity>,
-    transactions: HashMap<String, Vec<google::datastore::v1::Mutation>>,
+    // Armazenamento principal usando BTreeMap para entidades
+    entities: BTreeMap<KeyStruct, EntityWithMetadata>,
+    // Índices para consultas eficientes
+    indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
+    // Transações ativas
+    transactions: HashMap<String, TransactionState>,
+    // Contador para geração de IDs automáticos
+    id_counter: Arc<Mutex<i64>>,
+}
+
+impl DatastoreStorage {
+    fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
+        // Para cada propriedade da entidade, criar índices
+        for (prop_name, prop_value) in &entity.properties {
+            if let Some(value_type) = &prop_value.value_type {
+                // Extrair valor como string para indexação
+                let value_str = match value_type {
+                    google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
+                    google::datastore::v1::value::ValueType::IntegerValue(i) => i.to_string(),
+                    // Implementar outros tipos conforme necessário
+                    _ => continue,
+                };
+
+                // Obter o kind da entidade
+                if let Some((kind, _)) = key_struct.path_elements.last() {
+                    let index_key = (kind.clone(), prop_name.clone(), value_str);
+                    self.indexes
+                        .entry(index_key)
+                        .or_insert_with(BTreeSet::new)
+                        .insert(key_struct.clone());
+                }
+            }
+        }
+    }
+}
+
+// Entidade com metadados
+#[derive(Default, Debug)]
+struct EntityWithMetadata {
+    entity: Entity,
+    version: u64,
+    create_time: prost_types::Timestamp,
+    update_time: prost_types::Timestamp,
+}
+
+// Estrutura chave personalizada para indexação eficiente
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct KeyStruct {
+    namespace: String,
+    path_elements: Vec<(String, KeyId)>, // (kind, id/name)
+}
+
+impl KeyStruct {
+    fn from_datastore_key(key: &Key) -> Self {
+        let mut path_elements = Vec::new();
+        for path_element in &key.path {
+            let kind = path_element.kind.clone();
+            let id_type = match &path_element.id_type {
+                Some(IdType::Id(id)) => KeyId::IntId(*id),
+                Some(IdType::Name(name)) => KeyId::StringId(name.clone()),
+                None => continue,
+            };
+            path_elements.push((kind, id_type));
+        }
+        Self {
+            namespace: key
+                .partition_id
+                .as_ref()
+                .map_or_else(|| "".to_string(), |p| p.namespace_id.clone()),
+            path_elements,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum KeyId {
+    IntId(i64),
+    StringId(String),
+}
+
+// Estado de uma transação
+#[derive(Default, Debug)]
+struct TransactionState {
+    mutations: Vec<Mutation>,
+    snapshot: HashMap<KeyStruct, EntityWithMetadata>,
+    timestamp: prost_types::Timestamp,
+    read_only: bool,
 }
 
 #[derive(Debug)]
@@ -76,58 +161,56 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
+        let storage = self.storage.lock().unwrap();
 
-        let mut properties = HashMap::new();
-        properties.insert(
-            "name".to_string(),
-            google::datastore::v1::Value {
-                exclude_from_indexes: false,
-                meaning: 0,
-                value_type: Some(google::datastore::v1::value::ValueType::StringValue(
-                    "example_name".to_string(),
-                )),
-            },
-        );
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
 
-        let partition_id = PartitionId {
-            database_id: req.database_id.clone(),
-            project_id: "something".to_string(),
-            namespace_id: "".to_string(),
+        // Process each key in the request
+        for key in &req.keys {
+            let key_struct = KeyStruct::from_datastore_key(key);
+
+            // Look up the key in storage
+            if let Some(entity_metadata) = storage.entities.get(&key_struct) {
+                // Entity found, add to results
+                found.push(EntityResult {
+                    entity: Some(entity_metadata.entity.clone()),
+                    create_time: Some(entity_metadata.create_time.clone()),
+                    update_time: Some(entity_metadata.update_time.clone()),
+                    cursor: vec![],
+                    version: entity_metadata.version as i64,
+                });
+            } else {
+                // Entity not found, add to missing
+                missing.push(EntityResult {
+                    entity: Some(Entity {
+                        key: Some(key.clone()),
+                        properties: HashMap::new(),
+                    }),
+                    create_time: None,
+                    update_time: None,
+                    cursor: vec![],
+                    version: 0,
+                });
+            }
+        }
+
+        // Get current time for read_time
+        let now = SystemTime::now();
+        let read_time = prost_types::Timestamp {
+            seconds: now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
         };
 
-        let key = Key {
-            partition_id: Some(partition_id),
-            path: vec![PathElement {
-                kind: "Task".to_string(),
-                id_type: Some(IdType::Id(12345)),
-            }],
-        };
-
-        let results = vec![EntityResult {
-            entity: Some(Entity {
-                key: Some(key.clone()),
-                properties: properties.clone(),
-            }),
-            create_time: Some(prost_types::Timestamp {
-                seconds: 10,
-                nanos: 0,
-            }),
-            update_time: Some(prost_types::Timestamp {
-                seconds: 10,
-                nanos: 0,
-            }),
-            cursor: vec![],
-            version: 0,
-        }];
         Ok(Response::new(LookupResponse {
-            found: results,
-            missing: Vec::new(),
+            found,
+            missing,
             deferred: vec![],
             transaction: Vec::new(),
-            read_time: Some(prost_types::Timestamp {
-                seconds: 10,
-                nanos: 0,
-            }),
+            read_time: Some(read_time),
         }))
     }
 
@@ -260,17 +343,52 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
+        let mut storage = self.storage.lock().unwrap();
+        let mut mutation_results = Vec::new();
 
-        let mutation_results = req
-            .mutations
-            .iter()
-            .map(|_| google::datastore::v1::MutationResult { key: None })
-            .collect();
+        for mutation in req.mutations {
+            if let Some(Operation::Insert(entity) | Operation::Upsert(entity)) = mutation.operation
+            {
+                let key = match entity.key {
+                    Some(ref key) => key.clone(),
+                    None => return Err(Status::invalid_argument("Entity missing key")),
+                };
 
+                let key_struct = KeyStruct::from_datastore_key(&key);
+
+                let now = SystemTime::now();
+                let timestamp = prost_types::Timestamp {
+                    seconds: now
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64,
+                    nanos: 0,
+                };
+
+                let entity_metadata = EntityWithMetadata {
+                    entity: entity.clone(),
+                    version: 1, // Primeira versão
+                    create_time: timestamp.clone(),
+                    update_time: timestamp,
+                };
+
+                storage.entities.insert(key_struct.clone(), entity_metadata);
+
+                storage.update_indexes(&key_struct, &entity);
+
+                mutation_results.push(google::datastore::v1::MutationResult {
+                    key: Some(key),
+                    ..Default::default()
+                });
+            }
+            // another types of mutation
+        }
+        dbg!(&storage);
+
+        let index_updates = mutation_results.len() as i32;
         Ok(Response::new(CommitResponse {
             mutation_results,
-            index_updates: 0,
+            index_updates,
         }))
     }
 
@@ -279,7 +397,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
+        //dbg!(&req);
 
         let transaction_id = 1;
         let transaction_bytes = transaction_id.to_string().into_bytes();
@@ -294,7 +412,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
+        // dbg!(&req);
         let transaction_id = req.transaction.clone();
         // Convert transaction ID bytes to string
         let transaction_id = String::from_utf8_lossy(&transaction_id);
@@ -315,7 +433,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
-        dbg!(request);
+        //dbg!(request);
 
         Ok(Response::new(AllocateIdsResponse {
             keys: vec![Key {
@@ -336,7 +454,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
-        dbg!(request);
+        //dbg!(request);
         Ok(Response::new(ReserveIdsResponse {}))
     }
 
@@ -345,7 +463,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
+        //dbg!(&req);
 
         // Return an empty result batch for now
         let batch = AggregationResultBatch {
