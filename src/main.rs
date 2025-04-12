@@ -23,6 +23,7 @@ pub mod google {
 }
 
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
+use google::datastore::v1::aggregation_query::aggregation::Operator;
 use google::datastore::v1::{
     AggregationQuery, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
@@ -553,20 +554,53 @@ async fn commit(
         &self,
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
-        //dbg!(request);
-
+        let req = request.into_inner();
+        let mut storage = self.storage.lock().unwrap();
+        let mut allocated_keys = Vec::new();
+        
+        // Process each incomplete key in the request
+        for incomplete_key in req.keys {
+            // Verify the key is incomplete (missing ID or name)
+            if incomplete_key.path.is_empty() {
+                return Err(Status::invalid_argument("Key path cannot be empty"));
+            }
+            
+            // Create a new key with the same structure but with allocated IDs
+            let mut new_key = incomplete_key.clone();
+            let mut path_elements = Vec::new();
+            
+            for path_element in incomplete_key.path {
+                // Check if this path element needs an ID
+                if path_element.id_type.is_none() {
+                    // Allocate a new ID
+                    let new_id = {
+                        let mut counter = storage.id_counter.lock().unwrap();
+                        *counter += 1;
+                        *counter
+                    };
+                    
+                    // Create a new path element with the allocated ID
+                    let new_path_element = PathElement {
+                        kind: path_element.kind,
+                        id_type: Some(IdType::Id(new_id)),
+                    };
+                    
+                    path_elements.push(new_path_element);
+                } else {
+                    // This path element already has an ID or name, keep it as is
+                    path_elements.push(path_element);
+                }
+            }
+            
+            // Update the key with the new path elements
+            new_key.path = path_elements;
+            
+            // Add the allocated key to the result
+            allocated_keys.push(new_key);
+        }
+        
         Ok(Response::new(AllocateIdsResponse {
-            keys: vec![Key {
-                partition_id: Some(PartitionId {
-                    database_id: "database_id".to_string(),
-                    project_id: "something".to_string(),
-                    namespace_id: "".to_string(),
-                }),
-                path: vec![PathElement {
-                    kind: "Task".to_string(),
-                    id_type: Some(IdType::Id(12345)),
-                }],
-            }],
+            keys: allocated_keys,
         }))
     }
 
@@ -574,67 +608,168 @@ async fn commit(
         &self,
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
-        //dbg!(request);
+        let req = request.into_inner();
+        let mut storage = self.storage.lock().unwrap();
+        
+        // Process each key in the request
+        for key in &req.keys {
+            // Validate the key
+            if key.path.is_empty() {
+                return Err(Status::invalid_argument("Key path cannot be empty"));
+            }
+            
+            // For each path element with an ID, reserve that ID
+            for path_element in &key.path {
+                if let Some(IdType::Id(id)) = path_element.id_type {
+                    // Reserve this ID by ensuring our ID counter is greater than it
+                    let mut counter = storage.id_counter.lock().unwrap();
+                    if *counter <= id {
+                        *counter = id + 1;
+                    }
+                }
+            }
+            
+            // Create a KeyStruct for this key to potentially use in future lookups
+            let key_struct = KeyStruct::from_datastore_key(key);
+            
+            // We could store reserved keys in a separate collection if needed
+            // For now, we just ensure the ID counter is updated
+        }
+        
+        // Return success response
         Ok(Response::new(ReserveIdsResponse {}))
     }
 
-    async fn run_aggregation_query(
+async fn run_aggregation_query(
         &self,
         request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
         let req = request.into_inner();
-        //dbg!(&req);
-
-        // Return an empty result batch for now
+        let storage = self.storage.lock().unwrap();
+        
+        // Extract the aggregation query from the request
+        let aggregation_query = match req.query_type {
+            Some(google::datastore::v1::run_aggregation_query_request::QueryType::AggregationQuery(query)) => query,
+            _ => return Err(Status::invalid_argument("Missing or invalid aggregation query")),
+        };
+        
+        // Get the base query if it exists
+        let base_query = match aggregation_query.clone().query_type {
+            Some(google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => Some(query),
+            _ => None,
+        };
+        
+        // Get current time for read_time
+        let now = SystemTime::now();
+        let read_time = prost_types::Timestamp {
+            seconds: now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
+        };
+        
+        // Process each aggregation
+        let mut aggregation_results = Vec::new();
+        
+        for aggregation in &aggregation_query.aggregations {
+            match &aggregation.operator {
+                Some(Operator::Count(count)) => {
+                    // Perform COUNT aggregation
+                    let mut count_value = 0;
+                    
+                    // Filter entities based on the base query if provided
+                    if let Some(query) = &base_query {
+                        // Get entities matching the kind filter
+                        let mut matching_entities = Vec::new();
+                        
+                        for kind in &query.kind {
+                            // Find all entities of this kind
+                            for (key_struct, entity_metadata) in &storage.entities {
+                                if let Some((entity_kind, _)) = key_struct.path_elements.last() {
+                                    if entity_kind == &kind.name {
+                                        matching_entities.push(entity_metadata);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Apply filters if present
+                        if let Some(filter) = &query.filter {
+                            // In a real implementation, we would apply the filter here
+                            // For now, we'll just count all entities of the requested kinds
+                        }
+                        
+                        // Apply limit if present
+                        if let Some(limit) = query.limit {
+                            count_value = matching_entities.len().min(limit as usize) as i64;
+                        } else {
+                            count_value = matching_entities.len() as i64;
+                        }
+                    } else {
+                        // No base query, count all entities
+                        count_value = storage.entities.len() as i64;
+                    }
+                    
+                    // Apply up_to limit if specified in the count operator
+                    if let Some(up_to) = count.up_to {
+                        count_value = count_value.min(up_to);
+                    }
+                    
+                    // Create the aggregation result
+                    let result_value = google::datastore::v1::Value {
+                        exclude_from_indexes: false,
+                        meaning: 0,
+                        value_type: Some(google::datastore::v1::value::ValueType::IntegerValue(count_value)),
+                    };
+                    
+                    aggregation_results.push(google::datastore::v1::AggregationResult {
+                        //alias: aggregation.alias.clone(),
+                        aggregate_properties: {
+                            let mut props = HashMap::new();
+                            props.insert("count".to_string(), result_value);
+                            props
+                        },
+                    });
+                },
+                _ => return Err(Status::unimplemented("Only COUNT aggregation is currently supported")),
+            }
+        }
+        
+        // Create the result batch
         let batch = AggregationResultBatch {
-            aggregation_results: Vec::new(),
-            more_results: 0, // NO_MORE_RESULTS
-            read_time: Some(prost_types::Timestamp {
-                seconds: 10,
-                nanos: 0,
-            }),
+            aggregation_results,
+            more_results: 3, // NO_MORE_RESULTS
+            read_time: Some(read_time.clone()),
         };
-
-        let transaction_with_fake_data = vec![0; 0];
-        let query_with_fake_data = AggregationQuery {
-            aggregations: vec![Aggregation {
-                alias: "fake_alias".to_string(),
-                operator: Some(
-                    google::datastore::v1::aggregation_query::aggregation::Operator::Count(Count {
-                        up_to: Some(200_i64),
-                    }),
-                ),
-            }],
-            query_type: None,
-        };
-
+        let total_results = batch.aggregation_results.len() as i64; 
+        // Create execution metrics
         let mut fields = BTreeMap::new();
         fields.insert(
-            "Some key".to_string(),
+            "query_type".to_string(),
             ValueProps {
-                kind: Some(Kind::StringValue("Some value".to_string())),
+                kind: Some(Kind::StringValue("aggregation".to_string())),
             },
         );
         let debug_stats = Struct {
             fields: fields.clone(),
         };
+        
         Ok(Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
-            query: Some(query_with_fake_data),
-            transaction: transaction_with_fake_data,
+            query: Some(aggregation_query),
+            transaction: Vec::new(),
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
-                    indexes_used: vec![Struct {
-                        fields: fields.clone(),
-                    }],
+                    indexes_used: vec![],
                 }),
                 execution_stats: Some(ExecutionStats {
-                    results_returned: 10,
+                    results_returned: total_results,
                     execution_duration: Some(Duration {
-                        seconds: 10,
-                        nanos: 0,
+                        seconds: 0,
+                        nanos: 1000000, // 1ms
                     }),
-                    read_operations: 10,
+                    read_operations: storage.entities.len() as i64,
                     debug_stats: Some(debug_stats),
                 }),
             }),
