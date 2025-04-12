@@ -1,5 +1,6 @@
 use google::datastore::v1::aggregation_query::Aggregation;
 use google::datastore::v1::aggregation_query::aggregation::Count;
+use google::datastore::v1::commit_request::TransactionSelector;
 use google::datastore::v1::key::PathElement;
 use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::mutation::Operation;
@@ -44,6 +45,11 @@ struct DatastoreStorage {
 }
 
 impl DatastoreStorage {
+    fn clean_transaction(&mut self, transaction_id: &str) {
+        // Limpar transações
+        self.transactions.remove(transaction_id);
+    }
+
     fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // Para cada propriedade da entidade, criar índices
         for (prop_name, prop_value) in &entity.properties {
@@ -338,14 +344,49 @@ impl DatastoreService for DatastoreEmulator {
         }))
     }
 
-    async fn commit(
+async fn commit(
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
         let mut storage = self.storage.lock().unwrap();
         let mut mutation_results = Vec::new();
+        
+        // Handle transaction if present
+        let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
+            match transaction_selector {
+                TransactionSelector::Transaction(tx_bytes) => {
+                    // Convert transaction ID bytes to string
+                    match String::from_utf8(tx_bytes.clone()) {
+                        Ok(id) => Some(id),
+                        Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
+                    }
+                },
+                TransactionSelector::SingleUseTransaction(_) => None, // No existing transaction, just commit directly
+            }
+        } else {
+            None // No transaction specified, just commit directly
+        };
+        
+        // Check if this is a transactional commit
+        if let Some(tx_id) = transaction_id.clone() {
+            // Verify the transaction exists and is not read-only
+            if let Some(tx_state) = storage.transactions.get(&tx_id) {
+                if tx_state.read_only {
+                    return Err(Status::failed_precondition(
+                        "Cannot commit mutations in a read-only transaction"
+                    ));
+                }
+                
+                // In a real implementation, we would apply the transaction's mutations here
+                // For now, we'll just remove the transaction after committing
+                println!("Committing transaction: {}", tx_id);
+            } else {
+                return Err(Status::not_found(format!("Transaction {} not found", tx_id)));
+            }
+        }
 
+        // Process mutations
         for mutation in req.mutations {
             if let Some(Operation::Insert(entity) | Operation::Upsert(entity)) = mutation.operation
             {
@@ -365,10 +406,15 @@ impl DatastoreService for DatastoreEmulator {
                     nanos: 0,
                 };
 
+                // Check if entity already exists to determine if this is an insert or update
+                let existing_entity = storage.entities.get(&key_struct);
+                let version = existing_entity.map_or(1, |e| e.version + 1);
+                let create_time = existing_entity.map_or(timestamp.clone(), |e| e.create_time.clone());
+                
                 let entity_metadata = EntityWithMetadata {
                     entity: entity.clone(),
-                    version: 1, // Primeira versão
-                    create_time: timestamp.clone(),
+                    version,
+                    create_time,
                     update_time: timestamp,
                 };
 
@@ -381,14 +427,30 @@ impl DatastoreService for DatastoreEmulator {
                     ..Default::default()
                 });
             }
-            // another types of mutation
+            // Handle other types of mutations (delete, update) here
         }
-        dbg!(&storage);
-
+    
         let index_updates = mutation_results.len() as i32;
+
+        // Clean up the transaction if it was used
+        if let Some(tx_id) = transaction_id {
+            storage.clean_transaction(&tx_id);
+        }
+        
+        // Get current time for the commit timestamp
+        let now = SystemTime::now();
+        let commit_timestamp = prost_types::Timestamp {
+            seconds: now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
+        };
+        
         Ok(Response::new(CommitResponse {
             mutation_results,
             index_updates,
+            commit_time: Some(commit_timestamp),
         }))
     }
 
@@ -397,11 +459,59 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         let req = request.into_inner();
-        //dbg!(&req);
-
-        let transaction_id = 1;
-        let transaction_bytes = transaction_id.to_string().into_bytes();
-
+        
+        // Get current time for the transaction
+        let now = SystemTime::now();
+        let duration_since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+            
+        let timestamp = prost_types::Timestamp {
+            seconds: duration_since_epoch.as_secs() as i64,
+            nanos: 0,
+        };
+        
+        // Generate a unique transaction ID and create transaction state
+        let transaction_id;
+        {
+            let mut storage = self.storage.lock().unwrap();
+            
+            // Generate transaction ID using timestamp and current counter
+            let counter = {
+                let mut counter_guard = storage.id_counter.lock().unwrap();
+                let current = *counter_guard;
+                *counter_guard += 1;
+                current
+            };
+            transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
+            
+            // Check if the transaction is read-only
+            let transaction_options = req.transaction_options.unwrap_or_default();
+            let read_only =  if let Some(mode) = transaction_options.mode {
+                // Set read-only flag
+                match mode {
+                    google::datastore::v1::transaction_options::Mode::ReadOnly(_) => true, 
+                    google::datastore::v1::transaction_options::Mode::ReadWrite(_) => false,
+                }
+            } else {
+                // Default to read-write if no mode is specified
+                false
+            };
+            // Create a new transaction state
+            let transaction_state = TransactionState {
+                mutations: Vec::new(),
+                snapshot: HashMap::new(),  // Will be populated for read operations
+                timestamp: timestamp.clone(),
+                read_only,
+            };
+            
+            // Add the transaction to storage
+            storage.transactions.insert(transaction_id.clone(), transaction_state);
+        }
+        
+        // Return the transaction ID as bytes
+        let transaction_bytes = transaction_id.into_bytes();
+        
         Ok(Response::new(BeginTransactionResponse {
             transaction: transaction_bytes,
         }))
@@ -412,20 +522,30 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         let req = request.into_inner();
-        // dbg!(&req);
-        let transaction_id = req.transaction.clone();
+        
         // Convert transaction ID bytes to string
-        let transaction_id = String::from_utf8_lossy(&transaction_id);
-        // Convert transaction ID bytes back to string
-        let transaction_id = String::from_utf8_lossy(&req.transaction);
-
-        // Remove the transaction from storage
+        let transaction_id = match String::from_utf8(req.transaction.clone()) {
+            Ok(id) => id,
+            Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
+        };
+        
+        // Remove the transaction and any pending changes from storage
         {
             let mut storage = self.storage.lock().unwrap();
-            storage.transactions.remove(&transaction_id.to_string());
+            
+            // Check if the transaction exists
+            if storage.transactions.contains_key(&transaction_id) {
+                // Clean up the transaction (removes it from storage)
+                storage.clean_transaction(&transaction_id);
+                println!("Transaction {} rolled back successfully", transaction_id);
+            } else {
+                println!("Warning: Attempted to rollback non-existent transaction: {}", transaction_id);
+                // We still return success even if transaction doesn't exist
+                // This matches Datastore behavior which is idempotent for rollbacks
+            }
         }
 
-        println!("End rollback transaction");
+
         Ok(Response::new(RollbackResponse {}))
     }
 

@@ -682,9 +682,11 @@ message PropertyTransform {
     ArrayValue remove_all_from_array = 7;
   }
 }
+
 message CommitResponse {
-  repeated MutationResult mutation_results = 1;
-  int32 index_updates = 2;
+  repeated MutationResult mutation_results = 3;
+  int32 index_updates = 4;
+  google.protobuf.Timestamp commit_time = 8;
 }
 
 message MutationResult {
