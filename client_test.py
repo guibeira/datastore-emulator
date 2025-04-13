@@ -617,10 +617,80 @@ def explain_aggregation(client):
     # [END datastore_query_explain_aggregation]
 
 
+def delete_example(client):
+    # [START datastore_delete_example]
+    # Create sample entities
+    task1 = datastore.Entity(client.key("Task", "task_to_delete"))
+    task2 = datastore.Entity(client.key("Task", "task_to_keep"))
+
+    task1.update({"description": "This task will be deleted"})
+    task2.update({"description": "This task will be kept"})
+
+    # Insert entities into Datastore
+    client.put_multi([task1, task2])
+
+    # Delete the first task
+    client.delete(task1.key)
+
+    # Verify deletion
+    deleted_task = client.get(task1.key)
+    kept_task = client.get(task2.key)
+
+    if deleted_task is None:
+        print("Task successfully deleted.")
+    else:
+        print("Task deletion failed.")
+
+    if kept_task is not None:
+        print("Task to keep is still present.")
+    else:
+        print("Task to keep is missing.")
+    # [END datastore_delete_example]
+    return [task1, task2]
+
+
+def delete_multi_example(client):
+    # [START datastore_delete_multi_example]
+    # Create sample entities
+    task1 = datastore.Entity(client.key("Task", "task_to_delete_1"))
+    task2 = datastore.Entity(client.key("Task", "task_to_delete_2"))
+    task3 = datastore.Entity(client.key("Task", "task_to_keep"))
+
+    task1.update({"description": "This task will be deleted"})
+    task2.update({"description": "This task will also be deleted"})
+    task3.update({"description": "This task will be kept"})
+
+    # Insert entities into Datastore
+    client.put_multi([task1, task2, task3])
+
+    # Delete multiple tasks
+    client.delete_multi([task1.key, task2.key])
+
+    client.delete_multi([task1.key, task2.key])
+    # Verify deletion
+    deleted_task1 = client.get(task1.key)
+    deleted_task2 = client.get(task2.key)
+    kept_task = client.get(task3.key)
+
+    if deleted_task1 is None and deleted_task2 is None:
+        print("Tasks successfully deleted.")
+    else:
+        print("Task deletion failed.")
+
+    if kept_task is not None:
+        print("Task to keep is still present.")
+    else:
+        print("Task to keep is missing.")
+    # [END datastore_delete_multi_example]
+    return [task1, task2, task3]
+
+
 def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
+        # delete_example,
+        delete_multi_example,
         # insert_examples,
         # in_query,
         # not_equals_query,
@@ -633,7 +703,7 @@ def main(project_id):
         # count_query_with_stale_read,
         # sum_query_on_kind,
         # sum_query_property_filter,
-        avg_query_on_kind,
+        # avg_query_on_kind,
         # avg_query_property_filter,
         # multiple_aggregations_query,
         # explain_analyze_entity,

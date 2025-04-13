@@ -658,7 +658,6 @@ impl DatastoreService for DatastoreEmulator {
             if let Some(ref mutation) = mutation.operation {
                 match mutation {
                     Operation::Insert(entity) => {
-                        // Handle insert operation
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => return Err(Status::invalid_argument("Entity missing key")),
@@ -685,19 +684,100 @@ impl DatastoreService for DatastoreEmulator {
                         let entity_list = storage
                             .entities
                             .entry(key_as_string)
-                            .or_insert_with(Vec::new);
+                            .or_default();
                         entity_list.push(entity_metadata);
 
-                        storage.update_indexes(&key_struct, &entity);
+                        storage.update_indexes(&key_struct, entity);
 
                         mutation_results.push(google::datastore::v1::MutationResult {
                             key: Some(key),
                             ..Default::default()
                         });
                     }
-                    _ => {
-                        // Handle other operations (update, delete, etc.)
-                        println!("Unsupported mutation operation");
+                    Operation::Update(entity) => {
+                        let key = match entity.key {
+                            Some(ref key) => key.clone(),
+                            None => return Err(Status::invalid_argument("Entity missing key")),
+                        };
+                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
+
+                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
+                            for entity_metadata in entity_list {
+                                entity_metadata.entity = entity.clone();
+                                entity_metadata.update_time = prost_types::Timestamp {
+                                    seconds: SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64,
+                                    nanos: 0,
+                                };
+                            }
+                            mutation_results.push(google::datastore::v1::MutationResult {
+                                key: Some(key),
+                                ..Default::default()
+                            });
+                        } else {
+                            return Err(Status::not_found("Entity not found"));
+                        }
+                    }
+                    Operation::Upsert(entity) => {
+                        let key = match entity.key {
+                            Some(ref key) => key.clone(),
+                            None => return Err(Status::invalid_argument("Entity missing key")),
+                        };
+                        let key_struct = KeyStruct::from_datastore_key(&key);
+                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
+
+                        let now = SystemTime::now();
+                        let timestamp = prost_types::Timestamp {
+                            seconds: now
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64,
+                            nanos: 0,
+                        };
+
+                        let entity_metadata = EntityWithMetadata {
+                            entity: entity.clone(),
+                            version: 1,
+                            create_time: timestamp.clone(),
+                            update_time: timestamp,
+                        };
+
+                        let entity_list = storage
+                            .entities
+                            .entry(key_as_string)
+                            .or_default();
+                        entity_list.push(entity_metadata);
+
+                        storage.update_indexes(&key_struct, entity);
+
+                        mutation_results.push(google::datastore::v1::MutationResult {
+                            key: Some(key),
+                            ..Default::default()
+                        });
+                    }
+                    Operation::Delete(key) => {
+                        let key_as_string = KeyStruct::from_datastore_to_string(key);
+                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
+                            // Remove the entity from the list
+                            let removed_itens = entity_list.extract_if(..,|entity| entity.entity.key == Some(key.clone())).collect::<Vec<_>>();
+                            if removed_itens.is_empty() {
+                                return Err(Status::not_found("Entity not found"));
+                            }
+                            for entity_metadata in removed_itens {
+                                // Clean up indexes if needed
+                                let key_struct = KeyStruct::from_datastore_key(key);
+                                storage.update_indexes(&key_struct, &entity_metadata.entity);
+                                mutation_results.push(google::datastore::v1::MutationResult {
+                                    key: Some(key.clone()),
+                                });
+                            }
+                        } else {
+                            // do we really need return 404, 
+                            // todo: check doc about not found items
+                            return Err(Status::not_found("Entity not found"));
+                        }
                     }
                 }
             } else {
