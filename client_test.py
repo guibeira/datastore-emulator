@@ -144,7 +144,7 @@ def count_query_in_transaction(client):
                 tasks.append(task3)
             else:
                 print(f"Found existing {tasks_count.value} tasks, rolling back")
-                client.entities_to_delete.extend(tasks)
+                # client.entities_to_delete.extend(tasks)
                 raise ValueError("User 'John' cannot have more than 2 tasks")
     # [END datastore_count_in_transaction]
 
@@ -182,12 +182,18 @@ def allocate_ids_example(client):
 
     # Save the entities to Datastore
     client.put_multi(entities)
+    breakpoint()
 
     # Now we can retrieve one of the entities to verify it was saved
     first_key = keys[0]
-    retrieved_entity = client.get(first_key)
+    second_key = keys[1]
+    first_retrieved_entity = client.get(first_key)
     print(f"Retrieved entity with key {first_key}")
-    print(f"Name: {retrieved_entity['name']}")
+    print(f"Description: {first_retrieved_entity['description']}")
+
+    second_retrieved_entity = client.get(second_key)
+    print(f"Retrieved entity with key {second_key}")
+    print(f"Description: {second_retrieved_entity['description']}")
 
     return entities
 
@@ -317,7 +323,7 @@ def sum_query_on_kind(client):
 
     tasks = [task1, task2, task3]
     client.put_multi(tasks)
-
+    breakpoint()
     # Execute sum aggregation query
     all_tasks_query = client.query(kind="Task")
     all_tasks_sum_query = client.aggregation_query(all_tasks_query).sum("hours")
@@ -615,7 +621,7 @@ def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
-        insert_examples,
+        # insert_examples,
         # in_query,
         # not_equals_query,
         # not_in_query,
@@ -627,7 +633,7 @@ def main(project_id):
         # count_query_with_stale_read,
         # sum_query_on_kind,
         # sum_query_property_filter,
-        # avg_query_on_kind,
+        avg_query_on_kind,
         # avg_query_property_filter,
         # multiple_aggregations_query,
         # explain_analyze_entity,
