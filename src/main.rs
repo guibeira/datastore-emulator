@@ -382,7 +382,6 @@ fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bo
                     filter_results.push(apply_filter(entity_metadata, &filter_type));
                 }
             }
-            //dbg!("Filter results: {:?}", &filter_results);
             // Combine results based on the composite filter operator
             // AND = 1, OR = 2
             match composity_filter.op {
@@ -656,59 +655,54 @@ impl DatastoreService for DatastoreEmulator {
 
         // Process mutations
         for mutation in req.mutations {
-            match mutation.operation {
-                None => {
-                    // Handle no operation
-                    println!("No operation specified");
+            if let Some(ref mutation) = mutation.operation {
+                match mutation {
+                    Operation::Insert(entity) => {
+                        // Handle insert operation
+                        let key = match entity.key {
+                            Some(ref key) => key.clone(),
+                            None => return Err(Status::invalid_argument("Entity missing key")),
+                        };
+                        let key_struct = KeyStruct::from_datastore_key(&key);
+                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
+
+                        let now = SystemTime::now();
+                        let timestamp = prost_types::Timestamp {
+                            seconds: now
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64,
+                            nanos: 0,
+                        };
+
+                        let entity_metadata = EntityWithMetadata {
+                            entity: entity.clone(),
+                            version: 1,
+                            create_time: timestamp.clone(),
+                            update_time: timestamp,
+                        };
+
+                        let entity_list = storage
+                            .entities
+                            .entry(key_as_string)
+                            .or_insert_with(Vec::new);
+                        entity_list.push(entity_metadata);
+
+                        storage.update_indexes(&key_struct, &entity);
+
+                        mutation_results.push(google::datastore::v1::MutationResult {
+                            key: Some(key),
+                            ..Default::default()
+                        });
+                    }
+                    _ => {
+                        // Handle other operations (update, delete, etc.)
+                        println!("Unsupported mutation operation");
+                    }
                 }
-                Some(Operation::Insert(entity) | Operation::Upsert(entity)) => {
-                    // Handle insert or upsert operation
-                    let key = match entity.key {
-                        Some(ref key) => key.clone(),
-                        None => return Err(Status::invalid_argument("Entity missing key")),
-                    };
-                    let key_struct = KeyStruct::from_datastore_key(&key);
-                    let key_as_string = KeyStruct::from_datastore_to_string(&key);
-
-                    let now = SystemTime::now();
-                    let timestamp = prost_types::Timestamp {
-                        seconds: now
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64,
-                        nanos: 0,
-                    };
-
-                    let entity_metadata = EntityWithMetadata {
-                        entity: entity.clone(),
-                        version: 1,
-                        create_time: timestamp.clone(),
-                        update_time: timestamp,
-                    };
-
-                    let entity_list = storage
-                        .entities
-                        .entry(key_as_string)
-                        .or_insert_with(Vec::new);
-                    entity_list.push(entity_metadata);
-
-                    storage.update_indexes(&key_struct, &entity);
-
-                    mutation_results.push(google::datastore::v1::MutationResult {
-                        key: Some(key),
-                        ..Default::default()
-                    });
-                }
-                Some(Operation::Update(entity)) => {
-                    // Handle update operation
-                    println!("Updating entity: {:?}", entity);
-                }
-                _ => {
-                    // Handle other types of mutations (delete, etc.)
-                    println!("Unsupported mutation operation");
-                }
+            } else {
+                //  What should return if there is not mutation?
             }
-            // Handle other types of mutations (delete, update) here
         }
 
         let index_updates = mutation_results.len() as i32;
@@ -928,7 +922,6 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
         let req = request.into_inner();
-        dbg!(&req);
         let storage = self.storage.lock().unwrap();
 
         // Extract the aggregation query from the request
