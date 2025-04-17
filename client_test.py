@@ -536,13 +536,37 @@ def explain_analyze_aggregation(client):
 
 def in_query(client):
     # [START datastore_in_query]
+
+    task1 = datastore.Entity(client.key("Task", "sample_task_1"))
+    task1.update(
+        {
+            "description": "Item with priority 4",
+            "created": datetime.now(timezone.utc),
+            "done": False,
+            "priority": 4,
+            "tags": ["shopping", "errands"],
+        }
+    )
+    client.put(task1)
+    task2 = datastore.Entity(client.key("Task", "sample_task_1"))
+    task2.update(
+        {
+            "description": "Item with priority 5",
+            "created": datetime.now(timezone.utc),
+            "done": False,
+            "priority": 5,
+            "tags": ["shopping", "errands"],
+        }
+    )
+    client.put(task2)
+
     query = client.query(kind="Task")
-    query.add_filter("tag", "IN", ["learn", "study"])
-    query.add_filter(filter=PropertyFilter("confirmed", "=", True))
+    query.add_filter("priority", "=", 4)
+    # query.add_filter(filter=PropertyFilter("confirmed", "=", True))
     # query.add_filter(property_name="tag", operator="IN", value=["learn", "study"])
     # [END datastore_in_query]
-
-    return list(query.fetch())
+    results = [i for i in query.fetch()]
+    return results
 
 
 def insert_examples(client):
@@ -690,9 +714,9 @@ def main(project_id):
 
     functions_to_call = [
         # delete_example,
-        delete_multi_example,
+        # delete_multi_example,
         # insert_examples,
-        # in_query,
+        in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,

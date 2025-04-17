@@ -432,7 +432,7 @@ impl DatastoreService for DatastoreEmulator {
         let storage = self.storage.lock().unwrap();
         let mut found = Vec::new();
 
-        // Process each key in the request
+        // process each key in the request
         for key in &req.keys {
             let key_struct = KeyStruct::from_datastore_key(key);
             let key_as_string = KeyStruct::from_datastore_to_string(key);
@@ -456,6 +456,7 @@ impl DatastoreService for DatastoreEmulator {
                             cursor: vec![],
                             version: entity.version as i64,
                         });
+                        break; // Uncomment if you want to stop after finding the first match
                     }
                 }
             } else {
@@ -487,77 +488,51 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
-
-        let mut properties = HashMap::new();
-        properties.insert(
-            "name".to_string(),
-            google::datastore::v1::Value {
-                exclude_from_indexes: false,
-                meaning: 0,
-                value_type: Some(google::datastore::v1::value::ValueType::StringValue(
-                    "example_name".to_string(),
-                )),
-            },
-        );
-
-        let key = Key {
-            partition_id: req.partition_id.clone(),
-            path: vec![],
+        let storage = self.storage.lock().unwrap();
+        let mut results = Vec::new();
+        // Extract the aggregation query from the request
+        let aggregation_query = match req.query_type {
+            Some(google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
+            _ => {
+                // implement other query types if needed
+                return Err(Status::invalid_argument(
+                    "Missing or invalid aggregation query",
+                ));
+            }
         };
 
-        let results = vec![
-            EntityResult {
-                entity: Some(Entity {
-                    key: Some(key.clone()),
-                    properties: properties.clone(),
-                }),
-                create_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                update_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                cursor: vec![],
-                version: 1,
-            },
-            EntityResult {
-                entity: Some(Entity {
-                    key: Some(key.clone()),
-                    properties: properties.clone(),
-                }),
-                create_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                update_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                cursor: vec![],
-                version: 2,
-            },
-            EntityResult {
-                entity: Some(Entity {
-                    key: Some(key.clone()),
-                    properties: properties.clone(),
-                }),
-                create_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                update_time: Some(prost_types::Timestamp {
-                    seconds: 10,
-                    nanos: 0,
-                }),
-                cursor: vec![],
-                version: 3,
-            },
-        ];
+        let kind_name = aggregation_query.kind[0].name.clone();
+        if let Some(entities) = storage.entities.get(&kind_name) {
+            for entity in entities {
+                // Check if the entity matches the filter
+                if let Some(ref filter) = aggregation_query.filter {
+                    if let Some(filter_type) = &filter.filter_type {
+                        if !apply_filter(entity, filter_type) {
+                            continue; // Skip this entity if it doesn't match the filter
+                        }
+                    }
+                }
+
+                // Add the entity to the results
+                results.push(EntityResult {
+                    entity: Some(entity.entity.clone()),
+                    create_time: Some(entity.create_time.clone()),
+                    update_time: Some(entity.update_time.clone()),
+                    cursor: vec![],
+                    version: entity.version as i64,
+                });
+            }
+        }
+
+        dbg!("Results {:?}", &results);
         let batch = google::datastore::v1::QueryResultBatch {
+            entity_result_type: 1,
+            skipped_results: 0,
+            read_time: None,
+            skipped_cursor: vec![],
+            snapshot_version: 0,
             entity_results: results,
-            more_results: 3, // NO_MORE_RESULTS
+            more_results: 0, // NO_MORE_RESULTS
             end_cursor: Vec::new(),
         };
 
@@ -571,21 +546,21 @@ impl DatastoreService for DatastoreEmulator {
         let debug_stats = Struct {
             fields: fields.clone(),
         };
-        let query = Query {
-            projection: vec![],
-            kind: vec![],
-            filter: None,
-            order: vec![],
-            distinct_on: vec![],
-            start_cursor: Vec::new(),
-            end_cursor: Vec::new(),
-            offset: 1,
-            limit: Some(2),
-            find_nearest: None,
-        };
+        // let query = Query {
+        //     projection: vec![],
+        //     kind: vec![],
+        //     filter: None,
+        //     order: vec![],
+        //     distinct_on: vec![],
+        //     start_cursor: Vec::new(),
+        //     end_cursor: Vec::new(),
+        //     offset: 1,
+        //     limit: Some(2),
+        //     find_nearest: None,
+        // };
         Ok(Response::new(RunQueryResponse {
-            transaction: vec![],
-            query: Some(query),
+            transaction: vec![1],
+            query: Some(aggregation_query), // Some(query),
             batch: Some(batch),
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
@@ -681,10 +656,7 @@ impl DatastoreService for DatastoreEmulator {
                             update_time: timestamp,
                         };
 
-                        let entity_list = storage
-                            .entities
-                            .entry(key_as_string)
-                            .or_default();
+                        let entity_list = storage.entities.entry(key_as_string).or_default();
                         entity_list.push(entity_metadata);
 
                         storage.update_indexes(&key_struct, entity);
@@ -708,7 +680,8 @@ impl DatastoreService for DatastoreEmulator {
                                     seconds: SystemTime::now()
                                         .duration_since(SystemTime::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_secs() as i64,
+                                        .as_secs()
+                                        as i64,
                                     nanos: 0,
                                 };
                             }
@@ -717,7 +690,9 @@ impl DatastoreService for DatastoreEmulator {
                                 ..Default::default()
                             });
                         } else {
-                            return Err(Status::not_found("Entity not found"));
+                            // do we really need return 404,
+                            // todo: check doc about not found items
+                            //return Err(Status::not_found("Entity not found"));
                         }
                     }
                     Operation::Upsert(entity) => {
@@ -744,10 +719,7 @@ impl DatastoreService for DatastoreEmulator {
                             update_time: timestamp,
                         };
 
-                        let entity_list = storage
-                            .entities
-                            .entry(key_as_string)
-                            .or_default();
+                        let entity_list = storage.entities.entry(key_as_string).or_default();
                         entity_list.push(entity_metadata);
 
                         storage.update_indexes(&key_struct, entity);
@@ -761,9 +733,13 @@ impl DatastoreService for DatastoreEmulator {
                         let key_as_string = KeyStruct::from_datastore_to_string(key);
                         if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
                             // Remove the entity from the list
-                            let removed_itens = entity_list.extract_if(..,|entity| entity.entity.key == Some(key.clone())).collect::<Vec<_>>();
+                            let removed_itens = entity_list
+                                .extract_if(.., |entity| entity.entity.key == Some(key.clone()))
+                                .collect::<Vec<_>>();
                             if removed_itens.is_empty() {
-                                return Err(Status::not_found("Entity not found"));
+                                // do we really need return 404,
+                                // todo: check doc about not found items
+                                //return Err(Status::not_found("Entity not found"));
                             }
                             for entity_metadata in removed_itens {
                                 // Clean up indexes if needed
@@ -774,9 +750,9 @@ impl DatastoreService for DatastoreEmulator {
                                 });
                             }
                         } else {
-                            // do we really need return 404, 
+                            // do we really need return 404,
                             // todo: check doc about not found items
-                            return Err(Status::not_found("Entity not found"));
+                            //return Err(Status::not_found("Entity not found"));
                         }
                     }
                 }
