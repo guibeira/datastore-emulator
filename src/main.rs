@@ -1,13 +1,10 @@
-use google::datastore::v1::Filter;
-use google::datastore::v1::aggregation_query::Aggregation;
-use google::datastore::v1::aggregation_query::aggregation::Count;
 use google::datastore::v1::commit_request::TransactionSelector;
 use google::datastore::v1::filter::FilterType;
-use google::datastore::v1::key::PathElement;
 use google::datastore::v1::key::path_element::IdType;
+use google::datastore::v1::key::PathElement;
 use google::datastore::v1::mutation::Operation;
-use google::datastore::v1::property_filter::Operator;
 use google::datastore::v1::value::ValueType;
+use google::datastore::v1::Filter;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -15,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{transport::Server, Request, Response, Status};
 
 // Import the generated code
 pub mod google {
@@ -29,10 +26,10 @@ pub mod google {
 use google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationQuery, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
+    AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
     EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation,
-    PartitionId, PingRequest, PingResponse, PlanSummary, PropertyReference, Query,
+    PingRequest, PingResponse, PlanSummary, PropertyReference, 
     ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
@@ -72,7 +69,7 @@ impl DatastoreStorage {
                     let index_key = (kind.clone(), prop_name.clone(), value_str);
                     self.indexes
                         .entry(index_key)
-                        .or_insert_with(BTreeSet::new)
+                        .or_default()
                         .insert(key_struct.clone());
                 }
             }
@@ -106,9 +103,9 @@ impl KeyStruct {
             //     Some(IdType::Name(name)) => format!("name: {}", name),
             //     None => continue,
             // };
-            path_elements.push(format!("{}", kind));
+            path_elements.push(kind.to_string());
         }
-        format!("{}", path_elements.join(", "))
+        path_elements.join(", ").to_string()
     }
 
     fn from_datastore_key(key: &Key) -> Self {
@@ -349,7 +346,7 @@ fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bo
                                 return entity_value.value_type == value.value_type;
                             }
                             6 => { // IN = 6;
-                                // todo: implement this
+                                 // todo: implement this
                             }
                             9 => {
                                 // NOT_EQUAL = 9;
@@ -434,7 +431,6 @@ impl DatastoreService for DatastoreEmulator {
 
         // process each key in the request
         for key in &req.keys {
-            let key_struct = KeyStruct::from_datastore_key(key);
             let key_as_string = KeyStruct::from_datastore_to_string(key);
 
             // Look up the key in storage
@@ -524,7 +520,6 @@ impl DatastoreService for DatastoreEmulator {
             }
         }
 
-        dbg!("Results {:?}", &results);
         let batch = google::datastore::v1::QueryResultBatch {
             entity_result_type: 1,
             skipped_results: 0,
@@ -546,22 +541,11 @@ impl DatastoreService for DatastoreEmulator {
         let debug_stats = Struct {
             fields: fields.clone(),
         };
-        // let query = Query {
-        //     projection: vec![],
-        //     kind: vec![],
-        //     filter: None,
-        //     order: vec![],
-        //     distinct_on: vec![],
-        //     start_cursor: Vec::new(),
-        //     end_cursor: Vec::new(),
-        //     offset: 1,
-        //     limit: Some(2),
-        //     find_nearest: None,
-        // };
         Ok(Response::new(RunQueryResponse {
             transaction: vec![1],
-            query: Some(aggregation_query), // Some(query),
+            query: Some(aggregation_query),
             batch: Some(batch),
+            // todo: create real metrics
             explain_metrics: Some(ExplainMetrics {
                 plan_summary: Some(PlanSummary {
                     indexes_used: vec![Struct {
@@ -888,7 +872,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
         let req = request.into_inner();
-        let mut storage = self.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
         let mut allocated_keys = Vec::new();
 
         // Process each incomplete key in the request
@@ -942,7 +926,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
         let req = request.into_inner();
-        let mut storage = self.storage.lock().unwrap();
+        let storage = self.storage.lock().unwrap();
 
         // Process each key in the request
         for key in &req.keys {
@@ -961,9 +945,6 @@ impl DatastoreService for DatastoreEmulator {
                     }
                 }
             }
-
-            // Create a KeyStruct for this key to potentially use in future lookups
-            let key_struct = KeyStruct::from_datastore_key(key);
 
             // We could store reserved keys in a separate collection if needed
             // For now, we just ensure the ID counter is updated
