@@ -1,10 +1,10 @@
+use google::datastore::v1::Filter;
 use google::datastore::v1::commit_request::TransactionSelector;
 use google::datastore::v1::filter::FilterType;
-use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::key::PathElement;
+use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::mutation::Operation;
 use google::datastore::v1::value::ValueType;
-use google::datastore::v1::Filter;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 // Import the generated code
 pub mod google {
@@ -26,12 +26,12 @@ pub mod google {
 use google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
-    AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
-    BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
-    EntityResult, ExecutionStats, ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation,
-    PingRequest, PingResponse, PlanSummary, PropertyReference, 
-    ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
-    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
+    AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
+    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
+    ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation, PingRequest, PingResponse,
+    PlanSummary, PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest,
+    RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest,
+    RunQueryResponse,
 };
 
 #[derive(Default, Debug)]
@@ -52,13 +52,259 @@ impl DatastoreStorage {
         self.transactions.remove(transaction_id);
     }
 
+    fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bool {
+        match filter {
+            FilterType::PropertyFilter(property_filter) => {
+                if let Some(ref property) = property_filter.property {
+                    if let Some(ref value) = property_filter.value {
+                        // check if the property exists in the entity
+                        if let Some(entity_value) =
+                            entity_metadata.entity.properties.get(&property.name)
+                        {
+                            // Comparar os valores com base no operador
+                            // OPERATOR_UNSPECIFIED = 0;
+                            // LESS_THAN = 1;
+                            // LESS_THAN_OR_EQUAL = 2;
+                            // GREATER_THAN = 3;
+                            // GREATER_THAN_OR_EQUAL = 4;
+                            // EQUAL = 5;
+                            // IN = 6;
+                            // NOT_EQUAL = 9;
+                            // HAS_ANCESTOR = 11;
+                            // NOT_IN = 13;
+                            //
+                            // TYPES
+                            // NullValue(i32),
+                            // #[prost(bool, tag = "1")]
+                            // BooleanValue(bool),
+                            // #[prost(int64, tag = "2")]
+                            // IntegerValue(i64),
+                            // #[prost(double, tag = "3")]
+                            // DoubleValue(f64),
+                            // #[prost(message, tag = "10")]
+                            // TimestampValue(::prost_types::Timestamp),
+                            // #[prost(message, tag = "5")]
+                            // KeyValue(super::Key),
+                            // #[prost(string, tag = "17")]
+                            // StringValue(::prost::alloc::string::String),
+                            // #[prost(bytes, tag = "18")]
+                            // BlobValue(::prost::alloc::vec::Vec<u8>),
+                            // #[prost(message, tag = "8")]
+                            // GeoPointValue(super::LatLng),
+                            // #[prost(message, tag = "6")]
+                            // EntityValue(super::Entity),
+                            // #[prost(message, tag = "9")]
+                            // ArrayValue(super::ArrayValue),
+                            match property_filter.op {
+                                0 => {
+                                    // OPERATOR_UNSPECIFIED
+                                    return true;
+                                }
+                                1 => {
+                                    // LESS_THAN = 1;
+                                    match (&entity_value.value_type, &value.value_type) {
+                                        (
+                                            Some(ValueType::IntegerValue(entity_val)),
+                                            Some(ValueType::IntegerValue(filter_val)),
+                                        ) => {
+                                            return entity_val < filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::DoubleValue(entity_val)),
+                                            Some(ValueType::DoubleValue(filter_val)),
+                                        ) => {
+                                            return entity_val < filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::StringValue(entity_val)),
+                                            Some(ValueType::StringValue(filter_val)),
+                                        ) => {
+                                            return entity_val < filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::TimestampValue(entity_val)),
+                                            Some(ValueType::TimestampValue(filter_val)),
+                                        ) => {
+                                            return entity_val.seconds < filter_val.seconds
+                                                || (entity_val.seconds == filter_val.seconds
+                                                    && entity_val.nanos < filter_val.nanos);
+                                        }
+                                        _ => {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                2 => {
+                                    // LESS_THAN_OR_EQUAL = 2;
+                                    match (&entity_value.value_type, &value.value_type) {
+                                        (
+                                            Some(ValueType::IntegerValue(entity_val)),
+                                            Some(ValueType::IntegerValue(filter_val)),
+                                        ) => {
+                                            return entity_val <= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::DoubleValue(entity_val)),
+                                            Some(ValueType::DoubleValue(filter_val)),
+                                        ) => {
+                                            return entity_val <= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::StringValue(entity_val)),
+                                            Some(ValueType::StringValue(filter_val)),
+                                        ) => {
+                                            return entity_val <= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::TimestampValue(entity_val)),
+                                            Some(ValueType::TimestampValue(filter_val)),
+                                        ) => {
+                                            return entity_val.seconds < filter_val.seconds
+                                                || (entity_val.seconds == filter_val.seconds
+                                                    && entity_val.nanos <= filter_val.nanos);
+                                        }
+                                        _ => {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                3 => {
+                                    // GREATER_THAN = 3;
+                                    match (&entity_value.value_type, &value.value_type) {
+                                        (
+                                            Some(ValueType::IntegerValue(entity_val)),
+                                            Some(ValueType::IntegerValue(filter_val)),
+                                        ) => {
+                                            return entity_val > filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::DoubleValue(entity_val)),
+                                            Some(ValueType::DoubleValue(filter_val)),
+                                        ) => {
+                                            return entity_val > filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::StringValue(entity_val)),
+                                            Some(ValueType::StringValue(filter_val)),
+                                        ) => {
+                                            return entity_val > filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::TimestampValue(entity_val)),
+                                            Some(ValueType::TimestampValue(filter_val)),
+                                        ) => {
+                                            return entity_val.seconds > filter_val.seconds
+                                                || (entity_val.seconds == filter_val.seconds
+                                                    && entity_val.nanos > filter_val.nanos);
+                                        }
+                                        _ => {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    // GREATER_THAN_OR_EQUAL = 4;
+                                    match (&entity_value.value_type, &value.value_type) {
+                                        (
+                                            Some(ValueType::IntegerValue(entity_val)),
+                                            Some(ValueType::IntegerValue(filter_val)),
+                                        ) => {
+                                            return entity_val >= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::DoubleValue(entity_val)),
+                                            Some(ValueType::DoubleValue(filter_val)),
+                                        ) => {
+                                            return entity_val >= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::StringValue(entity_val)),
+                                            Some(ValueType::StringValue(filter_val)),
+                                        ) => {
+                                            return entity_val >= filter_val;
+                                        }
+                                        (
+                                            Some(ValueType::TimestampValue(entity_val)),
+                                            Some(ValueType::TimestampValue(filter_val)),
+                                        ) => {
+                                            return entity_val.seconds > filter_val.seconds
+                                                || (entity_val.seconds == filter_val.seconds
+                                                    && entity_val.nanos >= filter_val.nanos);
+                                        }
+                                        _ => {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                5 => {
+                                    // EQUAL = 5;
+                                    return entity_value.value_type == value.value_type;
+                                }
+                                6 => { // IN = 6;
+                                    // todo: implement this
+                                }
+                                9 => {
+                                    // NOT_EQUAL = 9;
+                                    return entity_value.value_type != value.value_type;
+                                }
+                                11 => {
+                                    // HAS_ANCESTOR = 11;
+                                    // todo: implement this
+                                    return true;
+                                }
+                                13 => {
+                                    // NOT_IN = 13;
+                                    //  todo: implement this
+                                    return true;
+                                }
+                                _ => {
+                                    // Unsupported operator
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            FilterType::CompositeFilter(composity_filter) => {
+                let mut filter_results = Vec::new();
+                for filter in composity_filter.filters.clone() {
+                    // Apply filter recursively
+                    if let Some(filter_type) = filter.filter_type {
+                        filter_results.push(DatastoreStorage::apply_filter(
+                            entity_metadata,
+                            &filter_type,
+                        ));
+                    }
+                }
+                // Combine results based on the composite filter operator
+                // AND = 1, OR = 2
+                match composity_filter.op {
+                    1 => {
+                        // AND we can translate to ALL are true
+                        return filter_results.iter().all(|&result| result);
+                    }
+                    2 => {
+                        // Or we can translate to ANY is true
+                        return filter_results.iter().any(|&result| result);
+                    }
+                    _ => {
+                        // OPERATOR_UNSPECIFIED
+                        return true;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
         // Search for the entity in the storage
         let key_as_string = KeyStruct::from_datastore_to_string(key);
         if let Some(entities) = self.entities.get(&key_as_string) {
             if entities.is_empty() {
                 return None;
-            }else{
+            } else {
                 for entity in entities.iter() {
                     if entity.entity.key == Some(key.clone()) {
                         return Some(entity.clone());
@@ -71,7 +317,7 @@ impl DatastoreStorage {
         None
     }
 
-    fn get_entities(&self,  key_db: String, filter: Option<Filter>) -> Vec<EntityResult> {
+    fn get_entities(&self, key_db: String, filter: Option<Filter>) -> Vec<EntityResult> {
         // Search for the entity in the storage
         let mut results = Vec::new();
         if let Some(entities) = self.entities.get(&key_db) {
@@ -79,7 +325,7 @@ impl DatastoreStorage {
                 if let Some(ref filter) = filter {
                     if let Some(filter_type) = &filter.filter_type {
                         // Check if the entity matches the filter
-                        if !apply_filter(entity, filter_type) {
+                        if !DatastoreStorage::apply_filter(entity, filter_type) {
                             continue; // Skip this entity if it doesn't match the filter
                         }
                     }
@@ -210,249 +456,6 @@ impl Default for DatastoreEmulator {
     }
 }
 
-fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bool {
-    match filter {
-        FilterType::PropertyFilter(property_filter) => {
-            if let Some(ref property) = property_filter.property {
-                if let Some(ref value) = property_filter.value {
-                    // check if the property exists in the entity
-                    if let Some(entity_value) =
-                        entity_metadata.entity.properties.get(&property.name)
-                    {
-                        // Comparar os valores com base no operador
-                        // OPERATOR_UNSPECIFIED = 0;
-                        // LESS_THAN = 1;
-                        // LESS_THAN_OR_EQUAL = 2;
-                        // GREATER_THAN = 3;
-                        // GREATER_THAN_OR_EQUAL = 4;
-                        // EQUAL = 5;
-                        // IN = 6;
-                        // NOT_EQUAL = 9;
-                        // HAS_ANCESTOR = 11;
-                        // NOT_IN = 13;
-                        //
-                        // TYPES
-                        // NullValue(i32),
-                        // #[prost(bool, tag = "1")]
-                        // BooleanValue(bool),
-                        // #[prost(int64, tag = "2")]
-                        // IntegerValue(i64),
-                        // #[prost(double, tag = "3")]
-                        // DoubleValue(f64),
-                        // #[prost(message, tag = "10")]
-                        // TimestampValue(::prost_types::Timestamp),
-                        // #[prost(message, tag = "5")]
-                        // KeyValue(super::Key),
-                        // #[prost(string, tag = "17")]
-                        // StringValue(::prost::alloc::string::String),
-                        // #[prost(bytes, tag = "18")]
-                        // BlobValue(::prost::alloc::vec::Vec<u8>),
-                        // #[prost(message, tag = "8")]
-                        // GeoPointValue(super::LatLng),
-                        // #[prost(message, tag = "6")]
-                        // EntityValue(super::Entity),
-                        // #[prost(message, tag = "9")]
-                        // ArrayValue(super::ArrayValue),
-                        match property_filter.op {
-                            0 => {
-                                // OPERATOR_UNSPECIFIED
-                                return true;
-                            }
-                            1 => {
-                                // LESS_THAN = 1;
-                                match (&entity_value.value_type, &value.value_type) {
-                                    (
-                                        Some(ValueType::IntegerValue(entity_val)),
-                                        Some(ValueType::IntegerValue(filter_val)),
-                                    ) => {
-                                        return entity_val < filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::DoubleValue(entity_val)),
-                                        Some(ValueType::DoubleValue(filter_val)),
-                                    ) => {
-                                        return entity_val < filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::StringValue(entity_val)),
-                                        Some(ValueType::StringValue(filter_val)),
-                                    ) => {
-                                        return entity_val < filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::TimestampValue(entity_val)),
-                                        Some(ValueType::TimestampValue(filter_val)),
-                                    ) => {
-                                        return entity_val.seconds < filter_val.seconds
-                                            || (entity_val.seconds == filter_val.seconds
-                                                && entity_val.nanos < filter_val.nanos);
-                                    }
-                                    _ => {
-                                        return true;
-                                    }
-                                }
-                            }
-                            2 => {
-                                // LESS_THAN_OR_EQUAL = 2;
-                                match (&entity_value.value_type, &value.value_type) {
-                                    (
-                                        Some(ValueType::IntegerValue(entity_val)),
-                                        Some(ValueType::IntegerValue(filter_val)),
-                                    ) => {
-                                        return entity_val <= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::DoubleValue(entity_val)),
-                                        Some(ValueType::DoubleValue(filter_val)),
-                                    ) => {
-                                        return entity_val <= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::StringValue(entity_val)),
-                                        Some(ValueType::StringValue(filter_val)),
-                                    ) => {
-                                        return entity_val <= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::TimestampValue(entity_val)),
-                                        Some(ValueType::TimestampValue(filter_val)),
-                                    ) => {
-                                        return entity_val.seconds < filter_val.seconds
-                                            || (entity_val.seconds == filter_val.seconds
-                                                && entity_val.nanos <= filter_val.nanos);
-                                    }
-                                    _ => {
-                                        return true;
-                                    }
-                                }
-                            }
-                            3 => {
-                                // GREATER_THAN = 3;
-                                match (&entity_value.value_type, &value.value_type) {
-                                    (
-                                        Some(ValueType::IntegerValue(entity_val)),
-                                        Some(ValueType::IntegerValue(filter_val)),
-                                    ) => {
-                                        return entity_val > filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::DoubleValue(entity_val)),
-                                        Some(ValueType::DoubleValue(filter_val)),
-                                    ) => {
-                                        return entity_val > filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::StringValue(entity_val)),
-                                        Some(ValueType::StringValue(filter_val)),
-                                    ) => {
-                                        return entity_val > filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::TimestampValue(entity_val)),
-                                        Some(ValueType::TimestampValue(filter_val)),
-                                    ) => {
-                                        return entity_val.seconds > filter_val.seconds
-                                            || (entity_val.seconds == filter_val.seconds
-                                                && entity_val.nanos > filter_val.nanos);
-                                    }
-                                    _ => {
-                                        return true;
-                                    }
-                                }
-                            }
-                            4 => {
-                                // GREATER_THAN_OR_EQUAL = 4;
-                                match (&entity_value.value_type, &value.value_type) {
-                                    (
-                                        Some(ValueType::IntegerValue(entity_val)),
-                                        Some(ValueType::IntegerValue(filter_val)),
-                                    ) => {
-                                        return entity_val >= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::DoubleValue(entity_val)),
-                                        Some(ValueType::DoubleValue(filter_val)),
-                                    ) => {
-                                        return entity_val >= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::StringValue(entity_val)),
-                                        Some(ValueType::StringValue(filter_val)),
-                                    ) => {
-                                        return entity_val >= filter_val;
-                                    }
-                                    (
-                                        Some(ValueType::TimestampValue(entity_val)),
-                                        Some(ValueType::TimestampValue(filter_val)),
-                                    ) => {
-                                        return entity_val.seconds > filter_val.seconds
-                                            || (entity_val.seconds == filter_val.seconds
-                                                && entity_val.nanos >= filter_val.nanos);
-                                    }
-                                    _ => {
-                                        return true;
-                                    }
-                                }
-                            }
-                            5 => {
-                                // EQUAL = 5;
-                                return entity_value.value_type == value.value_type;
-                            }
-                            6 => { // IN = 6;
-                                 // todo: implement this
-                            }
-                            9 => {
-                                // NOT_EQUAL = 9;
-                                return entity_value.value_type != value.value_type;
-                            }
-                            11 => {
-                                // HAS_ANCESTOR = 11;
-                                // todo: implement this
-                                return true;
-                            }
-                            13 => {
-                                // NOT_IN = 13;
-                                //  todo: implement this
-                                return true;
-                            }
-                            _ => {
-                                // Unsupported operator
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        FilterType::CompositeFilter(composity_filter) => {
-            let mut filter_results = Vec::new();
-            for filter in composity_filter.filters.clone() {
-                // Apply filter recursively
-                if let Some(filter_type) = filter.filter_type {
-                    filter_results.push(apply_filter(entity_metadata, &filter_type));
-                }
-            }
-            // Combine results based on the composite filter operator
-            // AND = 1, OR = 2
-            match composity_filter.op {
-                1 => {
-                    // AND we can translate to ALL are true
-                    return filter_results.iter().all(|&result| result);
-                }
-                2 => {
-                    // Or we can translate to ANY is true
-                    return filter_results.iter().any(|&result| result);
-                }
-                _ => {
-                    // OPERATOR_UNSPECIFIED
-                    return true;
-                }
-            }
-        }
-    }
-    true
-}
-
 #[tonic::async_trait]
 impl DatastoreService for DatastoreEmulator {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
@@ -486,13 +489,13 @@ impl DatastoreService for DatastoreEmulator {
         for key in &req.keys {
             let result_entity = storage.get_entity(key);
             if let Some(entity) = result_entity {
-                    found.push(EntityResult {
-                        entity: Some(entity.entity.clone()),
-                        create_time: Some(entity.create_time.clone()),
-                        update_time: Some(entity.update_time.clone()),
-                        cursor: vec![],
-                        version: entity.version as i64,
-                    });
+                found.push(EntityResult {
+                    entity: Some(entity.entity.clone()),
+                    create_time: Some(entity.create_time.clone()),
+                    update_time: Some(entity.update_time.clone()),
+                    cursor: vec![],
+                    version: entity.version as i64,
+                });
             }
         }
 
@@ -533,10 +536,7 @@ impl DatastoreService for DatastoreEmulator {
         };
         let kind_name = aggregation_query.kind[0].name.clone();
 
-        let results = storage.get_entities(
-            kind_name,
-            aggregation_query.filter.clone(),
-        );
+        let results = storage.get_entities(kind_name, aggregation_query.filter.clone());
 
         let batch = google::datastore::v1::QueryResultBatch {
             entity_result_type: 1,
@@ -1036,7 +1036,7 @@ impl DatastoreService for DatastoreEmulator {
                         }
                         // Apply filters if present
                         if let Some(filter) = &filters.filter_type {
-                            if apply_filter(entity_metadata, filter) {
+                            if DatastoreStorage::apply_filter(entity_metadata, filter) {
                                 matching_entities.push(entity_metadata);
                             }
                         } else {
