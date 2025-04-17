@@ -713,10 +713,10 @@ def main(project_id):
     client = datastore.Client(project_id)
 
     functions_to_call = [
-        # delete_example,
+        delete_example,
         # delete_multi_example,
         # insert_examples,
-        in_query,
+        # in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,

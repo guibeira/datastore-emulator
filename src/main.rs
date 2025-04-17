@@ -52,6 +52,25 @@ impl DatastoreStorage {
         self.transactions.remove(transaction_id);
     }
 
+    fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
+        // Search for the entity in the storage
+        let key_as_string = KeyStruct::from_datastore_to_string(key);
+        if let Some(entities) = self.entities.get(&key_as_string) {
+            if entities.is_empty() {
+                return None;
+            }else{
+                for entity in entities.iter() {
+                    if entity.entity.key == Some(key.clone()) {
+                        return Some(entity.clone());
+                    }
+                }
+            }
+        } else {
+            return None;
+        }
+        None
+    }
+
     fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // Para cada propriedade da entidade, criar índices
         for (prop_name, prop_value) in &entity.properties {
@@ -78,7 +97,7 @@ impl DatastoreStorage {
 }
 
 // Entidade com metadados
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct EntityWithMetadata {
     entity: Entity,
     version: u64,
@@ -431,32 +450,15 @@ impl DatastoreService for DatastoreEmulator {
 
         // process each key in the request
         for key in &req.keys {
-            let key_as_string = KeyStruct::from_datastore_to_string(key);
-
-            // Look up the key in storage
-            if let Some(entity_metadata) = storage.entities.get(&key_as_string) {
-                for entity in entity_metadata {
-                    // Check if the entity is found
-                    if entity.entity.key.is_none() {
-                        return Err(Status::not_found("Entity not found"));
-                    }
-
-                    // Check if the key matches the requested key
-                    let entity_key = entity.entity.key.clone().unwrap();
-                    if entity_key == *key {
-                        // Entity found, add to results
-                        found.push(EntityResult {
-                            entity: Some(entity.entity.clone()),
-                            create_time: Some(entity.create_time.clone()),
-                            update_time: Some(entity.update_time.clone()),
-                            cursor: vec![],
-                            version: entity.version as i64,
-                        });
-                        break; // Uncomment if you want to stop after finding the first match
-                    }
-                }
-            } else {
-                // do we really need to check for missing keys?
+            let result_entity = storage.get_entity(key);
+            if let Some(entity) = result_entity {
+                    found.push(EntityResult {
+                        entity: Some(entity.entity.clone()),
+                        create_time: Some(entity.create_time.clone()),
+                        update_time: Some(entity.update_time.clone()),
+                        cursor: vec![],
+                        version: entity.version as i64,
+                    });
             }
         }
 
