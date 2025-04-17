@@ -71,6 +71,40 @@ impl DatastoreStorage {
         None
     }
 
+    fn get_entities(&self,  key_db: String, filter: Option<Filter>) -> Vec<EntityResult> {
+        // Search for the entity in the storage
+        let mut results = Vec::new();
+        if let Some(entities) = self.entities.get(&key_db) {
+            for entity in entities.iter() {
+                if let Some(ref filter) = filter {
+                    if let Some(filter_type) = &filter.filter_type {
+                        // Check if the entity matches the filter
+                        if !apply_filter(entity, filter_type) {
+                            continue; // Skip this entity if it doesn't match the filter
+                        }
+                    }
+
+                    results.push(EntityResult {
+                        entity: Some(entity.entity.clone()),
+                        create_time: Some(entity.create_time.clone()),
+                        update_time: Some(entity.update_time.clone()),
+                        cursor: vec![],
+                        version: entity.version as i64,
+                    });
+                } else {
+                    results.push(EntityResult {
+                        entity: Some(entity.entity.clone()),
+                        create_time: Some(entity.create_time.clone()),
+                        update_time: Some(entity.update_time.clone()),
+                        cursor: vec![],
+                        version: entity.version as i64,
+                    });
+                }
+            }
+        }
+        results
+    }
+
     fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // Para cada propriedade da entidade, criar índices
         for (prop_name, prop_value) in &entity.properties {
@@ -487,7 +521,6 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<RunQueryResponse>, Status> {
         let req = request.into_inner();
         let storage = self.storage.lock().unwrap();
-        let mut results = Vec::new();
         // Extract the aggregation query from the request
         let aggregation_query = match req.query_type {
             Some(google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
@@ -498,29 +531,12 @@ impl DatastoreService for DatastoreEmulator {
                 ));
             }
         };
-
         let kind_name = aggregation_query.kind[0].name.clone();
-        if let Some(entities) = storage.entities.get(&kind_name) {
-            for entity in entities {
-                // Check if the entity matches the filter
-                if let Some(ref filter) = aggregation_query.filter {
-                    if let Some(filter_type) = &filter.filter_type {
-                        if !apply_filter(entity, filter_type) {
-                            continue; // Skip this entity if it doesn't match the filter
-                        }
-                    }
-                }
 
-                // Add the entity to the results
-                results.push(EntityResult {
-                    entity: Some(entity.entity.clone()),
-                    create_time: Some(entity.create_time.clone()),
-                    update_time: Some(entity.update_time.clone()),
-                    cursor: vec![],
-                    version: entity.version as i64,
-                });
-            }
-        }
+        let results = storage.get_entities(
+            kind_name,
+            aggregation_query.filter.clone(),
+        );
 
         let batch = google::datastore::v1::QueryResultBatch {
             entity_result_type: 1,
