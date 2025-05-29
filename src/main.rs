@@ -279,7 +279,7 @@ impl DatastoreStorage {
     fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
         // Search for the entity in the storage
         let key_as_string = KeyStruct::from_datastore_to_string(key);
-        // debug print items
+        // debug print items 
         for (db_name, entities) in self.entities.iter() {
             println!("db_name: {}", db_name);
             for entity in entities.iter() {
@@ -660,17 +660,16 @@ impl DatastoreService for DatastoreEmulator {
                             seconds: 0,
                             nanos: 10,
                         };
+
+                        let entity_list = storage.entities.entry(key_as_string).or_default();
                         let mut db_entity = entity.clone();
                         let mut clone_key = key.clone();
                         for path in clone_key.path.iter_mut() {
                             // Check if the path element has an ID
                             if path.id_type.is_none() {
                                 // Generate a new ID for the entity
-                                let new_id = {
-                                    let mut counter = storage.id_counter.lock().unwrap();
-                                    *counter += 1;
-                                    *counter
-                                };
+                                let new_id = entity_list.len() as i64 + 1; // Simple ID generation
+                                                                           // logic
                                 path.id_type = Some(IdType::Id(new_id));
                             }
                         }
@@ -681,7 +680,6 @@ impl DatastoreService for DatastoreEmulator {
                             create_time: timestamp.clone(),
                             update_time: timestamp,
                         };
-                        let entity_list = storage.entities.entry(key_as_string).or_default();
 
                         if let Some(key) = &entity_metadata.entity.key {
                             dbg!("Inserting entity", &key.path);
@@ -716,6 +714,7 @@ impl DatastoreService for DatastoreEmulator {
                         let key_as_string = KeyStruct::from_datastore_to_string(&key);
 
                         if let Some(entity_db) = storage.get_entity(&key) {
+
                             if let Some(key) = &&entity_db.entity.key {
                                 dbg!("Updating entity", &key.path);
                             };
@@ -830,14 +829,16 @@ impl DatastoreService for DatastoreEmulator {
                                 dbg!("Inserting upserting entity", &key.path);
                                 entity_list.push(entity_metadata);
                             }
-                        } else {
+                        }else{
                             dbg!("No entity list found for key", &key_as_string);
-                            storage
-                                .entities
-                                .insert(key_as_string.clone(), vec![entity_metadata.clone()]);
+                            storage.entities.insert(
+                                key_as_string.clone(),
+                                vec![entity_metadata.clone()],
+                            );
                         }
 
                         let entity_list = storage.entities.entry(key_as_string).or_default();
+
 
                         storage.update_indexes(&key_struct, entity);
 
@@ -875,6 +876,7 @@ impl DatastoreService for DatastoreEmulator {
                                 // Clean up indexes if needed
                                 let key_struct = KeyStruct::from_datastore_key(key);
                                 storage.update_indexes(&key_struct, &entity_metadata.entity);
+
 
                                 if let Some(key) = &&entity_metadata.entity.key {
                                     dbg!("Deleting entity", &key.path);
