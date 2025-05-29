@@ -342,16 +342,65 @@ message LookupResponse {
   google.protobuf.Timestamp read_time = 7;
 }
 
-// Simplified versions of core data types
 message Key {
+  // A (kind, ID/name) pair used to construct a key path.
+  //
+  // If either name or ID is set, the element is complete.
+  // If neither is set, the element is incomplete.
   message PathElement {
+    // The kind of the entity.
+    //
+    // A kind matching regex `__.*__` is reserved/read-only.
+    // A kind must not contain more than 1500 bytes when UTF-8 encoded.
+    // Cannot be `""`.
+    //
+    // Must be valid UTF-8 bytes. Legacy values that are not valid UTF-8 are
+    // encoded as `__bytes<X>__` where `<X>` is the base-64 encoding of the
+    // bytes.
     string kind = 1;
+
+    // The type of ID.
     oneof id_type {
+      // The auto-allocated ID of the entity.
+      //
+      // Never equal to zero. Values less than zero are discouraged and may not
+      // be supported in the future.
       int64 id = 2;
+
+      // The name of the entity.
+      //
+      // A name matching regex `__.*__` is reserved/read-only.
+      // A name must not be more than 1500 bytes when UTF-8 encoded.
+      // Cannot be `""`.
+      //
+      // Must be valid UTF-8 bytes. Legacy values that are not valid UTF-8 are
+      // encoded as `__bytes<X>__` where `<X>` is the base-64 encoding of the
+      // bytes.
       string name = 3;
     }
   }
+
+  // Entities are partitioned into subsets, currently identified by a project
+  // ID and namespace ID.
+  // Queries are scoped to a single partition.
   PartitionId partition_id = 1;
+
+  // The entity path.
+  // An entity path consists of one or more elements composed of a kind and a
+  // string or numerical identifier, which identify entities. The first
+  // element identifies a _root entity_, the second element identifies
+  // a _child_ of the root entity, the third element identifies a child of the
+  // second entity, and so forth. The entities identified by all prefixes of
+  // the path are called the element's _ancestors_.
+  //
+  // An entity path is always fully complete: *all* of the entity's ancestors
+  // are required to be in the path along with the entity identifier itself.
+  // The only exception is that in some documented cases, the identifier in the
+  // last path element (for the entity) itself may be omitted. For example,
+  // the last path element of the key of `Mutation.insert` may have no
+  // identifier.
+  //
+  // A path can never be empty, and a path can have at most 100 elements.
   repeated PathElement path = 2;
 }
 
@@ -362,16 +411,53 @@ message PartitionId {
 }
 
 message EntityResult {
+  // Specifies what data the 'entity' field contains.
+  // A `ResultType` is either implied (for example, in `LookupResponse.missing`
+  // from `datastore.proto`, it is always `KEY_ONLY`) or specified by context
+  // (for example, in message `QueryResultBatch`, field `entity_result_type`
+  // specifies a `ResultType` for all the values in field `entity_results`).
   enum ResultType {
+    // Unspecified. This value is never used.
     RESULT_TYPE_UNSPECIFIED = 0;
+
+    // The key and properties.
     FULL = 1;
+
+    // A projected subset of properties. The entity may have no key.
     PROJECTION = 2;
+
+    // Only the key.
     KEY_ONLY = 3;
   }
+
+  // The resulting entity.
   Entity entity = 1;
+
+  // The version of the entity, a strictly positive number that monotonically
+  // increases with changes to the entity.
+  //
+  // This field is set for
+  // [`FULL`][google.datastore.v1.EntityResult.ResultType.FULL] entity results.
+  //
+  // For [missing][google.datastore.v1.LookupResponse.missing] entities in
+  // `LookupResponse`, this is the version of the snapshot that was used to look
+  // up the entity, and it is always set except for eventually consistent reads.
   int64 version = 4;
+
+  // The time at which the entity was created.
+  // This field is set for
+  // [`FULL`][google.datastore.v1.EntityResult.ResultType.FULL] entity results.
+  // If this entity is missing, this field will not be set.
   google.protobuf.Timestamp create_time = 6;
+
+  // The time at which the entity was last changed.
+  // This field is set for
+  // [`FULL`][google.datastore.v1.EntityResult.ResultType.FULL] entity results.
+  // If this entity is missing, this field will not be set.
   google.protobuf.Timestamp update_time = 5;
+
+  // A cursor that points to the position after the result entity.
+  // Set only when the `EntityResult` is part of a `QueryResultBatch` message.
   bytes cursor = 3;
 }
 
@@ -679,18 +765,59 @@ message QueryResultBatch {
 
 // Basic Commit
 message CommitRequest {
+  // The modes available for commits.
   enum Mode {
+    // Unspecified. This value must not be used.
     MODE_UNSPECIFIED = 0;
+
+    // Transactional: The mutations are either all applied, or none are applied.
+    // Learn about transactions
+    // [here](https://cloud.google.com/datastore/docs/concepts/transactions).
     TRANSACTIONAL = 1;
+
+    // Non-transactional: The mutations may not apply as all or none.
     NON_TRANSACTIONAL = 2;
   }
+
+  // Required. The ID of the project against which to make the request.
   string project_id = 8 [(field_behavior) = REQUIRED];
+
+  // The ID of the database against which to make the request.
+  //
+  // '(default)' is not allowed; please use empty string '' to refer the default
+  // database.
   string database_id = 9;
+
+  // The type of commit to perform. Defaults to `TRANSACTIONAL`.
   Mode mode = 5;
+
+  // Must be set when mode is `TRANSACTIONAL`.
   oneof transaction_selector {
+    // The identifier of the transaction associated with the commit. A
+    // transaction identifier is returned by a call to
+    // [Datastore.BeginTransaction][google.datastore.v1.Datastore.BeginTransaction].
     bytes transaction = 1;
+
+    // Options for beginning a new transaction for this request.
+    // The transaction is committed when the request completes. If specified,
+    // [TransactionOptions.mode][google.datastore.v1.TransactionOptions] must be
+    // [TransactionOptions.ReadWrite][google.datastore.v1.TransactionOptions.ReadWrite].
     TransactionOptions single_use_transaction = 10;
   }
+
+  // The mutations to perform.
+  //
+  // When mode is `TRANSACTIONAL`, mutations affecting a single entity are
+  // applied in order. The following sequences of mutations affecting a single
+  // entity are not permitted in a single `Commit` request:
+  //
+  // - `insert` followed by `insert`
+  // - `update` followed by `insert`
+  // - `upsert` followed by `insert`
+  // - `delete` followed by `update`
+  //
+  // When mode is `NON_TRANSACTIONAL`, no two mutations may affect a single
+  // entity.
   repeated Mutation mutations = 6;
 }
 
@@ -741,7 +868,34 @@ message CommitResponse {
 }
 
 message MutationResult {
-  Key key = 1;
+  // The automatically allocated key.
+  // Set only when the mutation allocated a key.
+  Key key = 3;
+
+  // The version of the entity on the server after processing the mutation. If
+  // the mutation doesn't change anything on the server, then the version will
+  // be the version of the current entity or, if no entity is present, a version
+  // that is strictly greater than the version of any previous entity and less
+  // than the version of any possible future entity.
+  int64 version = 4;
+
+  // The create time of the entity. This field will not be set after a 'delete'.
+  google.protobuf.Timestamp create_time = 7;
+
+  // The update time of the entity on the server after processing the mutation.
+  // If the mutation doesn't change anything on the server, then the timestamp
+  // will be the update timestamp of the current entity. This field will not be
+  // set after a 'delete'.
+  google.protobuf.Timestamp update_time = 6;
+
+  // Whether a conflict was detected for this mutation. Always false when a
+  // conflict detection strategy field is not set in the mutation.
+  bool conflict_detected = 5;
+
+  // The results of applying each
+  // [PropertyTransform][google.datastore.v1.PropertyTransform], in the same
+  // order of the request.
+  repeated Value transform_results = 8;
 }
 
 message RollbackRequest {

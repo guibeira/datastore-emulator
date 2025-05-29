@@ -1,18 +1,19 @@
-use google::datastore::v1::Filter;
 use google::datastore::v1::commit_request::TransactionSelector;
 use google::datastore::v1::filter::FilterType;
-use google::datastore::v1::key::PathElement;
 use google::datastore::v1::key::path_element::IdType;
+use google::datastore::v1::key::PathElement;
 use google::datastore::v1::mutation::Operation;
 use google::datastore::v1::value::ValueType;
+use google::datastore::v1::Filter;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use tonic::codec::CompressionEncoding;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{transport::Server, Request, Response, Status};
 
 // Import the generated code
 pub mod google {
@@ -72,29 +73,6 @@ impl DatastoreStorage {
                             // NOT_EQUAL = 9;
                             // HAS_ANCESTOR = 11;
                             // NOT_IN = 13;
-                            //
-                            // TYPES
-                            // NullValue(i32),
-                            // #[prost(bool, tag = "1")]
-                            // BooleanValue(bool),
-                            // #[prost(int64, tag = "2")]
-                            // IntegerValue(i64),
-                            // #[prost(double, tag = "3")]
-                            // DoubleValue(f64),
-                            // #[prost(message, tag = "10")]
-                            // TimestampValue(::prost_types::Timestamp),
-                            // #[prost(message, tag = "5")]
-                            // KeyValue(super::Key),
-                            // #[prost(string, tag = "17")]
-                            // StringValue(::prost::alloc::string::String),
-                            // #[prost(bytes, tag = "18")]
-                            // BlobValue(::prost::alloc::vec::Vec<u8>),
-                            // #[prost(message, tag = "8")]
-                            // GeoPointValue(super::LatLng),
-                            // #[prost(message, tag = "6")]
-                            // EntityValue(super::Entity),
-                            // #[prost(message, tag = "9")]
-                            // ArrayValue(super::ArrayValue),
                             match property_filter.op {
                                 0 => {
                                     // OPERATOR_UNSPECIFIED
@@ -241,7 +219,7 @@ impl DatastoreStorage {
                                     return entity_value.value_type == value.value_type;
                                 }
                                 6 => { // IN = 6;
-                                    // todo: implement this
+                                     // todo: implement this
                                 }
                                 9 => {
                                     // NOT_EQUAL = 9;
@@ -249,7 +227,7 @@ impl DatastoreStorage {
                                 }
                                 11 => {
                                     // HAS_ANCESTOR = 11;
-                                    // todo: implement this
+                                    dbg!("Has ancestor filter", &entity_value, &property_filter);
                                     return true;
                                 }
                                 13 => {
@@ -301,6 +279,15 @@ impl DatastoreStorage {
     fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
         // Search for the entity in the storage
         let key_as_string = KeyStruct::from_datastore_to_string(key);
+        // debug print items
+        for (db_name, entities) in self.entities.iter() {
+            println!("db_name: {}", db_name);
+            for entity in entities.iter() {
+                if let Some(ref key) = entity.entity.key {
+                    println!("entity: {:?}", key.path);
+                }
+            }
+        }
         if let Some(entities) = self.entities.get(&key_as_string) {
             if entities.is_empty() {
                 return None;
@@ -320,6 +307,14 @@ impl DatastoreStorage {
     fn get_entities(&self, key_db: String, filter: Option<Filter>) -> Vec<EntityResult> {
         // Search for the entity in the storage
         let mut results = Vec::new();
+        for (db_name, entities) in self.entities.iter() {
+            println!("db_name: {}", db_name);
+            for entity in entities.iter() {
+                if let Some(ref key) = entity.entity.key {
+                    println!("entity: {:?}", key.path);
+                }
+            }
+        }
         if let Some(entities) = self.entities.get(&key_db) {
             for entity in entities.iter() {
                 if let Some(ref filter) = filter {
@@ -329,7 +324,6 @@ impl DatastoreStorage {
                             continue; // Skip this entity if it doesn't match the filter
                         }
                     }
-
                     results.push(EntityResult {
                         entity: Some(entity.entity.clone()),
                         create_time: Some(entity.create_time.clone()),
@@ -404,7 +398,11 @@ impl KeyStruct {
             // };
             path_elements.push(kind.to_string());
         }
-        path_elements.join(", ").to_string()
+        //return the last string
+        path_elements
+            .last()
+            .map_or_else(|| "".to_string(), |s| s.to_string())
+        //path_elements.join(", ").to_string();
     }
 
     fn from_datastore_key(key: &Key) -> Self {
@@ -462,10 +460,11 @@ impl DatastoreService for DatastoreEmulator {
         let req = request.into_inner();
         let now = SystemTime::now();
         let timestamp = prost_types::Timestamp {
-            seconds: now
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            seconds: 0,
+            // now
+            // .duration_since(SystemTime::UNIX_EPOCH)
+            // .unwrap_or_default()
+            // .as_secs() as i64,
             nanos: 0,
         };
 
@@ -485,6 +484,7 @@ impl DatastoreService for DatastoreEmulator {
         let storage = self.storage.lock().unwrap();
         let mut found = Vec::new();
 
+        let start_time = SystemTime::now();
         // process each key in the request
         for key in &req.keys {
             let result_entity = storage.get_entity(key);
@@ -498,14 +498,12 @@ impl DatastoreService for DatastoreEmulator {
                 });
             }
         }
-
         // Get current time for read_time
         let now = SystemTime::now();
+        let time_duration = now.duration_since(start_time).unwrap_or_default();
+
         let read_time = prost_types::Timestamp {
-            seconds: now
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            seconds: 0,
             nanos: 0,
         };
 
@@ -537,7 +535,7 @@ impl DatastoreService for DatastoreEmulator {
         let kind_name = aggregation_query.kind[0].name.clone();
 
         let results = storage.get_entities(kind_name, aggregation_query.filter.clone());
-
+        let start_time = SystemTime::now();
         let batch = google::datastore::v1::QueryResultBatch {
             entity_result_type: 1,
             skipped_results: 0,
@@ -549,7 +547,13 @@ impl DatastoreService for DatastoreEmulator {
             end_cursor: Vec::new(),
         };
 
+        let time_duration = start_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
         let mut fields = BTreeMap::new();
+
+        let amount_results = batch.entity_results.len() as i64;
+
         fields.insert(
             "Some key".to_string(),
             ValueProps {
@@ -560,7 +564,7 @@ impl DatastoreService for DatastoreEmulator {
             fields: fields.clone(),
         };
         Ok(Response::new(RunQueryResponse {
-            transaction: vec![1],
+            transaction: vec![],
             query: Some(aggregation_query),
             batch: Some(batch),
             // todo: create real metrics
@@ -571,11 +575,15 @@ impl DatastoreService for DatastoreEmulator {
                     }],
                 }),
                 execution_stats: Some(ExecutionStats {
-                    results_returned: 10,
-                    execution_duration: Some(Duration {
-                        seconds: 10,
-                        nanos: 0,
-                    }),
+                    results_returned: amount_results,
+                    execution_duration: None,
+                    //Some(Duration {
+                    // seconds: time_duration.as_secs() as i64,
+                    // nanos: time_duration.as_nanos() as i32,
+                    // seconds: 0,
+                    // nanos: 0
+
+                    // }),
                     read_operations: 10,
                     debug_stats: Some(debug_stats),
                 }),
@@ -613,11 +621,11 @@ impl DatastoreService for DatastoreEmulator {
         if let Some(tx_id) = transaction_id.clone() {
             // Verify the transaction exists and is not read-only
             if let Some(tx_state) = storage.transactions.get(&tx_id) {
-                if tx_state.read_only {
-                    return Err(Status::failed_precondition(
-                        "Cannot commit mutations in a read-only transaction",
-                    ));
-                }
+                // if tx_state.read_only {
+                //     return Err(Status::failed_precondition(
+                //         "Cannot commit mutations in a read-only transaction blabla",
+                //     ));
+                // }
 
                 // In a real implementation, we would apply the transaction's mutations here
                 // For now, we'll just remove the transaction after committing
@@ -635,6 +643,7 @@ impl DatastoreService for DatastoreEmulator {
             if let Some(ref mutation) = mutation.operation {
                 match mutation {
                     Operation::Insert(entity) => {
+                        dbg!("Inserting entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => return Err(Status::invalid_argument("Entity missing key")),
@@ -644,52 +653,125 @@ impl DatastoreService for DatastoreEmulator {
 
                         let now = SystemTime::now();
                         let timestamp = prost_types::Timestamp {
-                            seconds: now
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64,
-                            nanos: 0,
+                            // seconds: now
+                            //     .duration_since(SystemTime::UNIX_EPOCH)
+                            //     .unwrap_or_default()
+                            //     .as_secs() as i64,
+                            seconds: 0,
+                            nanos: 10,
                         };
-
+                        let mut db_entity = entity.clone();
+                        let mut clone_key = key.clone();
+                        for path in clone_key.path.iter_mut() {
+                            // Check if the path element has an ID
+                            if path.id_type.is_none() {
+                                // Generate a new ID for the entity
+                                let new_id = {
+                                    let mut counter = storage.id_counter.lock().unwrap();
+                                    *counter += 1;
+                                    *counter
+                                };
+                                path.id_type = Some(IdType::Id(new_id));
+                            }
+                        }
+                        db_entity.key = Some(clone_key.clone());
                         let entity_metadata = EntityWithMetadata {
-                            entity: entity.clone(),
+                            entity: db_entity.clone(),
                             version: 1,
                             create_time: timestamp.clone(),
                             update_time: timestamp,
                         };
-
                         let entity_list = storage.entities.entry(key_as_string).or_default();
+
+                        if let Some(key) = &entity_metadata.entity.key {
+                            dbg!("Inserting entity", &key.path);
+                        };
                         entity_list.push(entity_metadata);
 
                         storage.update_indexes(&key_struct, entity);
+                        let timestamp = prost_types::Timestamp {
+                            seconds: 0,
+                            //now
+                            // .duration_since(SystemTime::UNIX_EPOCH)
+                            // .unwrap_or_default()
+                            // .as_secs() as i64,
+                            nanos: 0,
+                        };
 
                         mutation_results.push(google::datastore::v1::MutationResult {
-                            key: Some(key),
-                            ..Default::default()
+                            key: Some(clone_key),
+                            version: 1,
+                            create_time: Some(timestamp.clone()),
+                            update_time: Some(timestamp),
+                            conflict_detected: false,
+                            transform_results: vec![],
                         });
                     }
                     Operation::Update(entity) => {
+                        dbg!("Updating entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => return Err(Status::invalid_argument("Entity missing key")),
                         };
                         let key_as_string = KeyStruct::from_datastore_to_string(&key);
 
-                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
-                            for entity_metadata in entity_list {
-                                entity_metadata.entity = entity.clone();
-                                entity_metadata.update_time = prost_types::Timestamp {
-                                    seconds: SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                        as i64,
+                        if let Some(entity_db) = storage.get_entity(&key) {
+                            if let Some(key) = &&entity_db.entity.key {
+                                dbg!("Updating entity", &key.path);
+                            };
+                            // Update the entity in the storage
+                            let mut entity_metadata = entity_db.clone();
+                            entity_metadata.entity = entity.clone();
+                            entity_metadata.update_time = prost_types::Timestamp {
+                                seconds: 0,
+                                //now
+                                // .duration_since(SystemTime::UNIX_EPOCH)
+                                // .unwrap_or_default()
+                                // .as_secs() as i64,
+                                nanos: 0,
+                            };
+                            // Update the entity in the list
+                            let updated_entity = EntityWithMetadata {
+                                entity: entity.clone(),
+                                version: entity_metadata.version + 1,
+                                create_time: entity_metadata.create_time.clone(),
+                                update_time: prost_types::Timestamp {
+                                    seconds: 0,
+                                    //now
+                                    // .duration_since(SystemTime::UNIX_EPOCH)
+                                    // .unwrap_or_default()
+                                    // .as_secs() as i64,
                                     nanos: 0,
-                                };
+                                },
+                            };
+
+                            if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
+                                for entity_metadata in entity_list {
+                                    if entity_metadata.entity.key == Some(key.clone()) {
+                                        *entity_metadata = updated_entity.clone();
+                                    }
+                                }
                             }
+
+                            // Clean up indexes if needed
+                            let key_struct = KeyStruct::from_datastore_key(&key);
+                            storage.update_indexes(&key_struct, &updated_entity.entity);
+
+                            let timestamp = prost_types::Timestamp {
+                                seconds: 0,
+                                //now
+                                // .duration_since(SystemTime::UNIX_EPOCH)
+                                // .unwrap_or_default()
+                                // .as_secs() as i64,
+                                nanos: 0,
+                            };
                             mutation_results.push(google::datastore::v1::MutationResult {
-                                key: Some(key),
-                                ..Default::default()
+                                key: entity.key.clone(),
+                                version: 1,
+                                create_time: Some(timestamp.clone()),
+                                update_time: Some(timestamp),
+                                conflict_detected: false,
+                                transform_results: vec![],
                             });
                         } else {
                             // do we really need return 404,
@@ -698,19 +780,20 @@ impl DatastoreService for DatastoreEmulator {
                         }
                     }
                     Operation::Upsert(entity) => {
+                        dbg!("Upserting entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => return Err(Status::invalid_argument("Entity missing key")),
                         };
                         let key_struct = KeyStruct::from_datastore_key(&key);
                         let key_as_string = KeyStruct::from_datastore_to_string(&key);
-
                         let now = SystemTime::now();
                         let timestamp = prost_types::Timestamp {
-                            seconds: now
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64,
+                            seconds: 0,
+                            //now
+                            // .duration_since(SystemTime::UNIX_EPOCH)
+                            // .unwrap_or_default()
+                            // .as_secs() as i64,
                             nanos: 0,
                         };
 
@@ -720,15 +803,59 @@ impl DatastoreService for DatastoreEmulator {
                             create_time: timestamp.clone(),
                             update_time: timestamp,
                         };
+                        let updated_entity = EntityWithMetadata {
+                            entity: entity.clone(),
+                            version: entity_metadata.version + 1,
+                            create_time: entity_metadata.create_time.clone(),
+                            update_time: prost_types::Timestamp {
+                                seconds: 0,
+                                //now
+                                // .duration_since(SystemTime::UNIX_EPOCH)
+                                // .unwrap_or_default()
+                                // .as_secs() as i64,
+                                nanos: 0,
+                            },
+                        };
+
+                        let mut item_was_inserted = false;
+                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
+                            for entity_metadata in &mut *entity_list {
+                                if entity_metadata.entity.key == Some(key.clone()) {
+                                    dbg!("Upserting entity", &key.path);
+                                    *entity_metadata = updated_entity.clone();
+                                    item_was_inserted = true;
+                                }
+                            }
+                            if !item_was_inserted {
+                                dbg!("Inserting upserting entity", &key.path);
+                                entity_list.push(entity_metadata);
+                            }
+                        } else {
+                            dbg!("No entity list found for key", &key_as_string);
+                            storage
+                                .entities
+                                .insert(key_as_string.clone(), vec![entity_metadata.clone()]);
+                        }
 
                         let entity_list = storage.entities.entry(key_as_string).or_default();
-                        entity_list.push(entity_metadata);
 
                         storage.update_indexes(&key_struct, entity);
 
+                        let timestamp = prost_types::Timestamp {
+                            seconds: 0,
+                            //now
+                            // .duration_since(SystemTime::UNIX_EPOCH)
+                            // .unwrap_or_default()
+                            // .as_secs() as i64,
+                            nanos: 0,
+                        };
                         mutation_results.push(google::datastore::v1::MutationResult {
                             key: Some(key),
-                            ..Default::default()
+                            version: 1,
+                            create_time: Some(timestamp.clone()),
+                            update_time: Some(timestamp),
+                            conflict_detected: false,
+                            transform_results: vec![],
                         });
                     }
                     Operation::Delete(key) => {
@@ -739,6 +866,7 @@ impl DatastoreService for DatastoreEmulator {
                                 .extract_if(.., |entity| entity.entity.key == Some(key.clone()))
                                 .collect::<Vec<_>>();
                             if removed_itens.is_empty() {
+                                println!("Entity not found for deletion");
                                 // do we really need return 404,
                                 // todo: check doc about not found items
                                 //return Err(Status::not_found("Entity not found"));
@@ -747,8 +875,25 @@ impl DatastoreService for DatastoreEmulator {
                                 // Clean up indexes if needed
                                 let key_struct = KeyStruct::from_datastore_key(key);
                                 storage.update_indexes(&key_struct, &entity_metadata.entity);
+
+                                if let Some(key) = &&entity_metadata.entity.key {
+                                    dbg!("Deleting entity", &key.path);
+                                };
+                                let timestamp = prost_types::Timestamp {
+                                    seconds: 0,
+                                    //now
+                                    // .duration_since(SystemTime::UNIX_EPOCH)
+                                    // .unwrap_or_default()
+                                    // .as_secs() as i64,
+                                    nanos: 0,
+                                };
                                 mutation_results.push(google::datastore::v1::MutationResult {
                                     key: Some(key.clone()),
+                                    version: 1,
+                                    create_time: Some(timestamp.clone()),
+                                    update_time: Some(timestamp),
+                                    conflict_detected: false,
+                                    transform_results: vec![],
                                 });
                             }
                         } else {
@@ -772,18 +917,20 @@ impl DatastoreService for DatastoreEmulator {
         // Get current time for the commit timestamp
         let now = SystemTime::now();
         let commit_timestamp = prost_types::Timestamp {
-            seconds: now
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            seconds: 0,
+            //now
+            // .duration_since(SystemTime::UNIX_EPOCH)
+            // .unwrap_or_default()
+            // .as_secs() as i64,
             nanos: 0,
         };
-
-        Ok(Response::new(CommitResponse {
+        let response = Response::new(CommitResponse {
             mutation_results,
             index_updates,
             commit_time: Some(commit_timestamp),
-        }))
+        });
+
+        Ok(response)
     }
 
     async fn begin_transaction(
@@ -799,7 +946,7 @@ impl DatastoreService for DatastoreEmulator {
             .unwrap_or_default();
 
         let timestamp = prost_types::Timestamp {
-            seconds: duration_since_epoch.as_secs() as i64,
+            seconds: 0,
             nanos: 0,
         };
 
@@ -845,10 +992,10 @@ impl DatastoreService for DatastoreEmulator {
 
         // Return the transaction ID as bytes
         let transaction_bytes = transaction_id.into_bytes();
-
-        Ok(Response::new(BeginTransactionResponse {
+        let transaction_response = BeginTransactionResponse {
             transaction: transaction_bytes,
-        }))
+        };
+        Ok(Response::new(transaction_response))
     }
 
     async fn rollback(
@@ -1007,10 +1154,11 @@ impl DatastoreService for DatastoreEmulator {
         // Get current time for read_time
         let now = SystemTime::now();
         let read_time = prost_types::Timestamp {
-            seconds: now
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            seconds: 0,
+            // now
+            // .duration_since(SystemTime::UNIX_EPOCH)
+            // .unwrap_or_default()
+            // .as_secs() as i64,
             nanos: 0,
         };
 
@@ -1196,8 +1344,8 @@ impl DatastoreService for DatastoreEmulator {
                 execution_stats: Some(ExecutionStats {
                     results_returned: total_results,
                     execution_duration: Some(Duration {
-                        seconds: 0,
-                        nanos: 1000000, // 1ms fake data
+                        seconds: 1,
+                        nanos: 1000000000, // 1ms fake data
                     }),
                     read_operations: storage.entities.len() as i64,
                     debug_stats: Some(debug_stats),
@@ -1215,10 +1363,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Datastore emulator listening on {}", addr);
 
+    // Create a Server with increased message size limits for Tonic 1.0
     Server::builder()
+        // In Tonic 1.0, we use max_frame_size to control message size
+        .max_frame_size(10 * 1024 * 1024) // 10MB frame size (applies to both send/receive)
+        // Register the service properly using the generated DatastoreServer
         .add_service(DatastoreServer::new(emulator))
         .serve(addr)
         .await?;
 
     Ok(())
 }
+
+// #[tokio::main]
+// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//     env_logger::init();
+//     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+//     let emulator = DatastoreEmulator::default();
+
+//     println!("Datastore emulator listening on {}", addr);
+
+//     let service = DatastoreServer::new(emulator)
+//         .accept_compressed(CompressionEncoding::Gzip)
+//         .max_decoding_message_size(1024 * 1024 * 20) // 10MB max message size
+//         .max_encoding_message_size(1024 * 1024 * 20); // 10MB max message size
+
+//     Server::builder()
+//         .add_service(service)
+//         .serve(addr)
+//         .await?;
+
+//     Ok(())
+// }

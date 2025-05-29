@@ -537,7 +537,7 @@ def explain_analyze_aggregation(client):
 def in_query(client):
     # [START datastore_in_query]
 
-    task1 = datastore.Entity(client.key("Task", "sample_task_1"))
+    task1 = datastore.Entity(client.key("Task"))
     task1.update(
         {
             "description": "Item with priority 4",
@@ -548,7 +548,23 @@ def in_query(client):
         }
     )
     client.put(task1)
-    task2 = datastore.Entity(client.key("Task", "sample_task_1"))
+
+    # get task 1 by key, where the key is 1
+    db_task = client.get(key=client.key("Task", 1))
+
+    db_task.update(
+        {
+            "description": "Item with priority 4",
+            "created": datetime.now(timezone.utc),
+            "done": False,
+            "priority": 4,
+            "tags": ["shopping", "errands"],
+        }
+    )
+    __import__("pdb").set_trace()
+    client.put(db_task)
+
+    task2 = datastore.Entity(client.key("Task"))
     task2.update(
         {
             "description": "Item with priority 5",
@@ -566,13 +582,14 @@ def in_query(client):
     # query.add_filter(property_name="tag", operator="IN", value=["learn", "study"])
     # [END datastore_in_query]
     results = [i for i in query.fetch()]
+    __import__("pdb").set_trace()
     return results
 
 
 def insert_examples(client):
     # [START datastore_insert_examples]
     # Example 1: Insert an entity with a specified key
-    task1 = datastore.Entity(client.key("Task", "sample_task_1"))
+    task1 = datastore.Entity(client.key("Task"))
     task1.update(
         {
             "description": "Buy groceries",
@@ -583,6 +600,9 @@ def insert_examples(client):
         }
     )
     client.put(task1)
+    __import__("pdb").set_trace()
+    db_task = client.get(key=client.key("Task", 1))
+    __import__("pdb").set_trace()
 
     # # Example 2: Insert an entity with auto-generated ID
     # task2 = datastore.Entity(client.key("Task"))  # Incomplete key - ID will be auto-assigned
@@ -710,13 +730,13 @@ def delete_multi_example(client):
 
 
 def main(project_id):
-    client = datastore.Client(project_id)
+    client = datastore.Client(project_id, database="gui-test")
 
     functions_to_call = [
-        delete_example,
+        # delete_example,
         # delete_multi_example,
         # insert_examples,
-        # in_query,
+        in_query,
         # not_equals_query,
         # not_in_query,
         # query_with_readtime,
