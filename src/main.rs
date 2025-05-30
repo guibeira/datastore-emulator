@@ -1,13 +1,11 @@
 use google::datastore::v1::commit_request::TransactionSelector;
-use google::datastore::v1::filter::FilterType;
 use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::key::PathElement;
 use google::datastore::v1::mutation::Operation;
-use google::datastore::v1::value::ValueType;
 use google::datastore::v1::Filter;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,8 +26,8 @@ use google::datastore::v1::aggregation_query::aggregation::Operator as Aggregati
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
-    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
-    ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation, PingRequest, PingResponse,
+    BeginTransactionResponse, CommitRequest, CommitResponse, EntityResult, ExecutionStats,
+    ExplainMetrics, LookupRequest, LookupResponse, PingRequest, PingResponse,
     PlanSummary, PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest,
     RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest,
     RunQueryResponse,
@@ -529,7 +527,7 @@ impl DatastoreService for DatastoreEmulator {
             let transaction_state = TransactionState {
                 mutations: Vec::new(),
                 snapshot: HashMap::new(), // Will be populated for read operations
-                timestamp: timestamp,
+                timestamp,
                 read_only,
             };
 

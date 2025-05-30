@@ -1,21 +1,12 @@
 use crate::google::datastore::v1::key::path_element::IdType;
 
-use crate::google::datastore::v1::commit_request::TransactionSelector;
 use crate::google::datastore::v1::filter::FilterType;
-use crate::google::datastore::v1::key::PathElement;
-use crate::google::datastore::v1::mutation::Operation;
 use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::Filter;
-use prost_types::value::Kind;
 use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{
-    AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
-    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
-    ExplainMetrics, Key, LookupRequest, LookupResponse, Mutation, PingRequest, PingResponse,
-    PlanSummary, PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest,
-    RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest,
-    RunQueryResponse,
+    Entity, EntityResult, Key, Mutation,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
