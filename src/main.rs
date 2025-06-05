@@ -888,3 +888,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Imports items from the parent module (main.rs)
+    use crate::google::datastore::v1::{
+        datastore_client::DatastoreClient,
+        Key, Value, Mutation, CommitRequest, LookupRequest, PingRequest,
+        PartitionId,
+        key::PathElement, // Corrected import for PathElement
+        key::path_element::IdType as GrpcIdType, // Alias for gRPC IdType
+        value::ValueType as GrpcValueType,     // Alias for gRPC ValueType
+        commit_request::Mode as CommitMode,
+        mutation::Operation as MutationOperation, // Alias for gRPC Mutation Operation
+    };
+    use std::collections::HashMap; // For entity properties
+    use tonic::transport::Channel;
+
+    const TEST_SERVER_ADDR: &str = "127.0.0.1:50051"; // Fixed port for tests
+
+    async fn setup_test_client() -> DatastoreClient<Channel> {
+        // Spawn the server in a background task.
+        // Note: This simple setup might lead to port conflicts if tests run in parallel
+        // without `--test-threads=1`. A new DatastoreEmulator is created for each call,
+        // meaning if the server could run on different ports, state would be isolated.
+        // With a fixed port, only one server instance will bind; subsequent attempts will fail
+        // to start a new server but might connect to the existing one if not careful.
+        tokio::spawn(async {
+            let addr = TEST_SERVER_ADDR.parse().unwrap();
+            let emulator = DatastoreEmulator::default();
+            eprintln!("Test Datastore emulator listening on {}", addr);
+            Server::builder()
+                .add_service(DatastoreServer::new(emulator))
+                .serve(addr)
+                .await
+                .unwrap_or_else(|e| eprintln!("Test server failed to start: {:?}", e));
+        });
+        // Give server a moment to start. This is not ideal but often works for local tests.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        DatastoreClient::connect(format!("http://{}", TEST_SERVER_ADDR))
+            .await
+            .expect("Failed to connect to test server")
+    }
+
+    #[tokio::test]
+    async fn test_ping_server() {
+        let mut client = setup_test_client().await;
+        let request = tonic::Request::new(PingRequest {
+            message: "test".to_string(),
+            // project_id field is not part of the standard PingRequest proto for datastore v1
+        });
+        let response = client.ping(request).await;
+        assert!(response.is_ok(), "Ping request failed: {:?}", response.err());
+        let response_inner = response.unwrap().into_inner();
+        assert!(response_inner.message.contains("Hello test!"));
+        assert!(response_inner.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_commit_insert_and_lookup() {
+        let mut client = setup_test_client().await;
+
+        // 1. Prepare an entity for insertion
+        let project_id = "test-project-insert-lookup".to_string();
+        let kind_name = "TestKindInsertLookup".to_string(); // Unique kind for this test
+        let entity_id_name = "testEntity1".to_string();
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "description".to_string(),
+            Value { value_type: Some(GrpcValueType::StringValue("This is a test entity".to_string())), ..Default::default() },
+        );
+        properties.insert(
+            "count".to_string(),
+            Value { value_type: Some(GrpcValueType::IntegerValue(123)), ..Default::default() },
+        );
+
+        let key = Key {
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(), // Default namespace
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name(entity_id_name.clone())),
+            }],
+        };
+
+        let entity_to_insert = Entity {
+            key: Some(key.clone()),
+            properties,
+        };
+
+        // 2. Create CommitRequest for insertion
+        let mutation = Mutation {
+            operation: Some(MutationOperation::Insert(entity_to_insert.clone())),
+            ..Default::default()
+        };
+        let commit_request = CommitRequest {
+            project_id: project_id.clone(),
+            mode: CommitMode::NonTransactional as i32,
+            mutations: vec![mutation],
+            transaction_selector: None,
+            database_id: "".to_string(), // Default database
+        };
+
+        // 3. Perform the commit
+        let commit_response = client.commit(tonic::Request::new(commit_request)).await;
+        assert!(commit_response.is_ok(), "Commit failed: {:?}", commit_response.err());
+        let commit_response_inner = commit_response.unwrap().into_inner();
+        assert_eq!(commit_response_inner.mutation_results.len(), 1, "Expected one mutation result");
+        assert!(commit_response_inner.mutation_results[0].key.is_some(), "Mutation result should have a key");
+
+        // 4. Prepare LookupRequest
+        let lookup_request = LookupRequest {
+            project_id: project_id.clone(),
+            keys: vec![key.clone()],
+            read_options: None,
+            database_id: "".to_string(), // Default database
+            property_mask: None, // Fetch all properties
+        };
+
+        // 5. Perform the lookup
+        let lookup_response = client.lookup(tonic::Request::new(lookup_request)).await;
+        assert!(lookup_response.is_ok(), "Lookup failed: {:?}", lookup_response.err());
+        let lookup_response_inner = lookup_response.unwrap().into_inner();
+
+        // 6. Verify the lookup result
+        assert_eq!(lookup_response_inner.found.len(), 1, "Expected to find one entity");
+        assert_eq!(lookup_response_inner.missing.len(), 0, "Expected no missing entities");
+
+        let found_entity_result = &lookup_response_inner.found[0];
+        assert!(found_entity_result.entity.is_some(), "Found entity result should contain an entity");
+        let found_entity = found_entity_result.entity.as_ref().unwrap();
+
+        assert_eq!(found_entity.key.as_ref(), Some(&key), "Found entity key does not match");
+        
+        let desc_prop = found_entity.properties.get("description").expect("Description property missing");
+        assert_eq!(desc_prop.value_type,
+                   Some(GrpcValueType::StringValue("This is a test entity".to_string())), "Description property mismatch");
+        
+        let count_prop = found_entity.properties.get("count").expect("Count property missing");
+        assert_eq!(count_prop.value_type,
+                   Some(GrpcValueType::IntegerValue(123)), "Count property mismatch");
+    }
+}
