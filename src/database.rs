@@ -1,13 +1,11 @@
 use crate::google::datastore::v1::key::path_element::IdType;
 
+use crate::google::datastore::v1::Filter;
 use crate::google::datastore::v1::filter::FilterType;
 use crate::google::datastore::v1::value::ValueType;
-use crate::google::datastore::v1::Filter;
 use std::sync::{Arc, Mutex};
 
-use crate::google::datastore::v1::{
-    Entity, EntityResult, Key, Mutation,
-};
+use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -25,7 +23,7 @@ pub struct KeyStruct {
 
 impl KeyStruct {
     pub fn from_datastore_to_string(key: &Key) -> String {
-        // this will be used as a key for get entityes
+        // this will be used as a key for get entities
 
         let mut path_elements = Vec::new();
         for path_element in &key.path {
@@ -84,8 +82,8 @@ pub struct TransactionState {
 
 #[derive(Default, Debug)]
 pub struct DatastoreStorage {
-    // Stores using BTreeMap for ordered storage
-    pub entities: BTreeMap<String, Vec<EntityWithMetadata>>,
+    // Stores using BTreeMap for ordered storage, mapping a full KeyStruct to its EntityWithMetadata
+    pub entities: BTreeMap<KeyStruct, EntityWithMetadata>,
     // Indexes for efficient queries
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
@@ -266,7 +264,7 @@ impl DatastoreStorage {
                                     return entity_value.value_type == value.value_type;
                                 }
                                 6 => { // IN = 6;
-                                     // todo: implement this
+                                    // todo: implement this
                                 }
                                 9 => {
                                     // NOT_EQUAL = 9;
@@ -324,69 +322,48 @@ impl DatastoreStorage {
     }
 
     pub fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
-        // Search for the entity in the storage
-        let key_as_string = KeyStruct::from_datastore_to_string(key);
-        // debug print items
-        for (db_name, entities) in self.entities.iter() {
-            println!("db_name: {}", db_name);
-            for entity in entities.iter() {
-                if let Some(ref key) = entity.entity.key {
-                    println!("entity: {:?}", key.path);
-                }
-            }
-        }
-        if let Some(entities) = self.entities.get(&key_as_string) {
-            if entities.is_empty() {
-                return None;
-            } else {
-                for entity in entities.iter() {
-                    if entity.entity.key == Some(key.clone()) {
-                        return Some(entity.clone());
-                    }
-                }
-            }
-        } else {
-            return None;
-        }
-        None
+        let key_struct = KeyStruct::from_datastore_key(key);
+
+        // Debug print items (optional, can be removed or adjusted)
+        // for (k_struct, entity_meta) in self.entities.iter() {
+        //     println!("Stored KeyStruct: {:?}, Entity Path: {:?}", k_struct, entity_meta.entity.key.as_ref().map(|k| &k.path));
+        // }
+
+        self.entities.get(&key_struct).cloned()
     }
 
-    pub fn get_entities(&self, key_db: String, filter: Option<Filter>) -> Vec<EntityResult> {
-        // Search for the entity in the storage
+    pub fn get_entities(&self, kind_name: String, filter: Option<Filter>) -> Vec<EntityResult> {
         let mut results = Vec::new();
-        for (db_name, entities) in self.entities.iter() {
-            println!("db_name: {}", db_name);
-            for entity in entities.iter() {
-                if let Some(ref key) = entity.entity.key {
-                    println!("entity: {:?}", key.path);
-                }
-            }
-        }
-        if let Some(entities) = self.entities.get(&key_db) {
-            for entity in entities.iter() {
-                if let Some(ref filter) = filter {
-                    if let Some(filter_type) = &filter.filter_type {
-                        // Check if the entity matches the filter
-                        if !DatastoreStorage::apply_filter(entity, filter_type) {
-                            continue; // Skip this entity if it doesn't match the filter
+
+        // Debug print (optional)
+        // println!("Getting entities for kind: {}", kind_name);
+        // for (key_s, entity_meta) in self.entities.iter() {
+        //     if let Some(k) = &entity_meta.entity.key {
+        //         println!("  Checking entity with key: {:?}", k.path);
+        //     }
+        // }
+
+        for (key_struct, entity_metadata) in self.entities.iter() {
+            // Check if the last path element's kind matches kind_name
+            if key_struct
+                .path_elements
+                .last()
+                .map_or(false, |(k, _)| k == &kind_name)
+            {
+                if let Some(ref filter_obj) = filter {
+                    if let Some(filter_type) = &filter_obj.filter_type {
+                        if !DatastoreStorage::apply_filter(entity_metadata, filter_type) {
+                            continue; // Skip if filter doesn't match
                         }
                     }
-                    results.push(EntityResult {
-                        entity: Some(entity.entity.clone()),
-                        create_time: Some(entity.create_time.clone()),
-                        update_time: Some(entity.update_time.clone()),
-                        cursor: vec![],
-                        version: entity.version as i64,
-                    });
-                } else {
-                    results.push(EntityResult {
-                        entity: Some(entity.entity.clone()),
-                        create_time: Some(entity.create_time.clone()),
-                        update_time: Some(entity.update_time.clone()),
-                        cursor: vec![],
-                        version: entity.version as i64,
-                    });
                 }
+                results.push(EntityResult {
+                    entity: Some(entity_metadata.entity.clone()),
+                    create_time: Some(entity_metadata.create_time.clone()),
+                    update_time: Some(entity_metadata.update_time.clone()),
+                    cursor: vec![],
+                    version: entity_metadata.version as i64,
+                });
             }
         }
         results

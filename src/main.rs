@@ -1,8 +1,8 @@
-use google::datastore::v1::commit_request::TransactionSelector;
-use google::datastore::v1::key::path_element::IdType;
-use google::datastore::v1::key::PathElement;
-use google::datastore::v1::mutation::Operation;
 use google::datastore::v1::Filter;
+use google::datastore::v1::commit_request::TransactionSelector;
+use google::datastore::v1::key::PathElement;
+use google::datastore::v1::key::path_element::IdType;
+use google::datastore::v1::mutation::Operation;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 pub mod database;
 use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
@@ -26,11 +26,10 @@ use google::datastore::v1::aggregation_query::aggregation::Operator as Aggregati
 use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
-    BeginTransactionResponse, CommitRequest, CommitResponse, EntityResult, ExecutionStats,
-    ExplainMetrics, LookupRequest, LookupResponse, PingRequest, PingResponse,
-    PlanSummary, PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest,
-    RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest,
-    RunQueryResponse,
+    BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
+    ExplainMetrics, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary,
+    PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
+    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
 
 #[derive(Debug)]
@@ -231,56 +230,83 @@ impl DatastoreService for DatastoreEmulator {
                 match mutation {
                     Operation::Insert(entity) => {
                         dbg!("Inserting entity", &entity);
-                        let key = match entity.key {
+                        let original_key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => return Err(Status::invalid_argument("Entity missing key")),
                         };
-                        let key_struct = KeyStruct::from_datastore_key(&key);
-                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
 
-                        let timestamp = prost_types::Timestamp {
-                            seconds: 0,
+                        let mut key_with_new_id = original_key.clone();
+                        // let mut id_generated = false; // Unused variable - a flag to track if an ID was generated is not necessary for this logic.
+
+                        // Determine the "kind" of the entity for ID generation.
+                        // This is based on the last PathElement of the original entity key.
+                        let entity_kind_for_id_gen = match original_key.path.last() {
+                            Some(pe) => &pe.kind,
+                            None => {
+                                // This case would occur if the entity key had no PathElements.
+                                return Err(Status::invalid_argument(
+                                    "The entity key has no path elements to determine the 'kind' for ID generation.",
+                                ));
+                            }
+                        };
+
+                        // Calculate the new ID based on the count of entities of the same "kind".
+                        // This count is done once before the loop, replicating the old logic.
+                        let count_for_entity_kind = storage
+                            .entities
+                            .keys()
+                            .filter(|stored_key_struct| {
+                                stored_key_struct
+                                    .path_elements
+                                    .last()
+                                    .map_or(false, |(k, _)| k == entity_kind_for_id_gen)
+                            })
+                            .count();
+                        let new_id_value = count_for_entity_kind as i64 + 1;
+
+                        // Apply the new_id_value to any PathElement in the key that is without an ID.
+                        for path_element in key_with_new_id.path.iter_mut() {
+                            if path_element.id_type.is_none() {
+                                path_element.id_type = Some(IdType::Id(new_id_value));
+                            }
+                        }
+
+                        let final_key_struct = KeyStruct::from_datastore_key(&key_with_new_id);
+
+                        let mut db_entity = entity.clone();
+                        db_entity.key = Some(key_with_new_id.clone());
+
+                        let timestamp_now = prost_types::Timestamp {
+                            // Placeholder, consider real time
+                            seconds: 0, // SystemTime::now().duration_since(UNIX_EPOCH)...
                             nanos: 10,
                         };
 
-                        let entity_list = storage.entities.entry(key_as_string).or_default();
-                        let mut db_entity = entity.clone();
-                        let mut clone_key = key.clone();
-                        for path in clone_key.path.iter_mut() {
-                            // Check if the path element has an ID
-                            if path.id_type.is_none() {
-                                // Generate a new ID for the entity
-                                let new_id = entity_list.len() as i64 + 1; // Simple ID generation
-                                                                           // logic
-                                path.id_type = Some(IdType::Id(new_id));
-                            }
-                        }
-                        db_entity.key = Some(clone_key.clone());
                         let entity_metadata = EntityWithMetadata {
                             entity: db_entity.clone(),
-                            version: 1,
-                            create_time: timestamp.clone(),
-                            update_time: timestamp,
+                            version: 1, // Initial version
+                            create_time: timestamp_now.clone(),
+                            update_time: timestamp_now.clone(),
                         };
 
-                        if let Some(key) = &entity_metadata.entity.key {
-                            dbg!("Inserting entity", &key.path);
-                        };
-                        entity_list.push(entity_metadata);
+                        if let Some(k) = &entity_metadata.entity.key {
+                            dbg!("Inserting entity with key", &k.path);
+                        }
 
-                        storage.update_indexes(&key_struct, entity);
+                        // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
+                        // Clone entity_metadata for insertion, so the original can be used for MutationResult
+                        storage
+                            .entities
+                            .insert(final_key_struct.clone(), entity_metadata.clone());
+                        storage.update_indexes(&final_key_struct, &db_entity);
 
-                        // todo: return real data instead fake ones
-                        let timestamp = prost_types::Timestamp {
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        // Removed unused local timestamp variable
 
                         mutation_results.push(google::datastore::v1::MutationResult {
-                            key: Some(clone_key),
-                            version: 1,
-                            create_time: Some(timestamp.clone()),
-                            update_time: Some(timestamp),
+                            key: Some(key_with_new_id.clone()),
+                            version: entity_metadata.version as i64, // Use actual version from metadata
+                            create_time: Some(timestamp_now.clone()),
+                            update_time: Some(timestamp_now.clone()),
                             conflict_detected: false,
                             transform_results: vec![],
                         });
@@ -289,168 +315,177 @@ impl DatastoreService for DatastoreEmulator {
                         dbg!("Updating entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
-                            None => return Err(Status::invalid_argument("Entity missing key")),
+                            None => {
+                                return Err(Status::invalid_argument(
+                                    "Entity missing key for update",
+                                ));
+                            }
                         };
-                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
+                        let key_struct = KeyStruct::from_datastore_key(&key);
 
-                        if let Some(entity_db) = storage.get_entity(&key) {
-                            if let Some(key) = &&entity_db.entity.key {
-                                dbg!("Updating entity", &key.path);
-                            };
-                            // Update the entity in the storage
-                            let mut entity_metadata = entity_db.clone();
-                            entity_metadata.entity = entity.clone();
-                            entity_metadata.update_time = prost_types::Timestamp {
-                                seconds: 0,
-                                nanos: 0,
-                            };
-                            // Update the entity in the list
-                            let updated_entity = EntityWithMetadata {
-                                entity: entity.clone(),
-                                version: entity_metadata.version + 1,
-                                // todo: return real data instead fake ones
-                                create_time: entity_metadata.create_time.clone(),
-                                update_time: prost_types::Timestamp {
-                                    seconds: 0,
-                                    nanos: 0,
-                                },
-                            };
+                        // Option to store data extracted from the mutable borrow if entity is found
+                        let mut opt_updated_data: Option<(
+                            /*entity_for_index_update*/ Entity,
+                            /*version_for_result*/ u64,
+                            /*create_time_for_result*/ prost_types::Timestamp,
+                            /*update_time_for_result*/ prost_types::Timestamp,
+                        )> = None;
 
-                            if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
-                                for entity_metadata in entity_list {
-                                    if entity_metadata.entity.key == Some(key.clone()) {
-                                        *entity_metadata = updated_entity.clone();
-                                    }
-                                }
+                        if let Some(existing_entity_metadata) =
+                            storage.entities.get_mut(&key_struct)
+                        {
+                            if let Some(k) = &existing_entity_metadata.entity.key {
+                                dbg!("Updating entity", &k.path);
                             }
 
-                            // Clean up indexes if needed
-                            let key_struct = KeyStruct::from_datastore_key(&key);
-                            storage.update_indexes(&key_struct, &updated_entity.entity);
-
-                            // todo: return real data instead fake ones
-                            let timestamp = prost_types::Timestamp {
+                            let timestamp_now = prost_types::Timestamp {
+                                // Placeholder
                                 seconds: 0,
                                 nanos: 0,
                             };
+
+                            existing_entity_metadata.entity = entity.clone(); // `entity` is from the request
+                            existing_entity_metadata.version += 1;
+                            existing_entity_metadata.update_time = timestamp_now.clone();
+
+                            // Store all data needed after this block, then the borrow of existing_entity_metadata ends
+                            opt_updated_data = Some((
+                                existing_entity_metadata.entity.clone(), // For update_indexes
+                                existing_entity_metadata.version,        // For MutationResult
+                                existing_entity_metadata.create_time.clone(), // For MutationResult
+                                timestamp_now, // For MutationResult (it's existing_entity_metadata.update_time)
+                            ));
+                        } // Mutable borrow of storage.entities (existing_entity_metadata) ends here.
+
+                        // Now, call storage.update_indexes and push to mutation_results if data was updated
+                        if let Some((entity_for_index, version, create_time, update_time)) =
+                            opt_updated_data
+                        {
+                            storage.update_indexes(&key_struct, &entity_for_index);
+
                             mutation_results.push(google::datastore::v1::MutationResult {
-                                key: entity.key.clone(),
-                                version: 1,
-                                create_time: Some(timestamp.clone()),
-                                update_time: Some(timestamp),
+                                key: entity.key.clone(), // Key from the original request entity
+                                version: version as i64,
+                                create_time: Some(create_time),
+                                update_time: Some(update_time),
                                 conflict_detected: false,
                                 transform_results: vec![],
                             });
                         } else {
-                            // do we really need return 404,
-                            // todo: check doc about not found items
-                            //return Err(Status::not_found("Entity not found"));
+                            // Entity not found for update.
+                            // Datastore typically doesn't error; the mutation just has no effect.
+                            // So, we don't add a MutationResult, which is fine.
+                            println!("Entity not found for update with key: {:?}", key.path);
                         }
                     }
                     Operation::Upsert(entity) => {
                         dbg!("Upserting entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
-                            None => return Err(Status::invalid_argument("Entity missing key")),
+                            None => {
+                                return Err(Status::invalid_argument(
+                                    "Entity missing key for upsert",
+                                ));
+                            }
                         };
+                        // Note: Upsert might generate an ID if the key is incomplete.
+                        // This logic assumes the key provided to upsert is complete or will be treated as such.
+                        // If ID generation is needed for upsert like in Insert, it should be added here.
+                        // For now, we assume `key` is complete for `KeyStruct` creation.
                         let key_struct = KeyStruct::from_datastore_key(&key);
-                        let key_as_string = KeyStruct::from_datastore_to_string(&key);
-                        let timestamp = prost_types::Timestamp {
+
+                        let timestamp_now = prost_types::Timestamp {
+                            // Placeholder
                             seconds: 0,
                             nanos: 0,
                         };
 
-                        let entity_metadata = EntityWithMetadata {
-                            entity: entity.clone(),
-                            version: 1,
-                            create_time: timestamp.clone(),
-                            update_time: timestamp,
-                        };
-                        let updated_entity = EntityWithMetadata {
-                            entity: entity.clone(),
-                            version: entity_metadata.version + 1,
-                            // todo: return real data instead fake ones
-                            create_time: entity_metadata.create_time.clone(),
-                            update_time: prost_types::Timestamp {
-                                seconds: 0,
-                                nanos: 0,
-                            },
-                        };
+                        let entry = storage.entities.entry(key_struct.clone());
+                        let version;
+                        let create_time;
+                        let update_time = timestamp_now.clone();
 
-                        let mut item_was_inserted = false;
-                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
-                            for entity_metadata in &mut *entity_list {
-                                if entity_metadata.entity.key == Some(key.clone()) {
-                                    dbg!("Upserting entity", &key.path);
-                                    *entity_metadata = updated_entity.clone();
-                                    item_was_inserted = true;
-                                }
+                        match entry {
+                            std::collections::btree_map::Entry::Occupied(mut occupied_entry) => {
+                                dbg!("Upserting (update path) entity", &key.path);
+                                let metadata = occupied_entry.get_mut();
+                                metadata.entity = entity.clone();
+                                metadata.version += 1;
+                                metadata.update_time = update_time.clone();
+                                version = metadata.version;
+                                create_time = metadata.create_time.clone();
                             }
-                            if !item_was_inserted {
-                                dbg!("Inserting upserting entity", &key.path);
-                                entity_list.push(entity_metadata);
+                            std::collections::btree_map::Entry::Vacant(vacant_entry) => {
+                                dbg!("Upserting (insert path) entity", &key.path);
+                                let new_metadata = EntityWithMetadata {
+                                    entity: entity.clone(),
+                                    version: 1,
+                                    create_time: timestamp_now.clone(),
+                                    update_time: update_time.clone(),
+                                };
+                                version = new_metadata.version;
+                                create_time = new_metadata.create_time.clone();
+                                vacant_entry.insert(new_metadata);
                             }
-                        } else {
-                            dbg!("No entity list found for key", &key_as_string);
-                            storage
-                                .entities
-                                .insert(key_as_string.clone(), vec![entity_metadata.clone()]);
                         }
 
                         storage.update_indexes(&key_struct, entity);
 
-                        let timestamp = prost_types::Timestamp {
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        // Use the determined version, create_time, and update_time for the result
                         mutation_results.push(google::datastore::v1::MutationResult {
                             key: Some(key),
-                            version: 1,
-                            create_time: Some(timestamp.clone()),
-                            update_time: Some(timestamp),
+                            version: version as i64,
+                            create_time: Some(create_time.clone()),
+                            update_time: Some(update_time.clone()),
                             conflict_detected: false,
                             transform_results: vec![],
                         });
                     }
-                    Operation::Delete(key) => {
-                        let key_as_string = KeyStruct::from_datastore_to_string(key);
-                        if let Some(entity_list) = storage.entities.get_mut(&key_as_string) {
-                            // Remove the entity from the list
-                            let removed_itens = entity_list
-                                .extract_if(.., |entity| entity.entity.key == Some(key.clone()))
-                                .collect::<Vec<_>>();
-                            if removed_itens.is_empty() {
-                                println!("Entity not found for deletion");
-                                // do we really need return 404,
-                                // todo: check doc about not found items
-                                //return Err(Status::not_found("Entity not found"));
-                            }
-                            for entity_metadata in removed_itens {
-                                // Clean up indexes if needed
-                                let key_struct = KeyStruct::from_datastore_key(key);
-                                storage.update_indexes(&key_struct, &entity_metadata.entity);
+                    Operation::Delete(key_to_delete) => {
+                        let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
 
-                                if let Some(key) = &&entity_metadata.entity.key {
-                                    dbg!("Deleting entity", &key.path);
-                                };
-                                // todo: return real data instead fake ones
-                                let timestamp = prost_types::Timestamp {
-                                    seconds: 0,
-                                    nanos: 0,
-                                };
-                                mutation_results.push(google::datastore::v1::MutationResult {
-                                    key: Some(key.clone()),
-                                    version: 1,
-                                    create_time: Some(timestamp.clone()),
-                                    update_time: Some(timestamp),
-                                    conflict_detected: false,
-                                    transform_results: vec![],
-                                });
+                        if let Some(removed_entity_metadata) =
+                            storage.entities.remove(&key_struct_to_delete)
+                        {
+                            if let Some(k) = &removed_entity_metadata.entity.key {
+                                dbg!("Deleting entity", &k.path);
                             }
+
+                            storage.update_indexes(
+                                &key_struct_to_delete,
+                                &removed_entity_metadata.entity,
+                            );
+
+                            let timestamp_now = prost_types::Timestamp {
+                                // Placeholder
+                                seconds: 0,
+                                nanos: 0,
+                            };
+                            mutation_results.push(google::datastore::v1::MutationResult {
+                                key: Some(key_to_delete.clone()), // Return the original key from request
+                                version: removed_entity_metadata.version as i64, // Use actual version
+                                create_time: Some(removed_entity_metadata.create_time.clone()),
+                                update_time: Some(timestamp_now), // Deletion time could be now
+                                conflict_detected: false,
+                                transform_results: vec![],
+                            });
                         } else {
-                            // do we really need return 404,
-                            // todo: check doc about not found items
-                            //return Err(Status::not_found("Entity not found"));
+                            println!(
+                                "Entity not found for deletion with key: {:?}",
+                                key_to_delete.path
+                            );
+                            // Datastore typically doesn't error if deleting a non-existent entity.
+                            // It returns a MutationResult with no key or version, or an empty result list.
+                            // For simplicity, we can add a result indicating nothing happened or skip.
+                            // Adding a result with the key but perhaps version 0 or specific times.
+                            mutation_results.push(google::datastore::v1::MutationResult {
+                                key: Some(key_to_delete.clone()),
+                                version: 0, // Indicate not found or already deleted
+                                create_time: None,
+                                update_time: None,
+                                conflict_detected: false,
+                                transform_results: vec![],
+                            });
                         }
                     }
                 }
@@ -715,27 +750,36 @@ impl DatastoreService for DatastoreEmulator {
                 .filter
                 .as_ref()
                 .unwrap_or(&Filter { filter_type: None });
-            for kind in &query.kind {
-                // Find all entities of this kind
-                let values_from_kind = storage.entities.get(&kind.name);
-                if let Some(values_from_kind) = values_from_kind {
-                    for entity_metadata in values_from_kind {
-                        // Check if the entity is found
-                        if entity_metadata.entity.key.is_none() {
-                            // Corrupted data? how to handle this?
-                            return Err(Status::not_found("Entity not found"));
-                        }
-                        // Apply filters if present
-                        if let Some(filter) = &filters.filter_type {
-                            if DatastoreStorage::apply_filter(entity_metadata, filter) {
-                                matching_entities.push(entity_metadata);
-                            }
-                        } else {
-                            matching_entities.push(entity_metadata);
-                        }
+
+            // Iterate over all entities and filter by kind and other filters
+            for (key_struct, entity_metadata) in storage.entities.iter() {
+                // Check if the entity's kind matches any of the kinds in the query
+                let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
+                if entity_kind.is_none()
+                    || !query
+                        .kind
+                        .iter()
+                        .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
+                {
+                    continue; // Skip if kind doesn't match
+                }
+
+                // Check if the entity is found (key should always be present in EntityWithMetadata)
+                if entity_metadata.entity.key.is_none() {
+                    // This case should ideally not happen if data is consistent
+                    eprintln!(
+                        "Warning: Entity found in storage without a key in its Entity struct."
+                    );
+                    continue;
+                }
+
+                // Apply filters if present
+                if let Some(filter_type) = &filters.filter_type {
+                    if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
+                        matching_entities.push(entity_metadata);
                     }
                 } else {
-                    //there is no kind in the storage
+                    matching_entities.push(entity_metadata); // No filter, include if kind matches
                 }
             }
         } else {
