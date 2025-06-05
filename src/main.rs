@@ -894,13 +894,17 @@ mod tests {
     use super::*; // Imports items from the parent module (main.rs)
     use crate::google::datastore::v1::{
         datastore_client::DatastoreClient,
-        Key, Value, Mutation, CommitRequest, LookupRequest, PingRequest,
-        PartitionId,
+        Key, Value, Mutation, CommitRequest, LookupRequest, PingRequest, RunQueryRequest, Query,
+        PartitionId, Filter, PropertyFilter, CompositeFilter, PropertyReference,
+        filter::FilterType as GrpcFilterType, // Alias for gRPC FilterType
+        property_filter::Operator as PropertyFilterOp,
+        composite_filter::Operator as CompositeFilterOp,
         key::PathElement, // Corrected import for PathElement
         key::path_element::IdType as GrpcIdType, // Alias for gRPC IdType
         value::ValueType as GrpcValueType,     // Alias for gRPC ValueType
         commit_request::Mode as CommitMode,
         mutation::Operation as MutationOperation, // Alias for gRPC Mutation Operation
+        KindExpression, // Import KindExpression directly
     };
     use std::collections::HashMap; // For entity properties
     use tonic::transport::Channel;
@@ -1033,5 +1037,163 @@ mod tests {
         let count_prop = found_entity.properties.get("count").expect("Count property missing");
         assert_eq!(count_prop.value_type,
                    Some(GrpcValueType::IntegerValue(123)), "Count property mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_run_query_with_property_filter() {
+        let mut client = setup_test_client().await;
+        let project_id = "test-project-prop-filter".to_string();
+        let kind_name = "TestKindPropFilter".to_string();
+
+        // Insert two entities
+        let entity1_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entity1".to_string())) }],
+        };
+        let mut props1 = HashMap::new();
+        props1.insert("status".to_string(), Value { value_type: Some(GrpcValueType::StringValue("active".to_string())), ..Default::default() });
+        let entity1 = Entity { key: Some(entity1_key.clone()), properties: props1 };
+
+        let entity2_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entity2".to_string())) }],
+        };
+        let mut props2 = HashMap::new();
+        props2.insert("status".to_string(), Value { value_type: Some(GrpcValueType::StringValue("inactive".to_string())), ..Default::default() });
+        let entity2 = Entity { key: Some(entity2_key.clone()), properties: props2 };
+
+        let commit_req = CommitRequest {
+            project_id: project_id.clone(),
+            mode: CommitMode::NonTransactional as i32,
+            mutations: vec![
+                Mutation { operation: Some(MutationOperation::Insert(entity1.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(entity2.clone())), ..Default::default() },
+            ],
+            database_id: "".to_string(),
+            ..Default::default()
+        };
+        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed");
+
+        // Query for entities with status "active"
+        let query = Query {
+            kind: vec![KindExpression { name: kind_name.clone() }], // Use KindExpression
+            filter: Some(Filter {
+                filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
+                    property: Some(PropertyReference { name: "status".to_string() }),
+                    op: PropertyFilterOp::Equal as i32,
+                    value: Some(Value { value_type: Some(GrpcValueType::StringValue("active".to_string())), ..Default::default() }),
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let run_query_req = RunQueryRequest {
+            project_id: project_id.clone(),
+            database_id: "".to_string(),
+            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            ..Default::default()
+        };
+
+        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery failed");
+        let batch = response.into_inner().batch.expect("Query result batch is missing");
+
+        assert_eq!(batch.entity_results.len(), 1, "Expected one entity with status 'active'");
+        let found_entity = batch.entity_results[0].entity.as_ref().unwrap();
+        assert_eq!(found_entity.key.as_ref(), Some(&entity1_key));
+        assert_eq!(found_entity.properties.get("status").unwrap().value_type, Some(GrpcValueType::StringValue("active".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_run_query_with_composite_filter() {
+        let mut client = setup_test_client().await;
+        let project_id = "test-project-comp-filter".to_string();
+        let kind_name = "TestKindCompFilter".to_string();
+
+        // Insert three entities
+        let entity1_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityA".to_string())) }],
+        };
+        let mut propsA = HashMap::new();
+        propsA.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() });
+        propsA.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(10)), ..Default::default() });
+        let entityA = Entity { key: Some(entity1_key.clone()), properties: propsA };
+
+        let entity2_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityB".to_string())) }],
+        };
+        let mut propsB = HashMap::new();
+        propsB.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("books".to_string())), ..Default::default() });
+        propsB.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(5)), ..Default::default() });
+        let entityB = Entity { key: Some(entity2_key.clone()), properties: propsB };
+        
+        let entity3_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityC".to_string())) }],
+        };
+        let mut propsC = HashMap::new();
+        propsC.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() });
+        propsC.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(3)), ..Default::default() });
+        let entityC = Entity { key: Some(entity3_key.clone()), properties: propsC };
+
+
+        let commit_req = CommitRequest {
+            project_id: project_id.clone(),
+            mode: CommitMode::NonTransactional as i32,
+            mutations: vec![
+                Mutation { operation: Some(MutationOperation::Insert(entityA.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(entityB.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(entityC.clone())), ..Default::default() },
+            ],
+            database_id: "".to_string(),
+            ..Default::default()
+        };
+        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed");
+
+        // Query for entities with category "electronics" AND stock > 5
+        let filter1 = Filter {
+            filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
+                property: Some(PropertyReference { name: "category".to_string() }),
+                op: PropertyFilterOp::Equal as i32,
+                value: Some(Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() }),
+            })),
+        };
+        let filter2 = Filter {
+            filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
+                property: Some(PropertyReference { name: "stock".to_string() }),
+                op: PropertyFilterOp::GreaterThan as i32,
+                value: Some(Value { value_type: Some(GrpcValueType::IntegerValue(5)), ..Default::default() }),
+            })),
+        };
+
+        let composite_filter = Filter {
+            filter_type: Some(GrpcFilterType::CompositeFilter(CompositeFilter {
+                op: CompositeFilterOp::And as i32,
+                filters: vec![filter1, filter2],
+            })),
+        };
+
+        let query = Query {
+            kind: vec![KindExpression { name: kind_name.clone() }], // Use KindExpression
+            filter: Some(composite_filter),
+            ..Default::default()
+        };
+
+        let run_query_req = RunQueryRequest {
+            project_id: project_id.clone(),
+            database_id: "".to_string(),
+            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            ..Default::default()
+        };
+
+        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery failed");
+        let batch = response.into_inner().batch.expect("Query result batch is missing");
+
+        assert_eq!(batch.entity_results.len(), 1, "Expected one entity matching composite filter");
+        let found_entity = batch.entity_results[0].entity.as_ref().unwrap();
+        assert_eq!(found_entity.key.as_ref(), Some(&entity1_key)); // Entity A
+        assert_eq!(found_entity.properties.get("category").unwrap().value_type, Some(GrpcValueType::StringValue("electronics".to_string())));
+        assert_eq!(found_entity.properties.get("stock").unwrap().value_type, Some(GrpcValueType::IntegerValue(10)));
     }
 }
