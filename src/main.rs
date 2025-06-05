@@ -229,87 +229,22 @@ impl DatastoreService for DatastoreEmulator {
             if let Some(ref mutation) = mutation.operation {
                 match mutation {
                     Operation::Insert(entity) => {
-                        dbg!("Inserting entity", &entity);
-                        let original_key = match entity.key {
-                            Some(ref key) => key.clone(),
-                            None => return Err(Status::invalid_argument("Entity missing key")),
-                        };
-
-                        let mut key_with_new_id = original_key.clone();
-                        // let mut id_generated = false; // Unused variable - a flag to track if an ID was generated is not necessary for this logic.
-
-                        // Determine the "kind" of the entity for ID generation.
-                        // This is based on the last PathElement of the original entity key.
-                        let entity_kind_for_id_gen = match original_key.path.last() {
-                            Some(pe) => &pe.kind,
-                            None => {
-                                // This case would occur if the entity key had no PathElements.
-                                return Err(Status::invalid_argument(
-                                    "The entity key has no path elements to determine the 'kind' for ID generation.",
-                                ));
+                        dbg!("Attempting to insert entity (from main.rs)", &entity);
+                        match storage.insert_entity(entity) {
+                            Ok((final_key, metadata)) => {
+                                mutation_results.push(google::datastore::v1::MutationResult {
+                                    key: Some(final_key),
+                                    version: metadata.version as i64,
+                                    create_time: Some(metadata.create_time.clone()),
+                                    update_time: Some(metadata.update_time.clone()),
+                                    conflict_detected: false,
+                                    transform_results: vec![],
+                                });
                             }
-                        };
-
-                        // Calculate the new ID based on the count of entities of the same "kind".
-                        // This count is done once before the loop, replicating the old logic.
-                        let count_for_entity_kind = storage
-                            .entities
-                            .keys()
-                            .filter(|stored_key_struct| {
-                                stored_key_struct
-                                    .path_elements
-                                    .last()
-                                    .map_or(false, |(k, _)| k == entity_kind_for_id_gen)
-                            })
-                            .count();
-                        let new_id_value = count_for_entity_kind as i64 + 1;
-
-                        // Apply the new_id_value to any PathElement in the key that is without an ID.
-                        for path_element in key_with_new_id.path.iter_mut() {
-                            if path_element.id_type.is_none() {
-                                path_element.id_type = Some(IdType::Id(new_id_value));
+                            Err(status) => {
+                                return Err(status);
                             }
                         }
-
-                        let final_key_struct = KeyStruct::from_datastore_key(&key_with_new_id);
-
-                        let mut db_entity = entity.clone();
-                        db_entity.key = Some(key_with_new_id.clone());
-
-                        let timestamp_now = prost_types::Timestamp {
-                            // Placeholder, consider real time
-                            seconds: 0, // SystemTime::now().duration_since(UNIX_EPOCH)...
-                            nanos: 10,
-                        };
-
-                        let entity_metadata = EntityWithMetadata {
-                            entity: db_entity.clone(),
-                            version: 1, // Initial version
-                            create_time: timestamp_now.clone(),
-                            update_time: timestamp_now.clone(),
-                        };
-
-                        if let Some(k) = &entity_metadata.entity.key {
-                            dbg!("Inserting entity with key", &k.path);
-                        }
-
-                        // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
-                        // Clone entity_metadata for insertion, so the original can be used for MutationResult
-                        storage
-                            .entities
-                            .insert(final_key_struct.clone(), entity_metadata.clone());
-                        storage.update_indexes(&final_key_struct, &db_entity);
-
-                        // Removed unused local timestamp variable
-
-                        mutation_results.push(google::datastore::v1::MutationResult {
-                            key: Some(key_with_new_id.clone()),
-                            version: entity_metadata.version as i64, // Use actual version from metadata
-                            create_time: Some(timestamp_now.clone()),
-                            update_time: Some(timestamp_now.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
                     }
                     Operation::Update(entity) => {
                         dbg!("Updating entity", &entity);
@@ -371,13 +306,9 @@ impl DatastoreService for DatastoreEmulator {
                                 conflict_detected: false,
                                 transform_results: vec![],
                             });
-                        } else {
-                            // Entity not found for update.
-                            // Datastore typically doesn't error; the mutation just has no effect.
-                            // So, we don't add a MutationResult, which is fine.
-                            println!("Entity not found for update with key: {:?}", key.path);
                         }
-                    }
+                    } // Closes Operation::Update(entity) arm
+                    // Removed duplicate Operation::Update block
                     Operation::Upsert(entity) => {
                         dbg!("Upserting entity", &entity);
                         let key = match entity.key {
@@ -442,19 +373,11 @@ impl DatastoreService for DatastoreEmulator {
                         });
                     }
                     Operation::Delete(key_to_delete) => {
-                        let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
-
-                        if let Some(removed_entity_metadata) =
-                            storage.entities.remove(&key_struct_to_delete)
+                        if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
                         {
                             if let Some(k) = &removed_entity_metadata.entity.key {
                                 dbg!("Deleting entity", &k.path);
                             }
-
-                            storage.update_indexes(
-                                &key_struct_to_delete,
-                                &removed_entity_metadata.entity,
-                            );
 
                             let timestamp_now = prost_types::Timestamp {
                                 // Placeholder

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::SystemTime;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyId {
@@ -98,6 +99,86 @@ impl DatastoreStorage {
         self.transactions.remove(transaction_id);
     }
 
+    pub fn insert_entity(
+        &mut self,
+        entity: &Entity,
+    ) -> Result<(Key, EntityWithMetadata), tonic::Status> {
+        let original_key = match entity.key {
+            Some(ref key) => key.clone(),
+            None => return Err(tonic::Status::invalid_argument("Entity missing key")),
+        };
+
+        let mut key_with_new_id = original_key.clone();
+
+        // Determine the "kind" of the entity for ID generation.
+        // This is based on the last PathElement of the original entity key.
+        let entity_kind_for_id_gen = match original_key.path.last() {
+            Some(pe) => &pe.kind,
+            None => {
+                // This case would occur if the entity key had no PathElements.
+                return Err(tonic::Status::invalid_argument(
+                    "The entity key has no path elements to determine the 'kind' for ID generation.",
+                ));
+            }
+        };
+
+        // Calculate the new ID based on the count of entities of the same "kind".
+        // This count is done once before the loop, replicating the old logic.
+        let count_for_entity_kind = self
+            .entities
+            .keys()
+            .filter(|stored_key_struct| {
+                stored_key_struct
+                    .path_elements
+                    .last()
+                    .map_or(false, |(k, _)| k == entity_kind_for_id_gen)
+            })
+            .count();
+        let new_id_value = count_for_entity_kind as i64 + 1;
+
+        // Apply the new_id_value to any PathElement in the key that is without an ID.
+        for path_element in key_with_new_id.path.iter_mut() {
+            if path_element.id_type.is_none() {
+                path_element.id_type = Some(IdType::Id(new_id_value));
+            }
+        }
+
+        let final_key_struct = KeyStruct::from_datastore_key(&key_with_new_id);
+
+        let mut db_entity = entity.clone();
+        db_entity.key = Some(key_with_new_id.clone());
+
+        let timestamp_now = prost_types::Timestamp {
+            // Placeholder, consider real time
+            seconds: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i32
+                % 1_000_000_000,
+        };
+
+        let entity_metadata = EntityWithMetadata {
+            entity: db_entity.clone(),
+            version: 1, // Initial version
+            create_time: timestamp_now.clone(),
+            update_time: timestamp_now.clone(),
+        };
+
+        if let Some(k) = &entity_metadata.entity.key {
+            dbg!("Inserting entity with key (from DatastoreStorage)", &k.path);
+        }
+
+        // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
+        self.entities
+            .insert(final_key_struct.clone(), entity_metadata.clone());
+        self.update_indexes(&final_key_struct, &db_entity);
+
+        Ok((key_with_new_id, entity_metadata))
+    }
     pub fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bool {
         match filter {
             FilterType::PropertyFilter(property_filter) => {
@@ -392,6 +473,48 @@ impl DatastoreStorage {
                         .insert(key_struct.clone());
                 }
             }
+        }
+    }
+
+    pub fn remove_from_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
+        // For each property of an entity, remove its KeyStruct from the index
+        for (prop_name, prop_value) in &entity.properties {
+            if let Some(value_type) = &prop_value.value_type {
+                // Extract a value as string for indexing
+                let value_str = match value_type {
+                    crate::google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
+                    crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
+                        i.to_string()
+                    }
+                    // todo: implement other types
+                    _ => continue,
+                };
+
+                // Get the kind of the entity
+                if let Some((kind, _)) = key_struct.path_elements.last() {
+                    let index_key = (kind.clone(), prop_name.clone(), value_str);
+                    if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                        indexed_keys_set.remove(key_struct);
+                        // Optional: if indexed_keys_set is empty after removal,
+                        // we could remove the index_key itself from self.indexes.
+                        // if indexed_keys_set.is_empty() {
+                        //     self.indexes.remove(&index_key);
+                        // }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<EntityWithMetadata> {
+        let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
+
+        if let Some(removed_entity_metadata) = self.entities.remove(&key_struct_to_delete) {
+            // If entity was removed, also remove it from indexes
+            self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
+            Some(removed_entity_metadata)
+        } else {
+            None
         }
     }
 }
