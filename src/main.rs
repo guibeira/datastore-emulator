@@ -121,9 +121,9 @@ impl DatastoreService for DatastoreEmulator {
         };
         let kind_name = aggregation_query.kind[0].name.clone();
 
-        let results = storage.get_entities(kind_name, aggregation_query.filter.clone());
+        let results = storage.get_entities(req.project_id.clone(), kind_name, aggregation_query.filter.clone());
         let batch = google::datastore::v1::QueryResultBatch {
-            entity_result_type: 1,
+            entity_result_type: 1, // Corresponds to EntityResultType::FULL
             skipped_results: 0,
             read_time: None,
             skipped_cursor: vec![],
@@ -674,8 +674,13 @@ impl DatastoreService for DatastoreEmulator {
                 .as_ref()
                 .unwrap_or(&Filter { filter_type: None });
 
-            // Iterate over all entities and filter by kind and other filters
+            // Iterate over all entities and filter by project_id, kind and other filters
             for (key_struct, entity_metadata) in storage.entities.iter() {
+                // Filter by project_id first
+                if key_struct.project_id != req.project_id {
+                    continue;
+                }
+
                 // Check if the entity's kind matches any of the kinds in the query
                 let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
                 if entity_kind.is_none()
@@ -908,34 +913,65 @@ mod tests {
     };
     use std::collections::HashMap; // For entity properties
     use tonic::transport::Channel;
+    use tokio::sync::OnceCell;
+    use once_cell::sync::Lazy; // For global static runtime
+    use tokio::runtime::Runtime; // For global static runtime
 
     const TEST_SERVER_ADDR: &str = "127.0.0.1:50051"; // Fixed port for tests
+    static TEST_SERVER_INIT: OnceCell<()> = OnceCell::const_new();
+
+    // Global Tokio runtime for the test server
+    static GLOBAL_TEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+        Runtime::new().expect("Failed to create Tokio runtime for test server")
+    });
 
     async fn setup_test_client() -> DatastoreClient<Channel> {
-        // Spawn the server in a background task.
-        // Note: This simple setup might lead to port conflicts if tests run in parallel
-        // without `--test-threads=1`. A new DatastoreEmulator is created for each call,
-        // meaning if the server could run on different ports, state would be isolated.
-        // With a fixed port, only one server instance will bind; subsequent attempts will fail
-        // to start a new server but might connect to the existing one if not careful.
-        tokio::spawn(async {
-            let addr = TEST_SERVER_ADDR.parse().unwrap();
-            let emulator = DatastoreEmulator::default();
-            eprintln!("Test Datastore emulator listening on {}", addr);
-            Server::builder()
-                .add_service(DatastoreServer::new(emulator))
-                .serve(addr)
-                .await
-                .unwrap_or_else(|e| eprintln!("Test server failed to start: {:?}", e));
-        });
-        // Give server a moment to start. This is not ideal but often works for local tests.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        DatastoreClient::connect(format!("http://{}", TEST_SERVER_ADDR))
-            .await
-            .expect("Failed to connect to test server")
+        TEST_SERVER_INIT.get_or_init(|| async {
+            GLOBAL_TEST_RUNTIME.spawn(async { // Spawn server on the global runtime
+                let addr = TEST_SERVER_ADDR.parse().unwrap();
+                // This DatastoreEmulator is created ONCE and shared across all tests.
+                let emulator = DatastoreEmulator::default();
+                eprintln!("Test Datastore emulator listening on {}", addr);
+                Server::builder()
+                    .add_service(DatastoreServer::new(emulator))
+                    .serve(addr)
+                    .await
+                    .unwrap_or_else(|e| {
+                        // eprintln is used to ensure output is visible during tests,
+                        // especially if server fails to start (e.g. port already in use by external process)
+                        eprintln!("!!! Test server failed to start: {:?} !!!", e);
+                        // Panicking here might be too aggressive if another process is legitimately using the port.
+                        // However, for a test suite, it's often an indicator of a problem.
+                        // Consider if just printing the error is sufficient or if panic is desired.
+                        // For now, let's just print, as the client connect will fail later if server isn't up.
+                    });
+            });
+            // Give server a moment to start. Increased delay for potentially slower CI environments.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            eprintln!("Test server setup process completed initialization attempt.");
+        }).await;
+    
+        // Retry connecting to the server a few times to give it a chance to start.
+        let mut attempts = 0;
+        loop {
+            match DatastoreClient::connect(format!("http://{}", TEST_SERVER_ADDR)).await {
+                Ok(client) => return client,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 15 { // Max 15 attempts (e.g., 15 * 200ms = 3 seconds total)
+                        panic!(
+                            "Failed to connect to test server at {} after {} attempts: {:?}. Ensure the server started correctly and is not being shut down prematurely.",
+                            TEST_SERVER_ADDR, attempts, e
+                        );
+                    }
+                    // eprintln is useful for debugging test setup issues.
+                    eprintln!("[Test Client] Connection attempt {}/15 failed. Retrying in 200ms...", attempts);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
     }
-
+    
     #[tokio::test]
     async fn test_ping_server() {
         let mut client = setup_test_client().await;
@@ -1195,5 +1231,105 @@ mod tests {
         assert_eq!(found_entity.key.as_ref(), Some(&entity1_key)); // Entity A
         assert_eq!(found_entity.properties.get("category").unwrap().value_type, Some(GrpcValueType::StringValue("electronics".to_string())));
         assert_eq!(found_entity.properties.get("stock").unwrap().value_type, Some(GrpcValueType::IntegerValue(10)));
+    }
+
+    #[tokio::test]
+    async fn test_run_query_with_has_ancestor_filter() {
+        let mut client = setup_test_client().await;
+        let project_id = "test-project-ancestor".to_string();
+        let parent_kind_name = "ParentKindAncestor".to_string();
+        let child_kind_name = "ChildKindAncestor".to_string();
+
+        // 1. Create Ancestor Key
+        let ancestor_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement {
+                kind: parent_kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("parent1".to_string())),
+            }],
+        };
+        let ancestor_entity = Entity { key: Some(ancestor_key.clone()), properties: HashMap::new() };
+
+        // 2. Create Child Entity
+        let child_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![
+                PathElement { kind: parent_kind_name.clone(), id_type: Some(GrpcIdType::Name("parent1".to_string())) },
+                PathElement { kind: child_kind_name.clone(), id_type: Some(GrpcIdType::Name("child1".to_string())) },
+            ],
+        };
+        let mut child_props = HashMap::new();
+        child_props.insert("name".to_string(), Value { value_type: Some(GrpcValueType::StringValue("Child One".to_string())), ..Default::default() });
+        let child_entity = Entity { key: Some(child_key.clone()), properties: child_props };
+
+        // 3. Create Unrelated Entity (different ancestor)
+        let unrelated_child_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![
+                PathElement { kind: parent_kind_name.clone(), id_type: Some(GrpcIdType::Name("parent2".to_string())) }, // Different parent
+                PathElement { kind: child_kind_name.clone(), id_type: Some(GrpcIdType::Name("child2".to_string())) },
+            ],
+        };
+        let unrelated_child_entity = Entity { key: Some(unrelated_child_key.clone()), properties: HashMap::new() };
+        
+        // 4. Create Another Unrelated Entity (same ancestor, but not a child for query)
+        let another_parent_key = Key {
+            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            path: vec![PathElement {
+                kind: "OtherParentKind".to_string(),
+                id_type: Some(GrpcIdType::Name("otherParent1".to_string())),
+            }],
+        };
+        let another_parent_entity = Entity { key: Some(another_parent_key.clone()), properties: HashMap::new() };
+
+
+        // Commit entities
+        let commit_req = CommitRequest {
+            project_id: project_id.clone(),
+            mode: CommitMode::NonTransactional as i32,
+            mutations: vec![
+                Mutation { operation: Some(MutationOperation::Insert(ancestor_entity.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(child_entity.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(unrelated_child_entity.clone())), ..Default::default() },
+                Mutation { operation: Some(MutationOperation::Insert(another_parent_entity.clone())), ..Default::default() },
+            ],
+            database_id: "".to_string(),
+            ..Default::default()
+        };
+        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed for ancestor test setup");
+
+        // 5. Query for entities with 'ancestor_key' as ancestor
+        // The property reference for HAS_ANCESTOR is special: its name is "__key__".
+        let query = Query {
+            // Kind filter can be applied to narrow down results further, e.g., to ChildKindAncestor
+            kind: vec![KindExpression { name: child_kind_name.clone() }],
+            filter: Some(Filter {
+                filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
+                    property: Some(PropertyReference { name: "__key__".to_string() }), // Special property name for ancestor queries
+                    op: PropertyFilterOp::HasAncestor as i32,
+                    value: Some(Value { value_type: Some(GrpcValueType::KeyValue(ancestor_key.clone())), ..Default::default() }),
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let run_query_req = RunQueryRequest {
+            project_id: project_id.clone(),
+            database_id: "".to_string(),
+            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            ..Default::default()
+        };
+
+        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery with HasAncestor failed");
+        let batch = response.into_inner().batch.expect("Query result batch is missing for HasAncestor test");
+
+        assert_eq!(batch.entity_results.len(), 1, "Expected one entity with the specified ancestor");
+        let found_entity_result = &batch.entity_results[0];
+        assert!(found_entity_result.entity.is_some(), "Found entity result should contain an entity");
+        let found_entity = found_entity_result.entity.as_ref().unwrap();
+        
+        assert_eq!(found_entity.key.as_ref(), Some(&child_key), "Found entity key does not match the expected child key");
+        let name_prop = found_entity.properties.get("name").expect("Name property missing from child");
+        assert_eq!(name_prop.value_type, Some(GrpcValueType::StringValue("Child One".to_string())), "Child name property mismatch");
     }
 }

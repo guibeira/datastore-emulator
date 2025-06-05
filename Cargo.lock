@@ -207,6 +207,7 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "once_cell",
  "prost",
  "prost-types",
  "serde",
