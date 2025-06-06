@@ -6,6 +6,7 @@ use google::datastore::v1::mutation::Operation;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -121,7 +122,11 @@ impl DatastoreService for DatastoreEmulator {
         };
         let kind_name = aggregation_query.kind[0].name.clone();
 
-        let results = storage.get_entities(req.project_id.clone(), kind_name, aggregation_query.filter.clone());
+        let results = storage.get_entities(
+            req.project_id.clone(),
+            kind_name,
+            aggregation_query.filter.clone(),
+        );
         let batch = google::datastore::v1::QueryResultBatch {
             entity_result_type: 1, // Corresponds to EntityResultType::FULL
             skipped_results: 0,
@@ -877,7 +882,23 @@ impl DatastoreService for DatastoreEmulator {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+    let args: Vec<String> = env::args().collect();
+    let host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
+    let port_str = args.get(2).map_or("8042", |s| s.as_str());
+    let port: u16 = port_str.parse().unwrap_or_else(|_| {
+        eprintln!("Invalid port number '{}', using default 8042.", port_str);
+        8042
+    });
+
+    let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap_or_else(|e| {
+        eprintln!(
+            "Invalid address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
+            host, port, e
+        );
+        SocketAddr::from(([127, 0, 0, 1], 8042))
+    });
+
     let emulator = DatastoreEmulator::default();
 
     println!("Datastore emulator listening on {}", addr);
@@ -898,59 +919,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*; // Imports items from the parent module (main.rs)
     use crate::google::datastore::v1::{
-        datastore_client::DatastoreClient,
-        Key, Value, Mutation, CommitRequest, LookupRequest, PingRequest, RunQueryRequest, Query,
-        PartitionId, Filter, PropertyFilter, CompositeFilter, PropertyReference,
-        filter::FilterType as GrpcFilterType, // Alias for gRPC FilterType
-        property_filter::Operator as PropertyFilterOp,
-        composite_filter::Operator as CompositeFilterOp,
-        key::PathElement, // Corrected import for PathElement
-        key::path_element::IdType as GrpcIdType, // Alias for gRPC IdType
-        value::ValueType as GrpcValueType,     // Alias for gRPC ValueType
-        commit_request::Mode as CommitMode,
-        mutation::Operation as MutationOperation, // Alias for gRPC Mutation Operation
+        CommitRequest,
+        CompositeFilter,
+        Filter,
+        Key,
         KindExpression, // Import KindExpression directly
+        LookupRequest,
+        Mutation,
+        PartitionId,
+        PingRequest,
+        PropertyFilter,
+        PropertyReference,
+        Query,
+        RunQueryRequest,
+        Value,
+        commit_request::Mode as CommitMode,
+        composite_filter::Operator as CompositeFilterOp,
+        datastore_client::DatastoreClient,
+        filter::FilterType as GrpcFilterType, // Alias for gRPC FilterType
+        key::PathElement,                     // Corrected import for PathElement
+        key::path_element::IdType as GrpcIdType, // Alias for gRPC IdType
+        mutation::Operation as MutationOperation, // Alias for gRPC Mutation Operation
+        property_filter::Operator as PropertyFilterOp,
+        value::ValueType as GrpcValueType, // Alias for gRPC ValueType
     };
-    use std::collections::HashMap; // For entity properties
-    use tonic::transport::Channel;
-    use tokio::sync::OnceCell;
     use once_cell::sync::Lazy; // For global static runtime
-    use tokio::runtime::Runtime; // For global static runtime
+    use std::collections::HashMap; // For entity properties
+    use tokio::runtime::Runtime;
+    use tokio::sync::OnceCell;
+    use tonic::transport::Channel; // For global static runtime
 
     const TEST_SERVER_ADDR: &str = "127.0.0.1:50051"; // Fixed port for tests
     static TEST_SERVER_INIT: OnceCell<()> = OnceCell::const_new();
 
     // Global Tokio runtime for the test server
-    static GLOBAL_TEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-        Runtime::new().expect("Failed to create Tokio runtime for test server")
-    });
+    static GLOBAL_TEST_RUNTIME: Lazy<Runtime> =
+        Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime for test server"));
 
     async fn setup_test_client() -> DatastoreClient<Channel> {
-        TEST_SERVER_INIT.get_or_init(|| async {
-            GLOBAL_TEST_RUNTIME.spawn(async { // Spawn server on the global runtime
-                let addr = TEST_SERVER_ADDR.parse().unwrap();
-                // This DatastoreEmulator is created ONCE and shared across all tests.
-                let emulator = DatastoreEmulator::default();
-                eprintln!("Test Datastore emulator listening on {}", addr);
-                Server::builder()
-                    .add_service(DatastoreServer::new(emulator))
-                    .serve(addr)
-                    .await
-                    .unwrap_or_else(|e| {
-                        // eprintln is used to ensure output is visible during tests,
-                        // especially if server fails to start (e.g. port already in use by external process)
-                        eprintln!("!!! Test server failed to start: {:?} !!!", e);
-                        // Panicking here might be too aggressive if another process is legitimately using the port.
-                        // However, for a test suite, it's often an indicator of a problem.
-                        // Consider if just printing the error is sufficient or if panic is desired.
-                        // For now, let's just print, as the client connect will fail later if server isn't up.
-                    });
-            });
-            // Give server a moment to start. Increased delay for potentially slower CI environments.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            eprintln!("Test server setup process completed initialization attempt.");
-        }).await;
-    
+        TEST_SERVER_INIT
+            .get_or_init(|| async {
+                GLOBAL_TEST_RUNTIME.spawn(async {
+                    // Spawn server on the global runtime
+                    let addr = TEST_SERVER_ADDR.parse().unwrap();
+                    // This DatastoreEmulator is created ONCE and shared across all tests.
+                    let emulator = DatastoreEmulator::default();
+                    eprintln!("Test Datastore emulator listening on {}", addr);
+                    Server::builder()
+                        .add_service(DatastoreServer::new(emulator))
+                        .serve(addr)
+                        .await
+                        .unwrap_or_else(|e| {
+                            // eprintln is used to ensure output is visible during tests,
+                            // especially if server fails to start (e.g. port already in use by external process)
+                            eprintln!("!!! Test server failed to start: {:?} !!!", e);
+                            // Panicking here might be too aggressive if another process is legitimately using the port.
+                            // However, for a test suite, it's often an indicator of a problem.
+                            // Consider if just printing the error is sufficient or if panic is desired.
+                            // For now, let's just print, as the client connect will fail later if server isn't up.
+                        });
+                });
+                // Give server a moment to start. Increased delay for potentially slower CI environments.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                eprintln!("Test server setup process completed initialization attempt.");
+            })
+            .await;
+
         // Retry connecting to the server a few times to give it a chance to start.
         let mut attempts = 0;
         loop {
@@ -958,20 +992,24 @@ mod tests {
                 Ok(client) => return client,
                 Err(e) => {
                     attempts += 1;
-                    if attempts >= 15 { // Max 15 attempts (e.g., 15 * 200ms = 3 seconds total)
+                    if attempts >= 15 {
+                        // Max 15 attempts (e.g., 15 * 200ms = 3 seconds total)
                         panic!(
                             "Failed to connect to test server at {} after {} attempts: {:?}. Ensure the server started correctly and is not being shut down prematurely.",
                             TEST_SERVER_ADDR, attempts, e
                         );
                     }
                     // eprintln is useful for debugging test setup issues.
-                    eprintln!("[Test Client] Connection attempt {}/15 failed. Retrying in 200ms...", attempts);
+                    eprintln!(
+                        "[Test Client] Connection attempt {}/15 failed. Retrying in 200ms...",
+                        attempts
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
         }
     }
-    
+
     #[tokio::test]
     async fn test_ping_server() {
         let mut client = setup_test_client().await;
@@ -980,7 +1018,11 @@ mod tests {
             // project_id field is not part of the standard PingRequest proto for datastore v1
         });
         let response = client.ping(request).await;
-        assert!(response.is_ok(), "Ping request failed: {:?}", response.err());
+        assert!(
+            response.is_ok(),
+            "Ping request failed: {:?}",
+            response.err()
+        );
         let response_inner = response.unwrap().into_inner();
         assert!(response_inner.message.contains("Hello test!"));
         assert!(response_inner.server_time.is_some());
@@ -998,11 +1040,19 @@ mod tests {
         let mut properties = HashMap::new();
         properties.insert(
             "description".to_string(),
-            Value { value_type: Some(GrpcValueType::StringValue("This is a test entity".to_string())), ..Default::default() },
+            Value {
+                value_type: Some(GrpcValueType::StringValue(
+                    "This is a test entity".to_string(),
+                )),
+                ..Default::default()
+            },
         );
         properties.insert(
             "count".to_string(),
-            Value { value_type: Some(GrpcValueType::IntegerValue(123)), ..Default::default() },
+            Value {
+                value_type: Some(GrpcValueType::IntegerValue(123)),
+                ..Default::default()
+            },
         );
 
         let key = Key {
@@ -1037,10 +1087,21 @@ mod tests {
 
         // 3. Perform the commit
         let commit_response = client.commit(tonic::Request::new(commit_request)).await;
-        assert!(commit_response.is_ok(), "Commit failed: {:?}", commit_response.err());
+        assert!(
+            commit_response.is_ok(),
+            "Commit failed: {:?}",
+            commit_response.err()
+        );
         let commit_response_inner = commit_response.unwrap().into_inner();
-        assert_eq!(commit_response_inner.mutation_results.len(), 1, "Expected one mutation result");
-        assert!(commit_response_inner.mutation_results[0].key.is_some(), "Mutation result should have a key");
+        assert_eq!(
+            commit_response_inner.mutation_results.len(),
+            1,
+            "Expected one mutation result"
+        );
+        assert!(
+            commit_response_inner.mutation_results[0].key.is_some(),
+            "Mutation result should have a key"
+        );
 
         // 4. Prepare LookupRequest
         let lookup_request = LookupRequest {
@@ -1048,31 +1109,64 @@ mod tests {
             keys: vec![key.clone()],
             read_options: None,
             database_id: "".to_string(), // Default database
-            property_mask: None, // Fetch all properties
+            property_mask: None,         // Fetch all properties
         };
 
         // 5. Perform the lookup
         let lookup_response = client.lookup(tonic::Request::new(lookup_request)).await;
-        assert!(lookup_response.is_ok(), "Lookup failed: {:?}", lookup_response.err());
+        assert!(
+            lookup_response.is_ok(),
+            "Lookup failed: {:?}",
+            lookup_response.err()
+        );
         let lookup_response_inner = lookup_response.unwrap().into_inner();
 
         // 6. Verify the lookup result
-        assert_eq!(lookup_response_inner.found.len(), 1, "Expected to find one entity");
-        assert_eq!(lookup_response_inner.missing.len(), 0, "Expected no missing entities");
+        assert_eq!(
+            lookup_response_inner.found.len(),
+            1,
+            "Expected to find one entity"
+        );
+        assert_eq!(
+            lookup_response_inner.missing.len(),
+            0,
+            "Expected no missing entities"
+        );
 
         let found_entity_result = &lookup_response_inner.found[0];
-        assert!(found_entity_result.entity.is_some(), "Found entity result should contain an entity");
+        assert!(
+            found_entity_result.entity.is_some(),
+            "Found entity result should contain an entity"
+        );
         let found_entity = found_entity_result.entity.as_ref().unwrap();
 
-        assert_eq!(found_entity.key.as_ref(), Some(&key), "Found entity key does not match");
-        
-        let desc_prop = found_entity.properties.get("description").expect("Description property missing");
-        assert_eq!(desc_prop.value_type,
-                   Some(GrpcValueType::StringValue("This is a test entity".to_string())), "Description property mismatch");
-        
-        let count_prop = found_entity.properties.get("count").expect("Count property missing");
-        assert_eq!(count_prop.value_type,
-                   Some(GrpcValueType::IntegerValue(123)), "Count property mismatch");
+        assert_eq!(
+            found_entity.key.as_ref(),
+            Some(&key),
+            "Found entity key does not match"
+        );
+
+        let desc_prop = found_entity
+            .properties
+            .get("description")
+            .expect("Description property missing");
+        assert_eq!(
+            desc_prop.value_type,
+            Some(GrpcValueType::StringValue(
+                "This is a test entity".to_string()
+            )),
+            "Description property mismatch"
+        );
+
+        let count_prop = found_entity
+            .properties
+            .get("count")
+            .expect("Count property missing");
+        assert_eq!(
+            count_prop.value_type,
+            Some(GrpcValueType::IntegerValue(123)),
+            "Count property mismatch"
+        );
     }
 
     #[tokio::test]
@@ -1083,41 +1177,89 @@ mod tests {
 
         // Insert two entities
         let entity1_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
-            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entity1".to_string())) }],
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("entity1".to_string())),
+            }],
         };
         let mut props1 = HashMap::new();
-        props1.insert("status".to_string(), Value { value_type: Some(GrpcValueType::StringValue("active".to_string())), ..Default::default() });
-        let entity1 = Entity { key: Some(entity1_key.clone()), properties: props1 };
+        props1.insert(
+            "status".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("active".to_string())),
+                ..Default::default()
+            },
+        );
+        let entity1 = Entity {
+            key: Some(entity1_key.clone()),
+            properties: props1,
+        };
 
         let entity2_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
-            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entity2".to_string())) }],
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("entity2".to_string())),
+            }],
         };
         let mut props2 = HashMap::new();
-        props2.insert("status".to_string(), Value { value_type: Some(GrpcValueType::StringValue("inactive".to_string())), ..Default::default() });
-        let entity2 = Entity { key: Some(entity2_key.clone()), properties: props2 };
+        props2.insert(
+            "status".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("inactive".to_string())),
+                ..Default::default()
+            },
+        );
+        let entity2 = Entity {
+            key: Some(entity2_key.clone()),
+            properties: props2,
+        };
 
         let commit_req = CommitRequest {
             project_id: project_id.clone(),
             mode: CommitMode::NonTransactional as i32,
             mutations: vec![
-                Mutation { operation: Some(MutationOperation::Insert(entity1.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(entity2.clone())), ..Default::default() },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(entity1.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(entity2.clone())),
+                    ..Default::default()
+                },
             ],
             database_id: "".to_string(),
             ..Default::default()
         };
-        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed");
+        client
+            .commit(tonic::Request::new(commit_req))
+            .await
+            .expect("Commit failed");
 
         // Query for entities with status "active"
         let query = Query {
-            kind: vec![KindExpression { name: kind_name.clone() }], // Use KindExpression
+            kind: vec![KindExpression {
+                name: kind_name.clone(),
+            }], // Use KindExpression
             filter: Some(Filter {
                 filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
-                    property: Some(PropertyReference { name: "status".to_string() }),
+                    property: Some(PropertyReference {
+                        name: "status".to_string(),
+                    }),
                     op: PropertyFilterOp::Equal as i32,
-                    value: Some(Value { value_type: Some(GrpcValueType::StringValue("active".to_string())), ..Default::default() }),
+                    value: Some(Value {
+                        value_type: Some(GrpcValueType::StringValue("active".to_string())),
+                        ..Default::default()
+                    }),
                 })),
             }),
             ..Default::default()
@@ -1126,17 +1268,32 @@ mod tests {
         let run_query_req = RunQueryRequest {
             project_id: project_id.clone(),
             database_id: "".to_string(),
-            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            query_type: Some(
+                crate::google::datastore::v1::run_query_request::QueryType::Query(query),
+            ),
             ..Default::default()
         };
 
-        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery failed");
-        let batch = response.into_inner().batch.expect("Query result batch is missing");
+        let response = client
+            .run_query(tonic::Request::new(run_query_req))
+            .await
+            .expect("RunQuery failed");
+        let batch = response
+            .into_inner()
+            .batch
+            .expect("Query result batch is missing");
 
-        assert_eq!(batch.entity_results.len(), 1, "Expected one entity with status 'active'");
+        assert_eq!(
+            batch.entity_results.len(),
+            1,
+            "Expected one entity with status 'active'"
+        );
         let found_entity = batch.entity_results[0].entity.as_ref().unwrap();
         assert_eq!(found_entity.key.as_ref(), Some(&entity1_key));
-        assert_eq!(found_entity.properties.get("status").unwrap().value_type, Some(GrpcValueType::StringValue("active".to_string())));
+        assert_eq!(
+            found_entity.properties.get("status").unwrap().value_type,
+            Some(GrpcValueType::StringValue("active".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1147,59 +1304,146 @@ mod tests {
 
         // Insert three entities
         let entity1_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
-            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityA".to_string())) }],
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("entityA".to_string())),
+            }],
         };
         let mut propsA = HashMap::new();
-        propsA.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() });
-        propsA.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(10)), ..Default::default() });
-        let entityA = Entity { key: Some(entity1_key.clone()), properties: propsA };
+        propsA.insert(
+            "category".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("electronics".to_string())),
+                ..Default::default()
+            },
+        );
+        propsA.insert(
+            "stock".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::IntegerValue(10)),
+                ..Default::default()
+            },
+        );
+        let entityA = Entity {
+            key: Some(entity1_key.clone()),
+            properties: propsA,
+        };
 
         let entity2_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
-            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityB".to_string())) }],
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("entityB".to_string())),
+            }],
         };
         let mut propsB = HashMap::new();
-        propsB.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("books".to_string())), ..Default::default() });
-        propsB.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(5)), ..Default::default() });
-        let entityB = Entity { key: Some(entity2_key.clone()), properties: propsB };
-        
+        propsB.insert(
+            "category".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("books".to_string())),
+                ..Default::default()
+            },
+        );
+        propsB.insert(
+            "stock".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::IntegerValue(5)),
+                ..Default::default()
+            },
+        );
+        let entityB = Entity {
+            key: Some(entity2_key.clone()),
+            properties: propsB,
+        };
+
         let entity3_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
-            path: vec![PathElement { kind: kind_name.clone(), id_type: Some(GrpcIdType::Name("entityC".to_string())) }],
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
+            path: vec![PathElement {
+                kind: kind_name.clone(),
+                id_type: Some(GrpcIdType::Name("entityC".to_string())),
+            }],
         };
         let mut propsC = HashMap::new();
-        propsC.insert("category".to_string(), Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() });
-        propsC.insert("stock".to_string(), Value { value_type: Some(GrpcValueType::IntegerValue(3)), ..Default::default() });
-        let entityC = Entity { key: Some(entity3_key.clone()), properties: propsC };
-
+        propsC.insert(
+            "category".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("electronics".to_string())),
+                ..Default::default()
+            },
+        );
+        propsC.insert(
+            "stock".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::IntegerValue(3)),
+                ..Default::default()
+            },
+        );
+        let entityC = Entity {
+            key: Some(entity3_key.clone()),
+            properties: propsC,
+        };
 
         let commit_req = CommitRequest {
             project_id: project_id.clone(),
             mode: CommitMode::NonTransactional as i32,
             mutations: vec![
-                Mutation { operation: Some(MutationOperation::Insert(entityA.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(entityB.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(entityC.clone())), ..Default::default() },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(entityA.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(entityB.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(entityC.clone())),
+                    ..Default::default()
+                },
             ],
             database_id: "".to_string(),
             ..Default::default()
         };
-        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed");
+        client
+            .commit(tonic::Request::new(commit_req))
+            .await
+            .expect("Commit failed");
 
         // Query for entities with category "electronics" AND stock > 5
         let filter1 = Filter {
             filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
-                property: Some(PropertyReference { name: "category".to_string() }),
+                property: Some(PropertyReference {
+                    name: "category".to_string(),
+                }),
                 op: PropertyFilterOp::Equal as i32,
-                value: Some(Value { value_type: Some(GrpcValueType::StringValue("electronics".to_string())), ..Default::default() }),
+                value: Some(Value {
+                    value_type: Some(GrpcValueType::StringValue("electronics".to_string())),
+                    ..Default::default()
+                }),
             })),
         };
         let filter2 = Filter {
             filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
-                property: Some(PropertyReference { name: "stock".to_string() }),
+                property: Some(PropertyReference {
+                    name: "stock".to_string(),
+                }),
                 op: PropertyFilterOp::GreaterThan as i32,
-                value: Some(Value { value_type: Some(GrpcValueType::IntegerValue(5)), ..Default::default() }),
+                value: Some(Value {
+                    value_type: Some(GrpcValueType::IntegerValue(5)),
+                    ..Default::default()
+                }),
             })),
         };
 
@@ -1211,7 +1455,9 @@ mod tests {
         };
 
         let query = Query {
-            kind: vec![KindExpression { name: kind_name.clone() }], // Use KindExpression
+            kind: vec![KindExpression {
+                name: kind_name.clone(),
+            }], // Use KindExpression
             filter: Some(composite_filter),
             ..Default::default()
         };
@@ -1219,18 +1465,36 @@ mod tests {
         let run_query_req = RunQueryRequest {
             project_id: project_id.clone(),
             database_id: "".to_string(),
-            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            query_type: Some(
+                crate::google::datastore::v1::run_query_request::QueryType::Query(query),
+            ),
             ..Default::default()
         };
 
-        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery failed");
-        let batch = response.into_inner().batch.expect("Query result batch is missing");
+        let response = client
+            .run_query(tonic::Request::new(run_query_req))
+            .await
+            .expect("RunQuery failed");
+        let batch = response
+            .into_inner()
+            .batch
+            .expect("Query result batch is missing");
 
-        assert_eq!(batch.entity_results.len(), 1, "Expected one entity matching composite filter");
+        assert_eq!(
+            batch.entity_results.len(),
+            1,
+            "Expected one entity matching composite filter"
+        );
         let found_entity = batch.entity_results[0].entity.as_ref().unwrap();
         assert_eq!(found_entity.key.as_ref(), Some(&entity1_key)); // Entity A
-        assert_eq!(found_entity.properties.get("category").unwrap().value_type, Some(GrpcValueType::StringValue("electronics".to_string())));
-        assert_eq!(found_entity.properties.get("stock").unwrap().value_type, Some(GrpcValueType::IntegerValue(10)));
+        assert_eq!(
+            found_entity.properties.get("category").unwrap().value_type,
+            Some(GrpcValueType::StringValue("electronics".to_string()))
+        );
+        assert_eq!(
+            found_entity.properties.get("stock").unwrap().value_type,
+            Some(GrpcValueType::IntegerValue(10))
+        );
     }
 
     #[tokio::test]
@@ -1242,72 +1506,139 @@ mod tests {
 
         // 1. Create Ancestor Key
         let ancestor_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
             path: vec![PathElement {
                 kind: parent_kind_name.clone(),
                 id_type: Some(GrpcIdType::Name("parent1".to_string())),
             }],
         };
-        let ancestor_entity = Entity { key: Some(ancestor_key.clone()), properties: HashMap::new() };
+        let ancestor_entity = Entity {
+            key: Some(ancestor_key.clone()),
+            properties: HashMap::new(),
+        };
 
         // 2. Create Child Entity
         let child_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
             path: vec![
-                PathElement { kind: parent_kind_name.clone(), id_type: Some(GrpcIdType::Name("parent1".to_string())) },
-                PathElement { kind: child_kind_name.clone(), id_type: Some(GrpcIdType::Name("child1".to_string())) },
+                PathElement {
+                    kind: parent_kind_name.clone(),
+                    id_type: Some(GrpcIdType::Name("parent1".to_string())),
+                },
+                PathElement {
+                    kind: child_kind_name.clone(),
+                    id_type: Some(GrpcIdType::Name("child1".to_string())),
+                },
             ],
         };
         let mut child_props = HashMap::new();
-        child_props.insert("name".to_string(), Value { value_type: Some(GrpcValueType::StringValue("Child One".to_string())), ..Default::default() });
-        let child_entity = Entity { key: Some(child_key.clone()), properties: child_props };
+        child_props.insert(
+            "name".to_string(),
+            Value {
+                value_type: Some(GrpcValueType::StringValue("Child One".to_string())),
+                ..Default::default()
+            },
+        );
+        let child_entity = Entity {
+            key: Some(child_key.clone()),
+            properties: child_props,
+        };
 
         // 3. Create Unrelated Entity (different ancestor)
         let unrelated_child_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
             path: vec![
-                PathElement { kind: parent_kind_name.clone(), id_type: Some(GrpcIdType::Name("parent2".to_string())) }, // Different parent
-                PathElement { kind: child_kind_name.clone(), id_type: Some(GrpcIdType::Name("child2".to_string())) },
+                PathElement {
+                    kind: parent_kind_name.clone(),
+                    id_type: Some(GrpcIdType::Name("parent2".to_string())),
+                }, // Different parent
+                PathElement {
+                    kind: child_kind_name.clone(),
+                    id_type: Some(GrpcIdType::Name("child2".to_string())),
+                },
             ],
         };
-        let unrelated_child_entity = Entity { key: Some(unrelated_child_key.clone()), properties: HashMap::new() };
-        
+        let unrelated_child_entity = Entity {
+            key: Some(unrelated_child_key.clone()),
+            properties: HashMap::new(),
+        };
+
         // 4. Create Another Unrelated Entity (same ancestor, but not a child for query)
         let another_parent_key = Key {
-            partition_id: Some(PartitionId { project_id: project_id.clone(), namespace_id: "".to_string(), ..Default::default() }),
+            partition_id: Some(PartitionId {
+                project_id: project_id.clone(),
+                namespace_id: "".to_string(),
+                ..Default::default()
+            }),
             path: vec![PathElement {
                 kind: "OtherParentKind".to_string(),
                 id_type: Some(GrpcIdType::Name("otherParent1".to_string())),
             }],
         };
-        let another_parent_entity = Entity { key: Some(another_parent_key.clone()), properties: HashMap::new() };
-
+        let another_parent_entity = Entity {
+            key: Some(another_parent_key.clone()),
+            properties: HashMap::new(),
+        };
 
         // Commit entities
         let commit_req = CommitRequest {
             project_id: project_id.clone(),
             mode: CommitMode::NonTransactional as i32,
             mutations: vec![
-                Mutation { operation: Some(MutationOperation::Insert(ancestor_entity.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(child_entity.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(unrelated_child_entity.clone())), ..Default::default() },
-                Mutation { operation: Some(MutationOperation::Insert(another_parent_entity.clone())), ..Default::default() },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(ancestor_entity.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(child_entity.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(unrelated_child_entity.clone())),
+                    ..Default::default()
+                },
+                Mutation {
+                    operation: Some(MutationOperation::Insert(another_parent_entity.clone())),
+                    ..Default::default()
+                },
             ],
             database_id: "".to_string(),
             ..Default::default()
         };
-        client.commit(tonic::Request::new(commit_req)).await.expect("Commit failed for ancestor test setup");
+        client
+            .commit(tonic::Request::new(commit_req))
+            .await
+            .expect("Commit failed for ancestor test setup");
 
         // 5. Query for entities with 'ancestor_key' as ancestor
         // The property reference for HAS_ANCESTOR is special: its name is "__key__".
         let query = Query {
             // Kind filter can be applied to narrow down results further, e.g., to ChildKindAncestor
-            kind: vec![KindExpression { name: child_kind_name.clone() }],
+            kind: vec![KindExpression {
+                name: child_kind_name.clone(),
+            }],
             filter: Some(Filter {
                 filter_type: Some(GrpcFilterType::PropertyFilter(PropertyFilter {
-                    property: Some(PropertyReference { name: "__key__".to_string() }), // Special property name for ancestor queries
+                    property: Some(PropertyReference {
+                        name: "__key__".to_string(),
+                    }), // Special property name for ancestor queries
                     op: PropertyFilterOp::HasAncestor as i32,
-                    value: Some(Value { value_type: Some(GrpcValueType::KeyValue(ancestor_key.clone())), ..Default::default() }),
+                    value: Some(Value {
+                        value_type: Some(GrpcValueType::KeyValue(ancestor_key.clone())),
+                        ..Default::default()
+                    }),
                 })),
             }),
             ..Default::default()
@@ -1316,20 +1647,46 @@ mod tests {
         let run_query_req = RunQueryRequest {
             project_id: project_id.clone(),
             database_id: "".to_string(),
-            query_type: Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)),
+            query_type: Some(
+                crate::google::datastore::v1::run_query_request::QueryType::Query(query),
+            ),
             ..Default::default()
         };
 
-        let response = client.run_query(tonic::Request::new(run_query_req)).await.expect("RunQuery with HasAncestor failed");
-        let batch = response.into_inner().batch.expect("Query result batch is missing for HasAncestor test");
+        let response = client
+            .run_query(tonic::Request::new(run_query_req))
+            .await
+            .expect("RunQuery with HasAncestor failed");
+        let batch = response
+            .into_inner()
+            .batch
+            .expect("Query result batch is missing for HasAncestor test");
 
-        assert_eq!(batch.entity_results.len(), 1, "Expected one entity with the specified ancestor");
+        assert_eq!(
+            batch.entity_results.len(),
+            1,
+            "Expected one entity with the specified ancestor"
+        );
         let found_entity_result = &batch.entity_results[0];
-        assert!(found_entity_result.entity.is_some(), "Found entity result should contain an entity");
+        assert!(
+            found_entity_result.entity.is_some(),
+            "Found entity result should contain an entity"
+        );
         let found_entity = found_entity_result.entity.as_ref().unwrap();
-        
-        assert_eq!(found_entity.key.as_ref(), Some(&child_key), "Found entity key does not match the expected child key");
-        let name_prop = found_entity.properties.get("name").expect("Name property missing from child");
-        assert_eq!(name_prop.value_type, Some(GrpcValueType::StringValue("Child One".to_string())), "Child name property mismatch");
+
+        assert_eq!(
+            found_entity.key.as_ref(),
+            Some(&child_key),
+            "Found entity key does not match the expected child key"
+        );
+        let name_prop = found_entity
+            .properties
+            .get("name")
+            .expect("Name property missing from child");
+        assert_eq!(
+            name_prop.value_type,
+            Some(GrpcValueType::StringValue("Child One".to_string())),
+            "Child name property mismatch"
+        );
     }
 }

@@ -116,7 +116,7 @@ impl DatastoreStorage {
                 stored_key_struct
                     .path_elements
                     .last()
-                    .map_or(false, |(k, _)| k == entity_kind_for_id_gen)
+                    .map_or_else(|| false, |(k, _)| k == entity_kind_for_id_gen)
             })
             .count();
         let new_id_value = count_for_entity_kind as i64 + 1;
@@ -168,20 +168,35 @@ impl DatastoreStorage {
         match filter {
             FilterType::PropertyFilter(property_filter) => {
                 if let Some(ref property) = property_filter.property {
-                    if let Some(ref filter_value) = property_filter.value { // Renamed `value` to `filter_value`
+                    if let Some(ref filter_value) = property_filter.value {
+                        // Renamed `value` to `filter_value`
                         // Special handling for HAS_ANCESTOR as it operates on keys, not properties
-                        if property.name == "__key__" && property_filter.op == 11 { // HAS_ANCESTOR = 11
-                            dbg!("Applying HAS_ANCESTOR filter", &entity_metadata.entity.key, &filter_value);
-                            if let Some(ValueType::KeyValue(ancestor_key_value)) = &filter_value.value_type {
+                        if property.name == "__key__" && property_filter.op == 11 {
+                            // HAS_ANCESTOR = 11
+                            dbg!(
+                                "Applying HAS_ANCESTOR filter",
+                                &entity_metadata.entity.key,
+                                &filter_value
+                            );
+                            if let Some(ValueType::KeyValue(ancestor_key_value)) =
+                                &filter_value.value_type
+                            {
                                 if let Some(entity_key) = &entity_metadata.entity.key {
                                     dbg!("Entity Key for HAS_ANCESTOR", entity_key);
                                     dbg!("Ancestor Key Value for HAS_ANCESTOR", ancestor_key_value);
-                                    
-                                    let entity_partition_id_obj = entity_key.partition_id.as_ref();
-                                    let ancestor_partition_id_obj = ancestor_key_value.partition_id.as_ref();
 
-                                    let partitions_match = match (entity_partition_id_obj, ancestor_partition_id_obj) {
-                                        (Some(ep), Some(ap)) => ep.project_id == ap.project_id && ep.namespace_id == ap.namespace_id,
+                                    let entity_partition_id_obj = entity_key.partition_id.as_ref();
+                                    let ancestor_partition_id_obj =
+                                        ancestor_key_value.partition_id.as_ref();
+
+                                    let partitions_match = match (
+                                        entity_partition_id_obj,
+                                        ancestor_partition_id_obj,
+                                    ) {
+                                        (Some(ep), Some(ap)) => {
+                                            ep.project_id == ap.project_id
+                                                && ep.namespace_id == ap.namespace_id
+                                        }
                                         (None, None) => true,
                                         _ => false,
                                     };
@@ -191,18 +206,33 @@ impl DatastoreStorage {
                                     }
 
                                     if entity_key.path.len() > ancestor_key_value.path.len() {
-                                        for (i, ancestor_path_element) in ancestor_key_value.path.iter().enumerate() {
+                                        for (i, ancestor_path_element) in
+                                            ancestor_key_value.path.iter().enumerate()
+                                        {
                                             let entity_path_element = &entity_key.path[i];
-                                            if entity_path_element.kind != ancestor_path_element.kind ||
-                                               entity_path_element.id_type != ancestor_path_element.id_type {
-                                                dbg!("HAS_ANCESTOR: Path element mismatch.", &entity_path_element, &ancestor_path_element);
-                                                return false; 
+                                            if entity_path_element.kind
+                                                != ancestor_path_element.kind
+                                                || entity_path_element.id_type
+                                                    != ancestor_path_element.id_type
+                                            {
+                                                dbg!(
+                                                    "HAS_ANCESTOR: Path element mismatch.",
+                                                    &entity_path_element,
+                                                    &ancestor_path_element
+                                                );
+                                                return false;
                                             }
                                         }
-                                        dbg!("HAS_ANCESTOR: Path prefix matches and length is greater. Returning true.");
+                                        dbg!(
+                                            "HAS_ANCESTOR: Path prefix matches and length is greater. Returning true."
+                                        );
                                         return true;
                                     } else {
-                                        dbg!("HAS_ANCESTOR: Path length condition not met.", entity_key.path.len(), ancestor_key_value.path.len());
+                                        dbg!(
+                                            "HAS_ANCESTOR: Path length condition not met.",
+                                            entity_key.path.len(),
+                                            ancestor_key_value.path.len()
+                                        );
                                     }
                                 } else {
                                     dbg!("HAS_ANCESTOR: Entity has no key.");
@@ -211,7 +241,7 @@ impl DatastoreStorage {
                                 dbg!("HAS_ANCESTOR: Filter value is not a KeyValue.");
                             }
                             dbg!("HAS_ANCESTOR: Defaulting to false.");
-                            return false; 
+                            return false;
                         }
                         // Regular property filters
                         else if let Some(entity_value) =
@@ -219,51 +249,121 @@ impl DatastoreStorage {
                         {
                             match property_filter.op {
                                 0 => return true, // OPERATOR_UNSPECIFIED
-                                1 => { // LESS_THAN
+                                1 => {
+                                    // LESS_THAN
                                     match (&entity_value.value_type, &filter_value.value_type) {
-                                        (Some(ValueType::IntegerValue(ev)), Some(ValueType::IntegerValue(fv))) => return ev < fv,
-                                        (Some(ValueType::DoubleValue(ev)), Some(ValueType::DoubleValue(fv))) => return ev < fv,
-                                        (Some(ValueType::StringValue(ev)), Some(ValueType::StringValue(fv))) => return ev < fv,
-                                        (Some(ValueType::TimestampValue(ev)), Some(ValueType::TimestampValue(fv))) =>
-                                            return ev.seconds < fv.seconds || (ev.seconds == fv.seconds && ev.nanos < fv.nanos),
+                                        (
+                                            Some(ValueType::IntegerValue(ev)),
+                                            Some(ValueType::IntegerValue(fv)),
+                                        ) => return ev < fv,
+                                        (
+                                            Some(ValueType::DoubleValue(ev)),
+                                            Some(ValueType::DoubleValue(fv)),
+                                        ) => return ev < fv,
+                                        (
+                                            Some(ValueType::StringValue(ev)),
+                                            Some(ValueType::StringValue(fv)),
+                                        ) => return ev < fv,
+                                        (
+                                            Some(ValueType::TimestampValue(ev)),
+                                            Some(ValueType::TimestampValue(fv)),
+                                        ) => {
+                                            return ev.seconds < fv.seconds
+                                                || (ev.seconds == fv.seconds
+                                                    && ev.nanos < fv.nanos);
+                                        }
                                         _ => return false, // Type mismatch or unsupported for comparison
                                     }
                                 }
-                                2 => { // LESS_THAN_OR_EQUAL
+                                2 => {
+                                    // LESS_THAN_OR_EQUAL
                                     match (&entity_value.value_type, &filter_value.value_type) {
-                                        (Some(ValueType::IntegerValue(ev)), Some(ValueType::IntegerValue(fv))) => return ev <= fv,
-                                        (Some(ValueType::DoubleValue(ev)), Some(ValueType::DoubleValue(fv))) => return ev <= fv,
-                                        (Some(ValueType::StringValue(ev)), Some(ValueType::StringValue(fv))) => return ev <= fv,
-                                        (Some(ValueType::TimestampValue(ev)), Some(ValueType::TimestampValue(fv))) =>
-                                            return ev.seconds < fv.seconds || (ev.seconds == fv.seconds && ev.nanos <= fv.nanos),
+                                        (
+                                            Some(ValueType::IntegerValue(ev)),
+                                            Some(ValueType::IntegerValue(fv)),
+                                        ) => return ev <= fv,
+                                        (
+                                            Some(ValueType::DoubleValue(ev)),
+                                            Some(ValueType::DoubleValue(fv)),
+                                        ) => return ev <= fv,
+                                        (
+                                            Some(ValueType::StringValue(ev)),
+                                            Some(ValueType::StringValue(fv)),
+                                        ) => return ev <= fv,
+                                        (
+                                            Some(ValueType::TimestampValue(ev)),
+                                            Some(ValueType::TimestampValue(fv)),
+                                        ) => {
+                                            return ev.seconds < fv.seconds
+                                                || (ev.seconds == fv.seconds
+                                                    && ev.nanos <= fv.nanos);
+                                        }
                                         _ => return false,
                                     }
                                 }
-                                3 => { // GREATER_THAN
+                                3 => {
+                                    // GREATER_THAN
                                     match (&entity_value.value_type, &filter_value.value_type) {
-                                        (Some(ValueType::IntegerValue(ev)), Some(ValueType::IntegerValue(fv))) => return ev > fv,
-                                        (Some(ValueType::DoubleValue(ev)), Some(ValueType::DoubleValue(fv))) => return ev > fv,
-                                        (Some(ValueType::StringValue(ev)), Some(ValueType::StringValue(fv))) => return ev > fv,
-                                        (Some(ValueType::TimestampValue(ev)), Some(ValueType::TimestampValue(fv))) =>
-                                            return ev.seconds > fv.seconds || (ev.seconds == fv.seconds && ev.nanos > fv.nanos),
+                                        (
+                                            Some(ValueType::IntegerValue(ev)),
+                                            Some(ValueType::IntegerValue(fv)),
+                                        ) => return ev > fv,
+                                        (
+                                            Some(ValueType::DoubleValue(ev)),
+                                            Some(ValueType::DoubleValue(fv)),
+                                        ) => return ev > fv,
+                                        (
+                                            Some(ValueType::StringValue(ev)),
+                                            Some(ValueType::StringValue(fv)),
+                                        ) => return ev > fv,
+                                        (
+                                            Some(ValueType::TimestampValue(ev)),
+                                            Some(ValueType::TimestampValue(fv)),
+                                        ) => {
+                                            return ev.seconds > fv.seconds
+                                                || (ev.seconds == fv.seconds
+                                                    && ev.nanos > fv.nanos);
+                                        }
                                         _ => return false,
                                     }
                                 }
-                                4 => { // GREATER_THAN_OR_EQUAL
+                                4 => {
+                                    // GREATER_THAN_OR_EQUAL
                                     match (&entity_value.value_type, &filter_value.value_type) {
-                                        (Some(ValueType::IntegerValue(ev)), Some(ValueType::IntegerValue(fv))) => return ev >= fv,
-                                        (Some(ValueType::DoubleValue(ev)), Some(ValueType::DoubleValue(fv))) => return ev >= fv,
-                                        (Some(ValueType::StringValue(ev)), Some(ValueType::StringValue(fv))) => return ev >= fv,
-                                        (Some(ValueType::TimestampValue(ev)), Some(ValueType::TimestampValue(fv))) =>
-                                            return ev.seconds > fv.seconds || (ev.seconds == fv.seconds && ev.nanos >= fv.nanos),
+                                        (
+                                            Some(ValueType::IntegerValue(ev)),
+                                            Some(ValueType::IntegerValue(fv)),
+                                        ) => return ev >= fv,
+                                        (
+                                            Some(ValueType::DoubleValue(ev)),
+                                            Some(ValueType::DoubleValue(fv)),
+                                        ) => return ev >= fv,
+                                        (
+                                            Some(ValueType::StringValue(ev)),
+                                            Some(ValueType::StringValue(fv)),
+                                        ) => return ev >= fv,
+                                        (
+                                            Some(ValueType::TimestampValue(ev)),
+                                            Some(ValueType::TimestampValue(fv)),
+                                        ) => {
+                                            return ev.seconds > fv.seconds
+                                                || (ev.seconds == fv.seconds
+                                                    && ev.nanos >= fv.nanos);
+                                        }
                                         _ => return false,
                                     }
                                 }
                                 5 => return entity_value.value_type == filter_value.value_type, // EQUAL
-                                6 => { /* IN - todo */ return false; } // Defaulting to false for unimplemented IN
+                                6 => {
+                                    /* IN - todo */
+                                    return false;
+                                } // Defaulting to false for unimplemented IN
                                 9 => return entity_value.value_type != filter_value.value_type, // NOT_EQUAL
                                 // Case 11 (HAS_ANCESTOR) is handled above
-                                13 => { /* NOT_IN - todo */ return false; } // Defaulting to false for unimplemented NOT_IN
+                                13 => {
+                                    /* NOT_IN - todo */
+                                    return false;
+                                } // Defaulting to false for unimplemented NOT_IN
                                 _ => return false, // Unsupported operator for property or op combination
                             }
                         } else {
@@ -322,7 +422,12 @@ impl DatastoreStorage {
         self.entities.get(&key_struct).cloned()
     }
 
-    pub fn get_entities(&self, project_id_filter: String, kind_name: String, filter: Option<Filter>) -> Vec<EntityResult> {
+    pub fn get_entities(
+        &self,
+        project_id_filter: String,
+        kind_name: String,
+        filter: Option<Filter>,
+    ) -> Vec<EntityResult> {
         let mut results = Vec::new();
 
         // Debug print (optional)
