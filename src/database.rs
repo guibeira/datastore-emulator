@@ -24,26 +24,6 @@ pub struct KeyStruct {
 }
 
 impl KeyStruct {
-    pub fn from_datastore_to_string(key: &Key) -> String {
-        // this will be used as a key for get entities
-
-        let mut path_elements = Vec::new();
-        for path_element in &key.path {
-            let kind = path_element.kind.clone();
-            // let id_type = match &path_element.id_type {
-            //     Some(IdType::Id(id)) => format!("id: {}", id),
-            //     Some(IdType::Name(name)) => format!("name: {}", name),
-            //     None => continue,
-            // };
-            path_elements.push(kind.to_string());
-        }
-        //return the last string
-        path_elements
-            .last()
-            .map_or_else(|| "".to_string(), |s| s.to_string())
-        //path_elements.join(", ").to_string();
-    }
-
     pub fn from_datastore_key(key: &Key) -> Self {
         let mut path_elements = Vec::new();
         for path_element in &key.path {
