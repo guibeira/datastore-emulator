@@ -6,17 +6,24 @@ use google::datastore::v1::mutation::Operation;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
-use std::env;
 
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{Request, Response, Status};
 
 pub mod database;
-use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
+pub mod leveldb;
+use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState, read_dump};
 pub mod google {
     pub mod datastore {
+        pub mod import_export {
+            pub mod dsbackups {
+                tonic::include_proto!("dsbackups");
+            }
+            pub mod datastore_v3 { // Added to resolve error E0433
+                tonic::include_proto!("appengine");
+            }
+        }
         pub mod v1 {
             tonic::include_proto!("google.datastore.v1");
         }
@@ -24,7 +31,7 @@ pub mod google {
 }
 
 use google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
-use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
+use google::datastore::v1::datastore_server::Datastore as DatastoreService;
 use google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
     BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
@@ -883,34 +890,35 @@ impl DatastoreService for DatastoreEmulator {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let args: Vec<String> = env::args().collect();
-    let host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
-    let port_str = args.get(2).map_or("8042", |s| s.as_str());
-    let port: u16 = port_str.parse().unwrap_or_else(|_| {
-        eprintln!("Invalid port number '{}', using default 8042.", port_str);
-        8042
-    });
+    read_dump();
+    // let args: Vec<String> = env::args().collect();
+    // let host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
+    // let port_str = args.get(2).map_or("8042", |s| s.as_str());
+    // let port: u16 = port_str.parse().unwrap_or_else(|_| {
+    //     eprintln!("Invalid port number '{}', using default 8042.", port_str);
+    //     8042
+    // });
 
-    let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap_or_else(|e| {
-        eprintln!(
-            "Invalid address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
-            host, port, e
-        );
-        SocketAddr::from(([127, 0, 0, 1], 8042))
-    });
+    // let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap_or_else(|e| {
+    //     eprintln!(
+    //         "Invalid address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
+    //         host, port, e
+    //     );
+    //     SocketAddr::from(([127, 0, 0, 1], 8042))
+    // });
 
-    let emulator = DatastoreEmulator::default();
+    // let emulator = DatastoreEmulator::default();
 
-    println!("Datastore emulator listening on {}", addr);
+    // println!("Datastore emulator listening on {}", addr);
 
-    // Create a Server with increased message size limits for Tonic 1.0
-    Server::builder()
-        // In Tonic 1.0, we use max_frame_size to control message size
-        .max_frame_size(10 * 1024 * 1024) // 10MB frame size (applies to both send/receive)
-        // Register the service properly using the generated DatastoreServer
-        .add_service(DatastoreServer::new(emulator))
-        .serve(addr)
-        .await?;
+    // // Create a Server with increased message size limits for Tonic 1.0
+    // Server::builder()
+    //     // In Tonic 1.0, we use max_frame_size to control message size
+    //     .max_frame_size(10 * 1024 * 1024) // 10MB frame size (applies to both send/receive)
+    //     // Register the service properly using the generated DatastoreServer
+    //     .add_service(DatastoreServer::new(emulator))
+    //     .serve(addr)
+    //     .await?;
 
     Ok(())
 }

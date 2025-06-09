@@ -1,13 +1,170 @@
+use crate::google::datastore::import_export::datastore_v3::EntityProto;
+use crate::google::datastore::import_export::dsbackups::ExportMetadata;
+use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
 use crate::google::datastore::v1::key::path_element::IdType;
+use rayon::prelude::*;
 
 use crate::google::datastore::v1::Filter;
 use crate::google::datastore::v1::filter::FilterType;
 use crate::google::datastore::v1::value::ValueType;
+use prost::Message;
 use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
+use crate::leveldb::LogReader; // Added to resolve error E0433
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::SystemTime; // Importing LogReader to read log files
+
+pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
+    let mut metadata_file = None;
+    for entry in std::fs::read_dir(export_dir).expect("Failed to read export directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".overall_export_metadata")
+        {
+            metadata_file = Some(entry.path());
+            break;
+        }
+    }
+
+    let _metadata_file = metadata_file.expect("Could not find .overall_export_metadata file.");
+    dbg!("Found metadata file:", _metadata_file.display());
+    // let reader = LogReader::new(_metadata_file.clone())
+    //     .expect("Failed to create LogReader for metadata file");
+    // dbg!("LogReader created for metadata file:", reader);
+    match LogReader::new(_metadata_file.clone()) {
+        Ok(reader) => {
+            for (i, record_result) in reader.enumerate() {
+                match record_result {
+                    Ok(record) => {
+                        match OverallExportMetadata::decode(&record[..]) {
+                            Ok(metadata) => {
+                                // Now you have the decoded 'metadata'.
+                                // You might want to process or store it.
+                                return Some(metadata); // Returning the metadata
+                            }
+                            Err(decode_err) => {
+                                eprintln!("Failed to decode OverallExportMetadata: {}", decode_err);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading record {}: {}", i + 1, e); // Translated eprintln
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Erro ao abrir o arquivo: {}", e);
+        }
+    }
+    None // Returning None as we are not returning the metadata here
+}
+
+pub fn read_dump() {
+    //let export_dir = ".";
+    let export_dir = "exports";
+    let entity_dump_path = std::path::PathBuf::from(export_dir).join("datastore_dump_output.json");
+
+    println!(
+        "Reading datastore export from: {}",
+        entity_dump_path.display()
+    );
+    let overall_metadata = read_overall_metadata(export_dir);
+    if let Some(metadata) = overall_metadata {
+        //dbg!("Overall metadata found:", &metadata.exports);
+        
+        // Parallelize processing for each export_entry (kind)
+        metadata.exports.into_par_iter().for_each(|export_entry| {
+            let kind_name = export_entry.kind.as_ref().map_or_else(String::new, |k| k.kind.clone());
+            println!("Processing kind: {}", kind_name);
+            let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
+
+            if !metadata_path.exists() {
+                eprintln!(
+                    "Metadata file for kind {} not found at: {}",
+                    kind_name,
+                    metadata_path.display()
+                );
+                return; // Skip this export_entry in parallel context
+            }
+
+            let export_metadata_result = std::fs::read(&metadata_path)
+                .map_err(|e| {
+                    eprintln!(
+                        "Failed to read metadata file {}: {}",
+                        metadata_path.display(),
+                        e
+                    );
+                    e 
+                })
+                .and_then(|data| {
+                    ExportMetadata::decode(&data[..]).map_err(|e| {
+                        eprintln!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    })
+                });
+
+            let export_metadata = match export_metadata_result {
+                Ok(meta) => meta,
+                Err(_) => return, // Skip this export_entry if metadata reading/decoding failed
+            };
+            
+            let output_file_names = export_metadata.items.unwrap_or_default().outputs;
+            let parent_dir_for_output_files = metadata_path
+                .parent()
+                .expect("Metadata path should have a parent directory")
+                .to_path_buf();
+
+            // This inner loop remains parallel, processing data files for the current kind
+            output_file_names.into_par_iter().for_each(|output_file_name_str| {
+                let output_file_path = parent_dir_for_output_files.join(output_file_name_str);
+                if output_file_path.exists() {
+                    // convert the output file to a LogReader
+                    match LogReader::new(output_file_path.clone()) {
+                        Ok(reader) => {
+                            for (i, record_result) in reader.enumerate() {
+                                match record_result {
+                                    Ok(record) => {
+                                        match EntityProto::decode(&record[..]) {
+                                            Ok(entity_proto) => {
+                                                //dbg!(&entity_proto);
+                                                // Here you can process the entity_proto as needed
+                                            }
+                                            Err(decode_err) => {
+                                                eprintln!(
+                                                    "Failed to decode EntityProto from file {}: {}",
+                                                    output_file_path.display(),
+                                                    decode_err
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error reading record {} from file {}: {}", i + 1, output_file_path.display(), e);
+                                        break; // Restaura o break para o loop sequencial
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Erro ao abrir o arquivo {}: {}", output_file_path.display(), e);
+                        }
+                    }
+                } else {
+                    eprintln!("Output file {} does not exist.", output_file_path.display());
+                }
+            });
+        }); // End of parallel processing for export_entry
+    } else {
+        eprintln!("No overall metadata found in the export directory.");
+        return;
+    }
+    println!("Finished reading datastore export.");
+}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyId {
@@ -408,7 +565,12 @@ impl DatastoreStorage {
                 }
             }
         }
-        true
+        // The code below was unreachable because all match arms returned explicitly.
+        // If none of the match arms are hit (which shouldn't happen with a valid FilterType),
+        // the default behavior would be not to filter, i.e., return true.
+        // However, the current match logic covers all FilterType cases (PropertyFilter, CompositeFilter).
+        // If FilterType is None, the filter is not applied in the previous call.
+        // Therefore, removing the final `true` is safe, as the match should be exhaustive for valid FilterType.
     }
 
     pub fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
