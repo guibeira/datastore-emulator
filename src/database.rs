@@ -1,7 +1,10 @@
-use crate::google::datastore::import_export::datastore_v3::EntityProto;
+use crate::google::datastore::import_export::datastore_v3::{
+    EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
+};
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
 use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
 use crate::google::datastore::v1::key::path_element::IdType;
+use crate::google::datastore::v1::{ArrayValue, LatLng, PartitionId, Value};
 use rayon::prelude::*;
 
 use crate::google::datastore::v1::Filter;
@@ -14,6 +17,171 @@ use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime; // Importing LogReader to read log files
+
+fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
+    if let Some(v) = prop_val.int64_value {
+        return Some(ValueType::IntegerValue(v));
+    }
+    if let Some(v) = prop_val.boolean_value {
+        return Some(ValueType::BooleanValue(v));
+    }
+    if let Some(v) = &prop_val.string_value {
+        return Some(ValueType::StringValue(v.clone()));
+    }
+    if let Some(v) = prop_val.double_value {
+        return Some(ValueType::DoubleValue(v));
+    }
+    if let Some(v) = &prop_val.pointvalue {
+        return Some(ValueType::GeoPointValue(LatLng {
+            latitude: v.x,
+            longitude: v.y,
+        }));
+    }
+    if let Some(v) = &prop_val.referencevalue {
+        let key = convert_reference_value_to_key(v);
+        return Some(ValueType::KeyValue(key));
+    }
+    // Note: list_value and user_value are not directly handled here as they are
+    // part of the Property structure itself or deprecated.
+    None
+}
+
+fn convert_reference_value_to_key(reference_value: &ReferenceValue) -> Key {
+    let path = reference_value
+        .pathelement
+        .iter()
+        .map(|el| {
+            let id_type = if let Some(id) = el.id {
+                Some(IdType::Id(id))
+            } else {
+                el.name.as_ref().map(|n| IdType::Name(n.clone()))
+            };
+            crate::google::datastore::v1::key::PathElement {
+                kind: el.r#type.clone(),
+                id_type,
+            }
+        })
+        .collect();
+
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: reference_value.app.clone(),
+            namespace_id: reference_value.name_space.clone().unwrap_or_default(),
+            database_id: "".to_string(),
+        }),
+        path,
+    }
+}
+
+fn convert_reference_to_key(reference: &Reference) -> Key {
+    let path = reference
+        .path
+        .element
+        .iter()
+        .map(|el| {
+            let id_type = if let Some(id) = el.id {
+                Some(IdType::Id(id))
+            } else {
+                el.name.as_ref().map(|n| IdType::Name(n.clone()))
+            };
+            crate::google::datastore::v1::key::PathElement {
+                kind: el.r#type.clone(),
+                id_type,
+            }
+        })
+        .collect();
+
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: reference.app.clone(),
+            namespace_id: reference.name_space.clone().unwrap_or_default(),
+            database_id: "".to_string(),
+        }),
+        path,
+    }
+}
+
+pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata> {
+    dump_entities
+        .into_iter()
+        .map(|entity_proto| {
+            let v1_key = Some(convert_reference_to_key(&entity_proto.key));
+
+            // Group properties by name to handle multi-valued properties
+            let mut grouped_props: HashMap<String, (Vec<Value>, bool)> = HashMap::new();
+
+            for prop in &entity_proto.property {
+                let prop_val = &prop.value;
+                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                    let entry = grouped_props
+                        .entry(prop.name.clone())
+                        .or_insert((vec![], false));
+                    entry.0.push(Value {
+                        value_type: Some(v1_value_type),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            for prop in &entity_proto.raw_property {
+                let prop_val = &prop.value;
+                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                    let entry = grouped_props
+                        .entry(prop.name.clone())
+                        .or_insert((vec![], true));
+                    entry.0.push(Value {
+                        value_type: Some(v1_value_type),
+                        ..Default::default()
+                    });
+                    entry.1 = true; // Mark as exclude_from_indexes
+                }
+            }
+
+            let mut properties: HashMap<String, Value> = HashMap::new();
+            for (name, (mut values, exclude)) in grouped_props {
+                if values.len() > 1 {
+                    // It's an array
+                    properties.insert(
+                        name,
+                        Value {
+                            value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
+                            exclude_from_indexes: exclude,
+                            ..Default::default()
+                        },
+                    );
+                } else if let Some(mut single_value) = values.pop() {
+                    // It's a single value
+                    single_value.exclude_from_indexes = exclude;
+                    properties.insert(name, single_value);
+                }
+            }
+
+            let v1_entity = Entity {
+                key: v1_key,
+                properties,
+            };
+
+            let timestamp_now = prost_types::Timestamp {
+                seconds: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                nanos: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i32
+                    % 1_000_000_000,
+            };
+
+            EntityWithMetadata {
+                entity: v1_entity,
+                version: 1,
+                create_time: timestamp_now.clone(),
+                update_time: timestamp_now,
+            }
+        })
+        .collect()
+}
 
 pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
     let mut metadata_file = None;
@@ -246,6 +414,21 @@ impl DatastoreStorage {
     pub fn clean_transaction(&mut self, transaction_id: &str) {
         // clean up the transaction state
         self.transactions.remove(transaction_id);
+    }
+
+    pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
+        let dump_entities = read_dump(path);
+        let entities_with_metadata = converter_dump(dump_entities);
+        for entity_metadata in entities_with_metadata {
+            if let Some(key) = &entity_metadata.entity.key {
+                self.insert_entity(&entity_metadata.entity)?;
+            } else {
+                return Err(tonic::Status::invalid_argument(
+                    "Entity missing key during import",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn insert_entity(

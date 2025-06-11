@@ -20,6 +20,9 @@ pub mod database;
 pub mod leveldb;
 use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
 pub mod google {
+    // pub mod r#type { // Removido pois não é necessário e causa conflitos
+    //     tonic::include_proto!("google.r#type");
+    // }
     pub mod datastore {
         pub mod import_export {
             pub mod dsbackups {
@@ -45,8 +48,6 @@ use google::datastore::v1::{
     PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
-
-use crate::database::read_dump;
 
 #[derive(Debug)]
 struct DatastoreEmulator {
@@ -994,8 +995,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
     let emulator = DatastoreEmulator::default();
+    // import dump
+    emulator
+        .storage
+        .lock()
+        .expect("poisoned")
+        .import_dump("exports");
     let datastore_service = DatastoreServer::new(emulator);
-    let objects_imported = read_dump("exports");
+
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<DatastoreServer<DatastoreEmulator>>()
