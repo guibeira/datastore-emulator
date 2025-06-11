@@ -1,0 +1,44 @@
+// Reverse engineered with protoc --decode_raw 
+
+syntax = "proto3";
+
+option go_package = "github.com/remko/dsbackups/internal/pb";
+
+package dsbackups;
+
+message OverallExportMetadata {
+  repeated ExportMetadataEntry exports = 1;
+}
+
+message ExportMetadataEntry {
+  ExportMetadataEntryKind kind = 1;
+  string path = 2;
+  int64 count = 3;
+  int64 size = 4;
+}
+
+message ExportMetadataEntryKind {
+  int32 unknown1 = 1;
+  string kind = 2;
+  int32 unknown2 = 3;
+}
+
+////////////////////////////////////////////////////////////////
+
+message ExportMetadata {
+  ExportMetadataOperation operation = 1;
+  ExportMetadataItems items = 2; 
+}
+
+message ExportMetadataOperation {
+  string operation = 1; // "export_entities"
+  int64 startTime = 2; // timestamp in microseconds (seems to be something else in emulator exports)
+  int64 endTime = 3; // timestamp in microseconds (seems to be something else in emulator exports)
+}
+
+message ExportMetadataItems {
+  string kind = 1;
+  repeated string outputs = 2;
+  // 3 contains kind Metadatadata (properties, ...)
+  // Not present in emulator exports
+}
