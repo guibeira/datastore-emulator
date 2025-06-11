@@ -64,9 +64,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
     None // Returning None as we are not returning the metadata here
 }
 
-pub fn read_dump() {
-    //let export_dir = ".";
-    let export_dir = "exports";
+pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
     let entity_dump_path = std::path::PathBuf::from(export_dir).join("datastore_dump_output.json");
 
     println!(
@@ -75,95 +73,104 @@ pub fn read_dump() {
     );
     let overall_metadata = read_overall_metadata(export_dir);
     if let Some(metadata) = overall_metadata {
-        //dbg!("Overall metadata found:", &metadata.exports);
-        
-        // Parallelize processing for each export_entry (kind)
-        metadata.exports.into_par_iter().for_each(|export_entry| {
-            let kind_name = export_entry.kind.as_ref().map_or_else(String::new, |k| k.kind.clone());
-            println!("Processing kind: {}", kind_name);
-            let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
+        let entity_protos: Vec<EntityProto> = metadata
+            .exports
+            .into_par_iter()
+            .flat_map(|export_entry| {
+                let kind_name = export_entry
+                    .kind
+                    .as_ref()
+                    .map_or_else(String::new, |k| k.kind.clone());
+                println!("Processing kind: {}", kind_name);
+                let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
 
-            if !metadata_path.exists() {
-                eprintln!(
-                    "Metadata file for kind {} not found at: {}",
-                    kind_name,
-                    metadata_path.display()
-                );
-                return; // Skip this export_entry in parallel context
-            }
-
-            let export_metadata_result = std::fs::read(&metadata_path)
-                .map_err(|e| {
+                if !metadata_path.exists() {
                     eprintln!(
-                        "Failed to read metadata file {}: {}",
-                        metadata_path.display(),
-                        e
+                        "Metadata file for kind {} not found at: {}",
+                        kind_name,
+                        metadata_path.display()
                     );
-                    e 
-                })
-                .and_then(|data| {
-                    ExportMetadata::decode(&data[..]).map_err(|e| {
-                        eprintln!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    return Vec::new().into_par_iter();
+                }
+
+                let export_metadata = match std::fs::read(&metadata_path)
+                    .map_err(|e| {
+                        eprintln!(
+                            "Failed to read metadata file {}: {}",
+                            metadata_path.display(),
+                            e
+                        );
+                        e
                     })
-                });
+                    .and_then(|data| {
+                        ExportMetadata::decode(&data[..]).map_err(|e| {
+                            eprintln!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                        })
+                    }) {
+                    Ok(meta) => meta,
+                    Err(_) => return Vec::new().into_par_iter(),
+                };
 
-            let export_metadata = match export_metadata_result {
-                Ok(meta) => meta,
-                Err(_) => return, // Skip this export_entry if metadata reading/decoding failed
-            };
-            
-            let output_file_names = export_metadata.items.unwrap_or_default().outputs;
-            let parent_dir_for_output_files = metadata_path
-                .parent()
-                .expect("Metadata path should have a parent directory")
-                .to_path_buf();
+                let output_file_names = export_metadata.items.unwrap_or_default().outputs;
+                let parent_dir_for_output_files = metadata_path
+                    .parent()
+                    .expect("Metadata path should have a parent directory")
+                    .to_path_buf();
 
-            // This inner loop remains parallel, processing data files for the current kind
-            output_file_names.into_par_iter().for_each(|output_file_name_str| {
-                let output_file_path = parent_dir_for_output_files.join(output_file_name_str);
-                if output_file_path.exists() {
-                    // convert the output file to a LogReader
-                    match LogReader::new(output_file_path.clone()) {
-                        Ok(reader) => {
-                            for (i, record_result) in reader.enumerate() {
-                                match record_result {
-                                    Ok(record) => {
-                                        match EntityProto::decode(&record[..]) {
-                                            Ok(entity_proto) => {
-                                                //dbg!(&entity_proto);
-                                                // Here you can process the entity_proto as needed
-                                            }
-                                            Err(decode_err) => {
+                let protos_for_this_export: Vec<EntityProto> = output_file_names
+                    .into_par_iter()
+                    .flat_map(move |output_file_name_str| {
+                        let output_file_path =
+                            parent_dir_for_output_files.join(output_file_name_str);
+                        let mut protos_in_file = Vec::new();
+                        if output_file_path.exists() {
+                            if let Ok(reader) = LogReader::new(output_file_path.clone()) {
+                                for (i, record_result) in reader.enumerate() {
+                                    match record_result {
+                                        Ok(record) => {
+                                            if let Ok(entity_proto) =
+                                                EntityProto::decode(&record[..])
+                                            {
+                                                protos_in_file.push(entity_proto);
+                                            } else {
                                                 eprintln!(
-                                                    "Failed to decode EntityProto from file {}: {}",
-                                                    output_file_path.display(),
-                                                    decode_err
+                                                    "Failed to decode EntityProto from file {}",
+                                                    output_file_path.display()
                                                 );
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Error reading record {} from file {}: {}", i + 1, output_file_path.display(), e);
-                                        break; // Restaura o break para o loop sequencial
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Error reading record {} from file {}: {}",
+                                                i + 1,
+                                                output_file_path.display(),
+                                                e
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
+                            } else {
+                                eprintln!("Error opening file: {}", output_file_path.display());
                             }
+                        } else {
+                            eprintln!("Output file {} does not exist.", output_file_path.display());
                         }
-                        Err(e) => {
-                            eprintln!("Erro ao abrir o arquivo {}: {}", output_file_path.display(), e);
-                        }
-                    }
-                } else {
-                    eprintln!("Output file {} does not exist.", output_file_path.display());
-                }
-            });
-        }); // End of parallel processing for export_entry
+                        protos_in_file
+                    })
+                    .collect();
+
+                protos_for_this_export.into_par_iter()
+            })
+            .collect();
+
+        println!("Finished reading datastore export.");
+        return entity_protos;
     } else {
         eprintln!("No overall metadata found in the export directory.");
-        return;
+        return Vec::new();
     }
-    println!("Finished reading datastore export.");
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]

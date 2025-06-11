@@ -1,3 +1,5 @@
+use axum::{Json, Router, extract::Path, routing::post};
+use chrono::Utc;
 use google::datastore::v1::Filter;
 use google::datastore::v1::commit_request::TransactionSelector;
 use google::datastore::v1::key::PathElement;
@@ -5,22 +7,26 @@ use google::datastore::v1::key::path_element::IdType;
 use google::datastore::v1::mutation::Operation;
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-
+use std::env;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
+use uuid::Uuid;
 
 pub mod database;
 pub mod leveldb;
-use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState, read_dump};
+use database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
 pub mod google {
     pub mod datastore {
         pub mod import_export {
             pub mod dsbackups {
                 tonic::include_proto!("dsbackups");
             }
-            pub mod datastore_v3 { // Added to resolve error E0433
+            pub mod datastore_v3 {
+                // Added to resolve error E0433
                 tonic::include_proto!("appengine");
             }
         }
@@ -31,7 +37,7 @@ pub mod google {
 }
 
 use google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
-use google::datastore::v1::datastore_server::Datastore as DatastoreService;
+use google::datastore::v1::datastore_server::{Datastore as DatastoreService, DatastoreServer};
 use google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
     BeginTransactionResponse, CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats,
@@ -39,6 +45,8 @@ use google::datastore::v1::{
     PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
 };
+
+use crate::database::read_dump;
 
 #[derive(Debug)]
 struct DatastoreEmulator {
@@ -886,39 +894,141 @@ impl DatastoreService for DatastoreEmulator {
     }
 }
 
+// --- HTTP Endpoint Logic ---
+
+#[derive(Deserialize)]
+struct WelcomeRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct WelcomeResponse {
+    msg: String,
+}
+
+async fn welcome_handler(Json(payload): Json<WelcomeRequest>) -> Json<WelcomeResponse> {
+    let response = WelcomeResponse {
+        msg: format!("welcome {}", payload.name),
+    };
+    Json(response)
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    #[serde(rename = "inputUrl")]
+    input_url: String,
+}
+
+#[derive(Serialize)]
+struct ImportResponse {
+    name: String,
+    metadata: ImportMetadata,
+}
+
+#[derive(Serialize)]
+struct ImportMetadata {
+    #[serde(rename = "@type")]
+    type_url: String,
+    common: CommonMetadata,
+    #[serde(rename = "entityFilter")]
+    entity_filter: serde_json::Value,
+    #[serde(rename = "inputUrl")]
+    input_url: String,
+}
+
+#[derive(Serialize)]
+struct CommonMetadata {
+    #[serde(rename = "startTime")]
+    start_time: String,
+    #[serde(rename = "operationType")]
+    operation_type: String,
+    state: String,
+}
+
+async fn import_handler(
+    Path(project_id): Path<String>,
+    Json(payload): Json<ImportRequest>,
+) -> Json<ImportResponse> {
+    let operation_id = Uuid::new_v4().to_string();
+    let response = ImportResponse {
+        name: format!("projects/{}/operations/{}", project_id, operation_id),
+        metadata: ImportMetadata {
+            type_url: "type.googleapis.com/google.datastore.admin.v1.ImportEntitiesMetadata"
+                .to_string(),
+            common: CommonMetadata {
+                start_time: Utc::now().to_rfc3339(),
+                operation_type: "IMPORT_ENTITIES".to_string(),
+                state: "PROCESSING".to_string(),
+            },
+            entity_filter: serde_json::json!({}),
+            input_url: payload.input_url,
+        },
+    };
+    Json(response)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init();
 
-    read_dump();
-    // let args: Vec<String> = env::args().collect();
-    // let host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
-    // let port_str = args.get(2).map_or("8042", |s| s.as_str());
-    // let port: u16 = port_str.parse().unwrap_or_else(|_| {
-    //     eprintln!("Invalid port number '{}', using default 8042.", port_str);
-    //     8042
-    // });
+    // --- gRPC Server Setup ---
+    let args: Vec<String> = env::args().collect();
+    let grpc_host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
+    let grpc_port_str = args.get(2).map_or("8042", |s| s.as_str());
+    let grpc_port: u16 = grpc_port_str.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "Invalid gRPC port number '{}', using default 8042.",
+            grpc_port_str
+        );
+        8042
+    });
 
-    // let addr: SocketAddr = format!("{}:{}", host, port).parse().unwrap_or_else(|e| {
-    //     eprintln!(
-    //         "Invalid address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
-    //         host, port, e
-    //     );
-    //     SocketAddr::from(([127, 0, 0, 1], 8042))
-    // });
+    let grpc_addr: SocketAddr = format!("{}:{}", grpc_host, grpc_port)
+        .parse()
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Invalid gRPC address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
+                grpc_host, grpc_port, e
+            );
+            SocketAddr::from(([127, 0, 0, 1], 8042))
+        });
 
-    // let emulator = DatastoreEmulator::default();
+    let emulator = DatastoreEmulator::default();
+    let datastore_service = DatastoreServer::new(emulator);
+    let objects_imported = read_dump("exports");
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<DatastoreServer<DatastoreEmulator>>()
+        .await;
 
-    // println!("Datastore emulator listening on {}", addr);
+    let grpc_server = Server::builder()
+        .add_service(datastore_service)
+        .add_service(health_service)
+        .serve(grpc_addr);
 
-    // // Create a Server with increased message size limits for Tonic 1.0
-    // Server::builder()
-    //     // In Tonic 1.0, we use max_frame_size to control message size
-    //     .max_frame_size(10 * 1024 * 1024) // 10MB frame size (applies to both send/receive)
-    //     // Register the service properly using the generated DatastoreServer
-    //     .add_service(DatastoreServer::new(emulator))
-    //     .serve(addr)
-    //     .await?;
+    // --- HTTP Server Setup ---
+    let http_addr: SocketAddr = "127.0.0.1:8043".parse()?;
+    let http_router = Router::new()
+        .route("/", post(welcome_handler))
+        .route("/v1/projects/:project_id/import", post(import_handler));
+    let http_server = axum::Server::bind(&http_addr).serve(http_router.into_make_service());
+
+    println!("Datastore emulator (gRPC) listening on {}", grpc_addr);
+    println!("HTTP server listening on {}", http_addr);
+
+    // --- Run both servers concurrently ---
+    tokio::try_join!(
+        async {
+            grpc_server
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+        },
+        async {
+            http_server
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+        }
+    )?;
 
     Ok(())
 }
@@ -944,8 +1054,8 @@ mod tests {
         commit_request::Mode as CommitMode,
         composite_filter::Operator as CompositeFilterOp,
         datastore_client::DatastoreClient,
+        datastore_server::DatastoreServer,
         filter::FilterType as GrpcFilterType, // Alias for gRPC FilterType
-        key::PathElement,                     // Corrected import for PathElement
         key::path_element::IdType as GrpcIdType, // Alias for gRPC IdType
         mutation::Operation as MutationOperation, // Alias for gRPC Mutation Operation
         property_filter::Operator as PropertyFilterOp,
@@ -955,7 +1065,10 @@ mod tests {
     use std::collections::HashMap; // For entity properties
     use tokio::runtime::Runtime;
     use tokio::sync::OnceCell;
-    use tonic::transport::Channel; // For global static runtime
+    use tonic::transport::{Channel, Server}; // For global static runtime
+    use tonic_health::pb::{
+        HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
+    };
 
     const TEST_SERVER_ADDR: &str = "127.0.0.1:50051"; // Fixed port for tests
     static TEST_SERVER_INIT: OnceCell<()> = OnceCell::const_new();
@@ -972,9 +1085,19 @@ mod tests {
                     let addr = TEST_SERVER_ADDR.parse().unwrap();
                     // This DatastoreEmulator is created ONCE and shared across all tests.
                     let emulator = DatastoreEmulator::default();
+                    let datastore_service = DatastoreServer::new(emulator);
+
+                    // Add health service for tests
+                    let (mut health_reporter, health_service) =
+                        tonic_health::server::health_reporter();
+                    health_reporter
+                        .set_serving::<DatastoreServer<DatastoreEmulator>>()
+                        .await;
+
                     eprintln!("Test Datastore emulator listening on {}", addr);
                     Server::builder()
-                        .add_service(DatastoreServer::new(emulator))
+                        .add_service(datastore_service)
+                        .add_service(health_service)
                         .serve(addr)
                         .await
                         .unwrap_or_else(|e| {
@@ -1016,6 +1139,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_http_welcome_endpoint() {
+        let app = Router::new().route("/", post(welcome_handler));
+
+        // Spawn the server in the background
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            axum::Server::from_tcp(listener)
+                .unwrap()
+                .serve(app.into_make_service()),
+        );
+
+        // Create a reqwest client
+        let client = reqwest::Client::new();
+
+        // Test the endpoint
+        let res = client
+            .post(format!("http://{}/", addr))
+            .json(&serde_json::json!({ "name": "foo" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({ "msg": "welcome foo" }));
+    }
+
+    #[tokio::test]
+    async fn test_http_import_endpoint() {
+        let app = Router::new().route("/v1/projects/:project_id/import", post(import_handler));
+
+        // Spawn the server in the background
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            axum::Server::from_tcp(listener)
+                .unwrap()
+                .serve(app.into_make_service()),
+        );
+
+        let client = reqwest::Client::new();
+        let project_id = "my-test-project";
+        let input_url = "gs://my-bucket/my-export.overall_export_metadata";
+
+        let res = client
+            .post(format!("http://{}/v1/projects/{}/import", addr, project_id))
+            .json(&serde_json::json!({ "inputUrl": input_url }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["name"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("projects/{}/operations/", project_id))
+        );
+        assert_eq!(
+            body["metadata"]["@type"],
+            "type.googleapis.com/google.datastore.admin.v1.ImportEntitiesMetadata"
+        );
+        assert_eq!(
+            body["metadata"]["common"]["operationType"],
+            "IMPORT_ENTITIES"
+        );
+        assert_eq!(body["metadata"]["common"]["state"], "PROCESSING");
+        assert_eq!(body["metadata"]["inputUrl"], input_url);
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        // Ensure the server is running
+        let _ = setup_test_client().await;
+
+        let mut client = HealthClient::connect(format!("http://{}", TEST_SERVER_ADDR))
+            .await
+            .expect("Failed to connect to health service");
+
+        // Check the health of the Datastore service
+        let request = tonic::Request::new(HealthCheckRequest {
+            service: "google.datastore.v1.Datastore".to_string(),
+        });
+
+        let response = client.check(request).await;
+        assert!(
+            response.is_ok(),
+            "Health check request failed: {:?}",
+            response.err()
+        );
+        let response_inner = response.unwrap().into_inner();
+        assert_eq!(
+            response_inner.status(),
+            ServingStatus::Serving,
+            "Datastore service should be serving"
+        );
+
+        // Check the health of an empty service name (overall health)
+        let request_overall = tonic::Request::new(HealthCheckRequest {
+            service: "".to_string(),
+        });
+        let response_overall = client.check(request_overall).await;
+        assert!(
+            response_overall.is_ok(),
+            "Overall health check request failed: {:?}",
+            response_overall.err()
+        );
+        let response_overall_inner = response_overall.unwrap().into_inner();
+        assert_eq!(
+            response_overall_inner.status(),
+            ServingStatus::Serving,
+            "Overall server status should be serving"
+        );
     }
 
     #[tokio::test]
