@@ -1,10 +1,12 @@
 use crate::google::datastore::import_export::datastore_v3::{
     EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
 };
+
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
 use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
 use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::{ArrayValue, LatLng, PartitionId, Value};
+use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
 
 use crate::google::datastore::v1::Filter;
@@ -103,7 +105,7 @@ fn convert_reference_to_key(reference: &Reference) -> Key {
 
 pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata> {
     dump_entities
-        .into_iter()
+        .into_par_iter()
         .map(|entity_proto| {
             let v1_key = Some(convert_reference_to_key(&entity_proto.key));
 
@@ -233,12 +235,15 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
 }
 
 pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
-    let entity_dump_path = std::path::PathBuf::from(export_dir).join("datastore_dump_output.json");
+    let entity_dump_path = std::path::PathBuf::from(export_dir).join("exports");
 
     println!(
         "Reading datastore export from: {}",
         entity_dump_path.display()
     );
+    let export_dir = entity_dump_path
+        .to_str()
+        .expect("Invalid export directory path");
     let overall_metadata = read_overall_metadata(export_dir);
     if let Some(metadata) = overall_metadata {
         let entity_protos: Vec<EntityProto> = metadata
@@ -334,10 +339,10 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
             .collect();
 
         println!("Finished reading datastore export.");
-        return entity_protos;
+        entity_protos
     } else {
         eprintln!("No overall metadata found in the export directory.");
-        return Vec::new();
+        Vec::new()
     }
 }
 
@@ -419,8 +424,13 @@ impl DatastoreStorage {
     pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
         let dump_entities = read_dump(path);
         let entities_with_metadata = converter_dump(dump_entities);
+        println!(
+            "Importing {} entities from dump at {}",
+            entities_with_metadata.len(),
+            path
+        );
         for entity_metadata in entities_with_metadata {
-            if let Some(key) = &entity_metadata.entity.key {
+            if let Some(_key) = &entity_metadata.entity.key {
                 self.insert_entity(&entity_metadata.entity)?;
             } else {
                 return Err(tonic::Status::invalid_argument(
@@ -500,10 +510,6 @@ impl DatastoreStorage {
             update_time: timestamp_now.clone(),
         };
 
-        if let Some(k) = &entity_metadata.entity.key {
-            dbg!("Inserting entity with key (from DatastoreStorage)", &k.path);
-        }
-
         // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
         self.entities
             .insert(final_key_struct.clone(), entity_metadata.clone());
@@ -520,18 +526,10 @@ impl DatastoreStorage {
                         // Special handling for HAS_ANCESTOR as it operates on keys, not properties
                         if property.name == "__key__" && property_filter.op == 11 {
                             // HAS_ANCESTOR = 11
-                            dbg!(
-                                "Applying HAS_ANCESTOR filter",
-                                &entity_metadata.entity.key,
-                                &filter_value
-                            );
                             if let Some(ValueType::KeyValue(ancestor_key_value)) =
                                 &filter_value.value_type
                             {
                                 if let Some(entity_key) = &entity_metadata.entity.key {
-                                    dbg!("Entity Key for HAS_ANCESTOR", entity_key);
-                                    dbg!("Ancestor Key Value for HAS_ANCESTOR", ancestor_key_value);
-
                                     let entity_partition_id_obj = entity_key.partition_id.as_ref();
                                     let ancestor_partition_id_obj =
                                         ancestor_key_value.partition_id.as_ref();
@@ -548,7 +546,6 @@ impl DatastoreStorage {
                                         _ => false,
                                     };
                                     if !partitions_match {
-                                        dbg!("HAS_ANCESTOR: Partition mismatch. Returning false.");
                                         return false;
                                     }
 
@@ -562,33 +559,14 @@ impl DatastoreStorage {
                                                 || entity_path_element.id_type
                                                     != ancestor_path_element.id_type
                                             {
-                                                dbg!(
-                                                    "HAS_ANCESTOR: Path element mismatch.",
-                                                    &entity_path_element,
-                                                    &ancestor_path_element
-                                                );
                                                 return false;
                                             }
                                         }
-                                        dbg!(
-                                            "HAS_ANCESTOR: Path prefix matches and length is greater. Returning true."
-                                        );
                                         return true;
-                                    } else {
-                                        dbg!(
-                                            "HAS_ANCESTOR: Path length condition not met.",
-                                            entity_key.path.len(),
-                                            ancestor_key_value.path.len()
-                                        );
                                     }
-                                } else {
-                                    dbg!("HAS_ANCESTOR: Entity has no key.");
                                 }
-                            } else {
-                                dbg!("HAS_ANCESTOR: Filter value is not a KeyValue.");
                             }
-                            dbg!("HAS_ANCESTOR: Defaulting to false.");
-                            return false;
+                            false
                         }
                         // Regular property filters
                         else if let Some(entity_value) =
@@ -719,11 +697,11 @@ impl DatastoreStorage {
                         }
                     } else {
                         // Filter value is missing
-                        return false;
+                        false
                     }
                 } else {
                     // Property reference is missing
-                    return false;
+                    false
                 }
             }
             FilterType::CompositeFilter(composity_filter) => {
@@ -742,15 +720,15 @@ impl DatastoreStorage {
                 match composity_filter.op {
                     1 => {
                         // AND we can translate to ALL are true
-                        return filter_results.iter().all(|&result| result);
+                        filter_results.iter().all(|&result| result)
                     }
                     2 => {
                         // Or we can translate to ANY is true
-                        return filter_results.iter().any(|&result| result);
+                        filter_results.iter().any(|&result| result)
                     }
                     _ => {
                         // OPERATOR_UNSPECIFIED
-                        return true;
+                        true
                     }
                 }
             }
@@ -766,9 +744,13 @@ impl DatastoreStorage {
     pub fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
         let key_struct = KeyStruct::from_datastore_key(key);
 
-        // Debug print items (optional, can be removed or adjusted)
+        //Debug print items (optional, can be removed or adjusted)
         // for (k_struct, entity_meta) in self.entities.iter() {
-        //     println!("Stored KeyStruct: {:?}, Entity Path: {:?}", k_struct, entity_meta.entity.key.as_ref().map(|k| &k.path));
+        //     println!(
+        //         "Stored KeyStruct: {:?}, Entity Path: {:?}",
+        //         k_struct,
+        //         entity_meta.entity.key.as_ref().map(|k| &k.path)
+        //     );
         // }
 
         self.entities.get(&key_struct).cloned()
@@ -782,14 +764,6 @@ impl DatastoreStorage {
     ) -> Vec<EntityResult> {
         let mut results = Vec::new();
 
-        // Debug print (optional)
-        // println!("Getting entities for kind: {}", kind_name);
-        // for (key_s, entity_meta) in self.entities.iter() {
-        //     if let Some(k) = &entity_meta.entity.key {
-        //         println!("  Checking entity with key: {:?}", k.path);
-        //     }
-        // }
-
         for (key_struct, entity_metadata) in self.entities.iter() {
             // Filter by project_id first
             if key_struct.project_id != project_id_filter {
@@ -800,17 +774,13 @@ impl DatastoreStorage {
             if key_struct
                 .path_elements
                 .last()
-                .map_or(false, |(k, _)| k == &kind_name)
+                .is_some_and(|(k, _)| k == &kind_name)
             {
-                dbg!("Kind matches for entity:", &entity_metadata.entity.key);
                 let mut passes_all_filters = true;
                 if let Some(ref filter_obj) = filter {
                     if let Some(filter_type) = &filter_obj.filter_type {
                         if !DatastoreStorage::apply_filter(entity_metadata, filter_type) {
                             passes_all_filters = false; // Skip if filter doesn't match
-                            dbg!("Entity FAILED filter:", &entity_metadata.entity.key);
-                        } else {
-                            dbg!("Entity PASSED filter:", &entity_metadata.entity.key);
                         }
                     }
                 }

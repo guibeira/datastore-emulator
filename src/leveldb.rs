@@ -141,7 +141,7 @@ impl LogReader {
             bytes_for_crc.push(record_type as u8); // record_type is already i8, convert to u8
             bytes_for_crc.extend_from_slice(&data);
             let crc = crc32c::crc32c(&bytes_for_crc);
-            ((crc >> 15) | (crc << 17)).wrapping_add(0xa282ead8)
+            crc.rotate_right(15).wrapping_add(0xa282ead8)
         };
 
         if checksum != masked_crc {

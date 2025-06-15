@@ -21,6 +21,7 @@ crc32c = "0.6.8"
 rayon = "1.10"
 tonic-health = "0.9"
 axum = "0.6"
+zip = "4.0.0"
 
 [build-dependencies]
 tonic-build = "0.9"
