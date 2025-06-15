@@ -112,7 +112,7 @@ impl LogReader {
         let mut cursor = &self.buffer[..HEADER_SIZE];
         let checksum = cursor.read_u32::<LittleEndian>()?;
         let length = cursor.read_u16::<LittleEndian>()? as usize;
-        let record_type = cursor.read_i8()?;
+        let record_type = cursor.read_u8()?;
 
         // If the complete record (header + data) is not in the buffer, try to read more.
         if self.buffer.len() < HEADER_SIZE + length {

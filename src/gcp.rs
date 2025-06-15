@@ -91,12 +91,14 @@ impl DatastoreService for DatastoreEmulator {
                 ));
             }
         };
+        dbg!("Aggregation query: {:?}", &aggregation_query);
         let kind_name = aggregation_query.kind[0].name.clone();
 
         let results = storage.get_entities(
             req.project_id.clone(),
             kind_name,
             aggregation_query.filter.clone(),
+            aggregation_query.limit,
         );
         let batch = crate::google::datastore::v1::QueryResultBatch {
             entity_result_type: 1, // Corresponds to EntityResultType::FULL

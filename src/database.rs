@@ -761,10 +761,16 @@ impl DatastoreStorage {
         project_id_filter: String,
         kind_name: String,
         filter: Option<Filter>,
+        limit: Option<i32>,
     ) -> Vec<EntityResult> {
         let mut results = Vec::new();
 
         for (key_struct, entity_metadata) in self.entities.iter() {
+            if let Some(limit_value) = limit {
+                if results.len() >= limit_value as usize {
+                    break; // Stop if we reached the limit
+                }
+            }
             // Filter by project_id first
             if key_struct.project_id != project_id_filter {
                 continue;
