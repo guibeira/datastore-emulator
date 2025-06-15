@@ -1,13 +1,350 @@
+use crate::google::datastore::import_export::datastore_v3::{
+    EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
+};
+
+use crate::google::datastore::import_export::dsbackups::ExportMetadata;
+use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
 use crate::google::datastore::v1::key::path_element::IdType;
+use crate::google::datastore::v1::{ArrayValue, LatLng, PartitionId, Value};
+use rayon::iter::ParallelIterator;
+use rayon::prelude::*;
 
 use crate::google::datastore::v1::Filter;
 use crate::google::datastore::v1::filter::FilterType;
 use crate::google::datastore::v1::value::ValueType;
+use prost::Message;
 use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
+use crate::leveldb::LogReader; // Added to resolve error E0433
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::SystemTime; // Importing LogReader to read log files
+
+fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
+    if let Some(v) = prop_val.int64_value {
+        return Some(ValueType::IntegerValue(v));
+    }
+    if let Some(v) = prop_val.boolean_value {
+        return Some(ValueType::BooleanValue(v));
+    }
+    if let Some(v) = &prop_val.string_value {
+        return Some(ValueType::StringValue(v.clone()));
+    }
+    if let Some(v) = prop_val.double_value {
+        return Some(ValueType::DoubleValue(v));
+    }
+    if let Some(v) = &prop_val.pointvalue {
+        return Some(ValueType::GeoPointValue(LatLng {
+            latitude: v.x,
+            longitude: v.y,
+        }));
+    }
+    if let Some(v) = &prop_val.referencevalue {
+        let key = convert_reference_value_to_key(v);
+        return Some(ValueType::KeyValue(key));
+    }
+    // Note: list_value and user_value are not directly handled here as they are
+    // part of the Property structure itself or deprecated.
+    None
+}
+
+fn convert_reference_value_to_key(reference_value: &ReferenceValue) -> Key {
+    let path = reference_value
+        .pathelement
+        .iter()
+        .map(|el| {
+            let id_type = if let Some(id) = el.id {
+                Some(IdType::Id(id))
+            } else {
+                el.name.as_ref().map(|n| IdType::Name(n.clone()))
+            };
+            crate::google::datastore::v1::key::PathElement {
+                kind: el.r#type.clone(),
+                id_type,
+            }
+        })
+        .collect();
+
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: reference_value.app.clone(),
+            namespace_id: reference_value.name_space.clone().unwrap_or_default(),
+            database_id: "".to_string(),
+        }),
+        path,
+    }
+}
+
+fn convert_reference_to_key(reference: &Reference) -> Key {
+    let path = reference
+        .path
+        .element
+        .iter()
+        .map(|el| {
+            let id_type = if let Some(id) = el.id {
+                Some(IdType::Id(id))
+            } else {
+                el.name.as_ref().map(|n| IdType::Name(n.clone()))
+            };
+            crate::google::datastore::v1::key::PathElement {
+                kind: el.r#type.clone(),
+                id_type,
+            }
+        })
+        .collect();
+
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: reference.app.clone(),
+            namespace_id: reference.name_space.clone().unwrap_or_default(),
+            database_id: "".to_string(),
+        }),
+        path,
+    }
+}
+
+pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata> {
+    dump_entities
+        .into_par_iter()
+        .map(|entity_proto| {
+            let v1_key = Some(convert_reference_to_key(&entity_proto.key));
+
+            // Group properties by name to handle multi-valued properties
+            let mut grouped_props: HashMap<String, (Vec<Value>, bool)> = HashMap::new();
+
+            for prop in &entity_proto.property {
+                let prop_val = &prop.value;
+                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                    let entry = grouped_props
+                        .entry(prop.name.clone())
+                        .or_insert((vec![], false));
+                    entry.0.push(Value {
+                        value_type: Some(v1_value_type),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            for prop in &entity_proto.raw_property {
+                let prop_val = &prop.value;
+                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                    let entry = grouped_props
+                        .entry(prop.name.clone())
+                        .or_insert((vec![], true));
+                    entry.0.push(Value {
+                        value_type: Some(v1_value_type),
+                        ..Default::default()
+                    });
+                    entry.1 = true; // Mark as exclude_from_indexes
+                }
+            }
+
+            let mut properties: HashMap<String, Value> = HashMap::new();
+            for (name, (mut values, exclude)) in grouped_props {
+                if values.len() > 1 {
+                    // It's an array
+                    properties.insert(
+                        name,
+                        Value {
+                            value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
+                            exclude_from_indexes: exclude,
+                            ..Default::default()
+                        },
+                    );
+                } else if let Some(mut single_value) = values.pop() {
+                    // It's a single value
+                    single_value.exclude_from_indexes = exclude;
+                    properties.insert(name, single_value);
+                }
+            }
+
+            let v1_entity = Entity {
+                key: v1_key,
+                properties,
+            };
+
+            let timestamp_now = prost_types::Timestamp {
+                seconds: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                nanos: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i32
+                    % 1_000_000_000,
+            };
+
+            EntityWithMetadata {
+                entity: v1_entity,
+                version: 1,
+                create_time: timestamp_now.clone(),
+                update_time: timestamp_now,
+            }
+        })
+        .collect()
+}
+
+pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
+    let mut metadata_file = None;
+    for entry in std::fs::read_dir(export_dir).expect("Failed to read export directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".overall_export_metadata")
+        {
+            metadata_file = Some(entry.path());
+            break;
+        }
+    }
+
+    let _metadata_file = metadata_file.expect("Could not find .overall_export_metadata file.");
+    dbg!("Found metadata file:", _metadata_file.display());
+    // let reader = LogReader::new(_metadata_file.clone())
+    //     .expect("Failed to create LogReader for metadata file");
+    // dbg!("LogReader created for metadata file:", reader);
+    match LogReader::new(_metadata_file.clone()) {
+        Ok(reader) => {
+            for (i, record_result) in reader.enumerate() {
+                match record_result {
+                    Ok(record) => {
+                        match OverallExportMetadata::decode(&record[..]) {
+                            Ok(metadata) => {
+                                // Now you have the decoded 'metadata'.
+                                // You might want to process or store it.
+                                return Some(metadata); // Returning the metadata
+                            }
+                            Err(decode_err) => {
+                                eprintln!("Failed to decode OverallExportMetadata: {}", decode_err);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading record {}: {}", i + 1, e); // Translated eprintln
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Erro ao abrir o arquivo: {}", e);
+        }
+    }
+    None // Returning None as we are not returning the metadata here
+}
+
+pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
+    let entity_dump_path = std::path::PathBuf::from(export_dir).join("exports");
+
+    println!(
+        "Reading datastore export from: {}",
+        entity_dump_path.display()
+    );
+    let export_dir = entity_dump_path
+        .to_str()
+        .expect("Invalid export directory path");
+    let overall_metadata = read_overall_metadata(export_dir);
+    if let Some(metadata) = overall_metadata {
+        let entity_protos: Vec<EntityProto> = metadata
+            .exports
+            .into_par_iter()
+            .flat_map(|export_entry| {
+                let kind_name = export_entry
+                    .kind
+                    .as_ref()
+                    .map_or_else(String::new, |k| k.kind.clone());
+                println!("Processing kind: {}", kind_name);
+                let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
+
+                if !metadata_path.exists() {
+                    eprintln!(
+                        "Metadata file for kind {} not found at: {}",
+                        kind_name,
+                        metadata_path.display()
+                    );
+                    return Vec::new().into_par_iter();
+                }
+
+                let export_metadata = match std::fs::read(&metadata_path)
+                    .map_err(|e| {
+                        eprintln!(
+                            "Failed to read metadata file {}: {}",
+                            metadata_path.display(),
+                            e
+                        );
+                        e
+                    })
+                    .and_then(|data| {
+                        ExportMetadata::decode(&data[..]).map_err(|e| {
+                            eprintln!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                        })
+                    }) {
+                    Ok(meta) => meta,
+                    Err(_) => return Vec::new().into_par_iter(),
+                };
+
+                let output_file_names = export_metadata.items.unwrap_or_default().outputs;
+                let parent_dir_for_output_files = metadata_path
+                    .parent()
+                    .expect("Metadata path should have a parent directory")
+                    .to_path_buf();
+
+                let protos_for_this_export: Vec<EntityProto> = output_file_names
+                    .into_par_iter()
+                    .flat_map(move |output_file_name_str| {
+                        let output_file_path =
+                            parent_dir_for_output_files.join(output_file_name_str);
+                        let mut protos_in_file = Vec::new();
+                        if output_file_path.exists() {
+                            if let Ok(reader) = LogReader::new(output_file_path.clone()) {
+                                for (i, record_result) in reader.enumerate() {
+                                    match record_result {
+                                        Ok(record) => {
+                                            if let Ok(entity_proto) =
+                                                EntityProto::decode(&record[..])
+                                            {
+                                                protos_in_file.push(entity_proto);
+                                            } else {
+                                                eprintln!(
+                                                    "Failed to decode EntityProto from file {}",
+                                                    output_file_path.display()
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Error reading record {} from file {}: {}",
+                                                i + 1,
+                                                output_file_path.display(),
+                                                e
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                eprintln!("Error opening file: {}", output_file_path.display());
+                            }
+                        } else {
+                            eprintln!("Output file {} does not exist.", output_file_path.display());
+                        }
+                        protos_in_file
+                    })
+                    .collect();
+
+                protos_for_this_export.into_par_iter()
+            })
+            .collect();
+
+        println!("Finished reading datastore export.");
+        entity_protos
+    } else {
+        eprintln!("No overall metadata found in the export directory.");
+        Vec::new()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyId {
@@ -84,6 +421,26 @@ impl DatastoreStorage {
         self.transactions.remove(transaction_id);
     }
 
+    pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
+        let dump_entities = read_dump(path);
+        let entities_with_metadata = converter_dump(dump_entities);
+        println!(
+            "Importing {} entities from dump at {}",
+            entities_with_metadata.len(),
+            path
+        );
+        for entity_metadata in entities_with_metadata {
+            if let Some(_key) = &entity_metadata.entity.key {
+                self.insert_entity(&entity_metadata.entity)?;
+            } else {
+                return Err(tonic::Status::invalid_argument(
+                    "Entity missing key during import",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn insert_entity(
         &mut self,
         entity: &Entity,
@@ -153,10 +510,6 @@ impl DatastoreStorage {
             update_time: timestamp_now.clone(),
         };
 
-        if let Some(k) = &entity_metadata.entity.key {
-            dbg!("Inserting entity with key (from DatastoreStorage)", &k.path);
-        }
-
         // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
         self.entities
             .insert(final_key_struct.clone(), entity_metadata.clone());
@@ -173,18 +526,10 @@ impl DatastoreStorage {
                         // Special handling for HAS_ANCESTOR as it operates on keys, not properties
                         if property.name == "__key__" && property_filter.op == 11 {
                             // HAS_ANCESTOR = 11
-                            dbg!(
-                                "Applying HAS_ANCESTOR filter",
-                                &entity_metadata.entity.key,
-                                &filter_value
-                            );
                             if let Some(ValueType::KeyValue(ancestor_key_value)) =
                                 &filter_value.value_type
                             {
                                 if let Some(entity_key) = &entity_metadata.entity.key {
-                                    dbg!("Entity Key for HAS_ANCESTOR", entity_key);
-                                    dbg!("Ancestor Key Value for HAS_ANCESTOR", ancestor_key_value);
-
                                     let entity_partition_id_obj = entity_key.partition_id.as_ref();
                                     let ancestor_partition_id_obj =
                                         ancestor_key_value.partition_id.as_ref();
@@ -201,7 +546,6 @@ impl DatastoreStorage {
                                         _ => false,
                                     };
                                     if !partitions_match {
-                                        dbg!("HAS_ANCESTOR: Partition mismatch. Returning false.");
                                         return false;
                                     }
 
@@ -215,33 +559,14 @@ impl DatastoreStorage {
                                                 || entity_path_element.id_type
                                                     != ancestor_path_element.id_type
                                             {
-                                                dbg!(
-                                                    "HAS_ANCESTOR: Path element mismatch.",
-                                                    &entity_path_element,
-                                                    &ancestor_path_element
-                                                );
                                                 return false;
                                             }
                                         }
-                                        dbg!(
-                                            "HAS_ANCESTOR: Path prefix matches and length is greater. Returning true."
-                                        );
                                         return true;
-                                    } else {
-                                        dbg!(
-                                            "HAS_ANCESTOR: Path length condition not met.",
-                                            entity_key.path.len(),
-                                            ancestor_key_value.path.len()
-                                        );
                                     }
-                                } else {
-                                    dbg!("HAS_ANCESTOR: Entity has no key.");
                                 }
-                            } else {
-                                dbg!("HAS_ANCESTOR: Filter value is not a KeyValue.");
                             }
-                            dbg!("HAS_ANCESTOR: Defaulting to false.");
-                            return false;
+                            false
                         }
                         // Regular property filters
                         else if let Some(entity_value) =
@@ -372,11 +697,11 @@ impl DatastoreStorage {
                         }
                     } else {
                         // Filter value is missing
-                        return false;
+                        false
                     }
                 } else {
                     // Property reference is missing
-                    return false;
+                    false
                 }
             }
             FilterType::CompositeFilter(composity_filter) => {
@@ -395,28 +720,37 @@ impl DatastoreStorage {
                 match composity_filter.op {
                     1 => {
                         // AND we can translate to ALL are true
-                        return filter_results.iter().all(|&result| result);
+                        filter_results.iter().all(|&result| result)
                     }
                     2 => {
                         // Or we can translate to ANY is true
-                        return filter_results.iter().any(|&result| result);
+                        filter_results.iter().any(|&result| result)
                     }
                     _ => {
                         // OPERATOR_UNSPECIFIED
-                        return true;
+                        true
                     }
                 }
             }
         }
-        true
+        // The code below was unreachable because all match arms returned explicitly.
+        // If none of the match arms are hit (which shouldn't happen with a valid FilterType),
+        // the default behavior would be not to filter, i.e., return true.
+        // However, the current match logic covers all FilterType cases (PropertyFilter, CompositeFilter).
+        // If FilterType is None, the filter is not applied in the previous call.
+        // Therefore, removing the final `true` is safe, as the match should be exhaustive for valid FilterType.
     }
 
     pub fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
         let key_struct = KeyStruct::from_datastore_key(key);
 
-        // Debug print items (optional, can be removed or adjusted)
+        //Debug print items (optional, can be removed or adjusted)
         // for (k_struct, entity_meta) in self.entities.iter() {
-        //     println!("Stored KeyStruct: {:?}, Entity Path: {:?}", k_struct, entity_meta.entity.key.as_ref().map(|k| &k.path));
+        //     println!(
+        //         "Stored KeyStruct: {:?}, Entity Path: {:?}",
+        //         k_struct,
+        //         entity_meta.entity.key.as_ref().map(|k| &k.path)
+        //     );
         // }
 
         self.entities.get(&key_struct).cloned()
@@ -427,18 +761,16 @@ impl DatastoreStorage {
         project_id_filter: String,
         kind_name: String,
         filter: Option<Filter>,
+        limit: Option<i32>,
     ) -> Vec<EntityResult> {
         let mut results = Vec::new();
 
-        // Debug print (optional)
-        // println!("Getting entities for kind: {}", kind_name);
-        // for (key_s, entity_meta) in self.entities.iter() {
-        //     if let Some(k) = &entity_meta.entity.key {
-        //         println!("  Checking entity with key: {:?}", k.path);
-        //     }
-        // }
-
         for (key_struct, entity_metadata) in self.entities.iter() {
+            if let Some(limit_value) = limit {
+                if results.len() >= limit_value as usize {
+                    break; // Stop if we reached the limit
+                }
+            }
             // Filter by project_id first
             if key_struct.project_id != project_id_filter {
                 continue;
@@ -448,17 +780,13 @@ impl DatastoreStorage {
             if key_struct
                 .path_elements
                 .last()
-                .map_or(false, |(k, _)| k == &kind_name)
+                .is_some_and(|(k, _)| k == &kind_name)
             {
-                dbg!("Kind matches for entity:", &entity_metadata.entity.key);
                 let mut passes_all_filters = true;
                 if let Some(ref filter_obj) = filter {
                     if let Some(filter_type) = &filter_obj.filter_type {
                         if !DatastoreStorage::apply_filter(entity_metadata, filter_type) {
                             passes_all_filters = false; // Skip if filter doesn't match
-                            dbg!("Entity FAILED filter:", &entity_metadata.entity.key);
-                        } else {
-                            dbg!("Entity PASSED filter:", &entity_metadata.entity.key);
                         }
                     }
                 }
