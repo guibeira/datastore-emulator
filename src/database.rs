@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
+use bincode;
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
@@ -416,6 +418,67 @@ pub struct DatastoreStorage {
 }
 
 impl DatastoreStorage {
+    // Add this new method to load data from disk
+    pub fn load_from_disk(&mut self, path: &str) -> std::io::Result<()> {
+        // Try to open the file. If it doesn't exist, just return Ok without doing anything.
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("Data file '{}' not found. Starting with an empty store.", path);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        // Deserialize the buffer into a Vec of entity bytes
+        let (encoded_entities, _): (Vec<Vec<u8>>, _) =
+            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        println!("Loading {} entities from '{}'...", encoded_entities.len(), path);
+
+        for encoded_entity in encoded_entities {
+            // Decode each entity using prost
+            match Entity::decode(&encoded_entity[..]) {
+                Ok(entity) => {
+                    // Reuse the insert logic to ensure indexes are created
+                    if let Err(e) = self.insert_entity(&entity) {
+                        eprintln!("Error inserting entity during load: {}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to decode entity from file: {}", e);
+                }
+            }
+        }
+        println!("Load complete.");
+        Ok(())
+    }
+
+    // Add this new method to save data to disk
+    pub fn save_to_disk(&self, path: &str) -> std::io::Result<()> {
+        println!("Saving {} entities to '{}'...", self.entities.len(), path);
+        let mut encoded_entities: Vec<Vec<u8>> = Vec::new();
+
+        // Iterate over the entities, encode each one to bytes using prost
+        for entity_with_meta in self.entities.values() {
+            encoded_entities.push(entity_with_meta.entity.encode_to_vec());
+        }
+
+        // Serialize the Vec of bytes with bincode
+        let buffer = bincode::serde::encode_to_vec(&encoded_entities, bincode::config::standard())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // Write the serialized buffer to the file
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&buffer)?;
+        println!("Data saved successfully.");
+        Ok(())
+    }
+
     pub fn clean_transaction(&mut self, transaction_id: &str) {
         // clean up the transaction state
         self.transactions.remove(transaction_id);
