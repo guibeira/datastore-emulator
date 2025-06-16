@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
+use bincode;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
-use bincode;
-use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
@@ -465,10 +465,14 @@ impl DatastoreStorage {
     // Add this new method to load data from disk
     pub fn load_from_disk(&mut self, path: &str) -> std::io::Result<()> {
         // Try to open the file. If it doesn't exist, just return Ok without doing anything.
+        let start_time = SystemTime::now();
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("Data file '{}' not found. Starting with an empty store.", path);
+                println!(
+                    "Data file '{}' not found. Starting with an empty store.",
+                    path
+                );
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -478,7 +482,10 @@ impl DatastoreStorage {
         file.read_to_end(&mut buffer)?;
 
         if buffer.is_empty() {
-            println!("Data file '{}' is empty. Starting with an empty store.", path);
+            println!(
+                "Data file '{}' is empty. Starting with an empty store.",
+                path
+            );
             return Ok(());
         }
 
@@ -499,9 +506,7 @@ impl DatastoreStorage {
                 if let Some(value_type) = &prop_value.value_type {
                     // Extract a value as string for indexing
                     let value_str = match value_type {
-                        crate::google::datastore::v1::value::ValueType::StringValue(s) => {
-                            s.clone()
-                        }
+                        crate::google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
                         crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
                             i.to_string()
                         }
@@ -522,7 +527,9 @@ impl DatastoreStorage {
         }
         self.indexes = new_indexes;
 
-        println!("Load complete.");
+        let end_time = SystemTime::now();
+        let diff = end_time.duration_since(start_time).unwrap_or_default();
+        println!("Load complete in {} seconds.", diff.as_secs_f64());
         Ok(())
     }
 
