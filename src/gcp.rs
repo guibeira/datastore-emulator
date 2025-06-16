@@ -91,7 +91,6 @@ impl DatastoreService for DatastoreEmulator {
                 ));
             }
         };
-        dbg!("Aggregation query: {:?}", &aggregation_query);
         let kind_name = aggregation_query.kind[0].name.clone();
 
         let results = storage.get_entities(

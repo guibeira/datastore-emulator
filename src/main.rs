@@ -37,6 +37,7 @@ pub struct DatastoreEmulator {
 
 impl Default for DatastoreEmulator {
     fn default() -> Self {
+        println!("Initializing Datastore Emulator...");
         let mut storage = DatastoreStorage::default();
         // Attempt to load data from disk on startup
         if let Err(e) = storage.load_from_disk("datastore.bin") {

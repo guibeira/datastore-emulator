@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
 use bincode;
+use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
@@ -348,14 +349,14 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyId {
     IntId(i64),
     StringId(String),
 }
 
 // Custom key structure for efficient indexing
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct KeyStruct {
     pub project_id: String,
     pub namespace: String,
@@ -396,6 +397,49 @@ pub struct EntityWithMetadata {
     pub update_time: prost_types::Timestamp,
 }
 
+#[derive(Deserialize)]
+struct SerializableEntityWithMetadata {
+    entity_bytes: Vec<u8>,
+    version: u64,
+    create_time_bytes: Vec<u8>,
+    update_time_bytes: Vec<u8>,
+}
+
+impl Serialize for EntityWithMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("EntityWithMetadata", 4)?;
+        state.serialize_field("entity_bytes", &self.entity.encode_to_vec())?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("create_time_bytes", &self.create_time.encode_to_vec())?;
+        state.serialize_field("update_time_bytes", &self.update_time.encode_to_vec())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityWithMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = SerializableEntityWithMetadata::deserialize(deserializer)?;
+        let entity = Entity::decode(&s.entity_bytes[..]).map_err(Error::custom)?;
+        let create_time =
+            prost_types::Timestamp::decode(&s.create_time_bytes[..]).map_err(Error::custom)?;
+        let update_time =
+            prost_types::Timestamp::decode(&s.update_time_bytes[..]).map_err(Error::custom)?;
+
+        Ok(EntityWithMetadata {
+            entity,
+            version: s.version,
+            create_time,
+            update_time,
+        })
+    }
+}
+
 // Transaction state
 #[derive(Debug)]
 pub struct TransactionState {
@@ -433,27 +477,51 @@ impl DatastoreStorage {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        // Deserialize the buffer into a Vec of entity bytes
-        let (encoded_entities, _): (Vec<Vec<u8>>, _) =
+        if buffer.is_empty() {
+            println!("Data file '{}' is empty. Starting with an empty store.", path);
+            return Ok(());
+        }
+
+        // Deserialize the buffer directly into the BTreeMap
+        let (entities, _): (BTreeMap<KeyStruct, EntityWithMetadata>, _) =
             bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        println!("Loading {} entities from '{}'...", encoded_entities.len(), path);
+        println!("Loading {} entities from '{}'...", entities.len(), path);
+        self.entities = entities;
 
-        for encoded_entity in encoded_entities {
-            // Decode each entity using prost
-            match Entity::decode(&encoded_entity[..]) {
-                Ok(entity) => {
-                    // Reuse the insert logic to ensure indexes are created
-                    if let Err(e) = self.insert_entity(&entity) {
-                        eprintln!("Error inserting entity during load: {}", e);
+        // Bulk rebuild indexes
+        println!("Rebuilding indexes for {} entities...", self.entities.len());
+        let mut new_indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>> =
+            HashMap::new();
+        for (key_struct, metadata) in &self.entities {
+            for (prop_name, prop_value) in &metadata.entity.properties {
+                if let Some(value_type) = &prop_value.value_type {
+                    // Extract a value as string for indexing
+                    let value_str = match value_type {
+                        crate::google::datastore::v1::value::ValueType::StringValue(s) => {
+                            s.clone()
+                        }
+                        crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
+                            i.to_string()
+                        }
+                        // todo: implement other types
+                        _ => continue,
+                    };
+
+                    // Get the kind of the entity
+                    if let Some((kind, _)) = key_struct.path_elements.last() {
+                        let index_key = (kind.clone(), prop_name.clone(), value_str);
+                        new_indexes
+                            .entry(index_key)
+                            .or_default()
+                            .insert(key_struct.clone());
                     }
-                }
-                Err(e) => {
-                    eprintln!("Failed to decode entity from file: {}", e);
                 }
             }
         }
+        self.indexes = new_indexes;
+
         println!("Load complete.");
         Ok(())
     }
@@ -461,15 +529,9 @@ impl DatastoreStorage {
     // Add this new method to save data to disk
     pub fn save_to_disk(&self, path: &str) -> std::io::Result<()> {
         println!("Saving {} entities to '{}'...", self.entities.len(), path);
-        let mut encoded_entities: Vec<Vec<u8>> = Vec::new();
 
-        // Iterate over the entities, encode each one to bytes using prost
-        for entity_with_meta in self.entities.values() {
-            encoded_entities.push(entity_with_meta.entity.encode_to_vec());
-        }
-
-        // Serialize the Vec of bytes with bincode
-        let buffer = bincode::serde::encode_to_vec(&encoded_entities, bincode::config::standard())
+        // Serialize the whole BTreeMap
+        let buffer = bincode::serde::encode_to_vec(&self.entities, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         // Write the serialized buffer to the file
