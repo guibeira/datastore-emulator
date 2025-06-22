@@ -138,7 +138,7 @@ impl LogReader {
         let masked_crc = {
             // Construct the bytes for the CRC more explicitly
             let mut bytes_for_crc = Vec::with_capacity(1 + data.len());
-            bytes_for_crc.push(record_type as u8); // record_type is already i8, convert to u8
+            bytes_for_crc.push(record_type); // record_type is already i8, convert to u8
             bytes_for_crc.extend_from_slice(&data);
             let crc = crc32c::crc32c(&bytes_for_crc);
             crc.rotate_right(15).wrapping_add(0xa282ead8)
@@ -149,7 +149,7 @@ impl LogReader {
             // return Err(CorruptionError::ChecksumMismatch);
         }
 
-        Ok(Some((record_type as u8, data))) // Converted record_type to u8 to match the function signature
+        Ok(Some((record_type, data))) // Converted record_type to u8 to match the function signature
     }
 
     /// Reads the next logical record (which may be fragmented).

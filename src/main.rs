@@ -92,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Datastore emulator (gRPC) listening on {}", grpc_addr);
     println!("HTTP server listening on {}", http_addr);
 
-    let datastore_service = DatastoreServer::new(emulator);
+    let datastore_service = DatastoreServer::new(emulator)
+        .max_encoding_message_size(16 * 1024 * 1024) // 16 MB
+        .max_decoding_message_size(16 * 1024 * 1024); // 16 MB
     let grpc_server = Server::builder()
         .add_service(datastore_service)
         .add_service(health_service)

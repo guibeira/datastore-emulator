@@ -93,23 +93,13 @@ impl DatastoreService for DatastoreEmulator {
         };
         let kind_name = aggregation_query.kind[0].name.clone();
 
-        let results = storage.get_entities(
+        let batch = storage.get_entities(
             req.project_id.clone(),
             kind_name,
             aggregation_query.filter.clone(),
             aggregation_query.limit,
+            aggregation_query.start_cursor.clone(),
         );
-        let batch = crate::google::datastore::v1::QueryResultBatch {
-            entity_result_type: 1, // Corresponds to EntityResultType::FULL
-            skipped_results: 0,
-            read_time: None,
-            skipped_cursor: vec![],
-            snapshot_version: 0,
-            entity_results: results,
-            more_results: 0, // NO_MORE_RESULTS
-            end_cursor: Vec::new(),
-        };
-
         let mut fields = BTreeMap::new();
 
         let amount_results = batch.entity_results.len() as i64;

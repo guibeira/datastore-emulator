@@ -5,6 +5,7 @@ use crate::google::datastore::import_export::datastore_v3::{
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
 use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
 use crate::google::datastore::v1::key::path_element::IdType;
+use crate::google::datastore::v1::query_result_batch::MoreResultsType;
 use crate::google::datastore::v1::{ArrayValue, LatLng, PartitionId, Value};
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
@@ -22,6 +23,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::Se
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
+
+const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
@@ -539,7 +543,7 @@ impl DatastoreStorage {
 
         // Serialize the whole BTreeMap
         let buffer = bincode::serde::encode_to_vec(&self.entities, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         // Write the serialized buffer to the file
         let mut file = std::fs::File::create(path)?;
@@ -894,47 +898,120 @@ impl DatastoreStorage {
         kind_name: String,
         filter: Option<Filter>,
         limit: Option<i32>,
-    ) -> Vec<EntityResult> {
+        start_cursor: Vec<u8>,
+    ) -> crate::google::datastore::v1::QueryResultBatch {
         let mut results = Vec::new();
+        let mut start = 0;
+        if !start_cursor.is_empty() {
+            start = u32::from_be_bytes(
+                start_cursor
+                    .get(0..4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .unwrap_or([0, 0, 0, 0]),
+            ) as usize;
+        }
 
-        for (key_struct, entity_metadata) in self.entities.iter() {
+        let entities_filter_by_project_id: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|(k, _e)| {
+                k.project_id == project_id_filter
+                    && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
+            })
+            .collect();
+
+        let db_entities_count = entities_filter_by_project_id.len();
+        let mut current_entities_payload_size: usize = 0;
+        let mut new_more_results_state = MoreResultsType::NoMoreResults;
+
+        // This variable will track our position in the `entities_filter_by_project_id` vec
+        let mut items_processed_from_start = 0;
+
+        for (_key_struct, entity_metadata) in entities_filter_by_project_id.iter().skip(start) {
+            items_processed_from_start += 1;
+
+            // Apply filter first
+            let passes_filter = if let Some(ref filter_obj) = filter {
+                if let Some(ref filter_type) = filter_obj.filter_type {
+                    DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+
+            if !passes_filter {
+                continue; // Does not match filter, go to next entity
+            }
+
+            // Now that we know it passes the filter, check limits
+
+            // Check payload limit. The !results.is_empty() check is crucial to prevent a loop
+            // if the very first entity considered is larger than the max payload.
+            let entity_size_bytes = entity_metadata.entity.encoded_len();
+            if !results.is_empty()
+                && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
+            {
+                new_more_results_state = MoreResultsType::NotFinished;
+                // This item was not included, so the cursor for the next request should point to it.
+                // We decrement the counter so the final cursor calculation is correct.
+                items_processed_from_start -= 1;
+                break;
+            }
+
+            // Check query limit
             if let Some(limit_value) = limit {
                 if results.len() >= limit_value as usize {
-                    break; // Stop if we reached the limit
+                    new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
+                    // This item was not included, so the cursor for the next request should point to it.
+                    items_processed_from_start -= 1;
+                    break;
                 }
-            }
-            // Filter by project_id first
-            if key_struct.project_id != project_id_filter {
-                continue;
             }
 
-            // Check if the last path element's kind matches kind_name
-            if key_struct
-                .path_elements
-                .last()
-                .is_some_and(|(k, _)| k == &kind_name)
-            {
-                let mut passes_all_filters = true;
-                if let Some(ref filter_obj) = filter {
-                    if let Some(filter_type) = &filter_obj.filter_type {
-                        if !DatastoreStorage::apply_filter(entity_metadata, filter_type) {
-                            passes_all_filters = false; // Skip if filter doesn't match
-                        }
-                    }
-                }
-
-                if passes_all_filters {
-                    results.push(EntityResult {
-                        entity: Some(entity_metadata.entity.clone()),
-                        create_time: Some(entity_metadata.create_time.clone()),
-                        update_time: Some(entity_metadata.update_time.clone()),
-                        cursor: vec![],
-                        version: entity_metadata.version as i64,
-                    });
-                }
-            }
+            // If all checks pass, add the entity to the results
+            results.push(EntityResult {
+                entity: Some(entity_metadata.entity.clone()),
+                create_time: Some(entity_metadata.create_time.clone()),
+                update_time: Some(entity_metadata.update_time.clone()),
+                cursor: vec![],
+                version: entity_metadata.version as i64,
+            });
+            current_entities_payload_size += entity_size_bytes;
         }
-        results
+
+        let final_cursor_offset = start + items_processed_from_start;
+
+        let end_cursor = {
+            if final_cursor_offset >= db_entities_count {
+                vec![] // No more results, so no end cursor
+            } else {
+                (final_cursor_offset as u32).to_be_bytes().to_vec()
+            }
+        };
+
+        // If the loop finished for any reason other than exhausting the entities,
+        // there might be more results.
+        if new_more_results_state == MoreResultsType::NoMoreResults && final_cursor_offset < db_entities_count {
+            new_more_results_state = MoreResultsType::NotFinished;
+        }
+
+        crate::google::datastore::v1::QueryResultBatch {
+            entity_result_type: 1, // Corresponds to EntityResultType::FULL
+            // The number of results skipped due to the start cursor.
+            skipped_results: start as i32,
+            read_time: None,
+            // A cursor that points to the position after the last skipped result. Will be set when skipped_results != 0.
+            skipped_cursor: vec![0], // NO_SKIP_CURSOR
+            snapshot_version: 0,
+            //The results for this batch.
+            entity_results: results,
+            //The state of the query after the current batch.
+            more_results: new_more_results_state as i32,
+            //A cursor that points to the position after the last result in the batch.
+            end_cursor,
+        }
     }
 
     pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
