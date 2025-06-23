@@ -182,7 +182,6 @@ def allocate_ids_example(client):
 
     # Save the entities to Datastore
     client.put_multi(entities)
-    breakpoint()
 
     # Now we can retrieve one of the entities to verify it was saved
     first_key = keys[0]
