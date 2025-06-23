@@ -993,7 +993,9 @@ impl DatastoreStorage {
 
         // If the loop finished for any reason other than exhausting the entities,
         // there might be more results.
-        if new_more_results_state == MoreResultsType::NoMoreResults && final_cursor_offset < db_entities_count {
+        if new_more_results_state == MoreResultsType::NoMoreResults
+            && final_cursor_offset < db_entities_count
+        {
             new_more_results_state = MoreResultsType::NotFinished;
         }
 
@@ -1003,7 +1005,7 @@ impl DatastoreStorage {
             skipped_results: start as i32,
             read_time: None,
             // A cursor that points to the position after the last skipped result. Will be set when skipped_results != 0.
-            skipped_cursor: vec![0], // NO_SKIP_CURSOR
+            skipped_cursor: vec![], // NO_SKIP_CURSOR
             snapshot_version: 0,
             //The results for this batch.
             entity_results: results,
