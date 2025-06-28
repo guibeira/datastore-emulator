@@ -1,0 +1,26 @@
+services:
+  # Service for your Rust emulator implementation
+  datastore-emulator-rust:
+    container_name: datastore_emulator_rust
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Arguments passed to the ENTRYPOINT in the Dockerfile: [host, port]
+    command: ["0.0.0.0", "8042"]
+    ports:
+      - "8042:8042" # gRPC port for the Rust emulator
+      - "8043:8043" # HTTP port for the Rust emulator
+
+  # Service for the official Google Datastore emulator
+  datastore-emulator-google:
+    container_name: datastore_emulator_google
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    # Command to start the Datastore emulator
+    command: >
+      /bin/sh -c "gcloud beta emulators datastore start 
+      --project=test-project-2 
+      --host-port=0.0.0.0:8044 
+      --no-store-on-disk"
+    ports:
+      - "8044:8044" # gRPC port for the official Google emulator
+
