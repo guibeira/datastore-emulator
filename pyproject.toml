@@ -1,0 +1,18 @@
+[project]
+name = "datastore-emulator"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Guilherme Beira",email = "guilherme.vieira.beira@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-cloud-datastore (==2.20.2)",
+    "pytest (>=8.4.1,<9.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
