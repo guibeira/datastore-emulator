@@ -19,7 +19,6 @@ from pprint import pprint
 
 # os.environ["GRPC_VERBOSITY"] = "DEBUG"
 # os.environ["GRPC_TRACE"] = "all"
-os.environ["DATASTORE_EMULATOR_HOST"] = "localhost:8080"
 from google.cloud import datastore  # noqa: I100
 from google.cloud.datastore.key import Key
 from google.cloud.datastore.query import PropertyFilter

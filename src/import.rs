@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: String) {
-    // only supports zip files at same machine
     println!("Importing data from {:?} in the background...", input_url);
     // check if the file exists,
     // todo: download the file if it does not exist

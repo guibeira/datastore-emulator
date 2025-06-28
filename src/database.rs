@@ -228,7 +228,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
             }
         }
         Err(e) => {
-            eprintln!("Erro ao abrir o arquivo: {}", e);
+            eprintln!("Error opening file: {}", e);
         }
     }
     None // Returning None as we are not returning the metadata here

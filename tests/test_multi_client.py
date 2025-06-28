@@ -71,10 +71,12 @@ def test_multi_client_filter_query():
             for i in range(3):
                 key = client.key("Task", f"task-{test_id}-{i}")
                 entity = datastore.Entity(key=key)
-                entity.update({
-                    "category": f"category-{test_id}",
-                    "done": i % 2 == 0,  # Two done, one not done
-                })
+                entity.update(
+                    {
+                        "category": f"category-{test_id}",
+                        "done": i % 2 == 0,  # Two done, one not done
+                    }
+                )
                 client.put(entity)
                 keys_to_delete.append(key)
 
@@ -129,10 +131,12 @@ def test_multi_client_aggregation_query():
             for i in range(5):
                 key = client.key("DataPoint", f"dp-{test_id}-{i}")
                 entity = datastore.Entity(key=key)
-                entity.update({
-                    "group": f"group-{test_id}",
-                    "value": i * 10,
-                })
+                entity.update(
+                    {
+                        "group": f"group-{test_id}",
+                        "value": i * 10,
+                    }
+                )
                 client.put(entity)
                 keys_to_delete.append(key)
 
