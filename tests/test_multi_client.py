@@ -1,5 +1,6 @@
 import os
 import uuid
+from time import sleep
 
 import pytest
 from google.cloud import datastore
@@ -10,11 +11,11 @@ def rust_client():
     """
     Fixture to create a Rust client connected to the emulator.
     """
-    os.environ["DATASTORE_EMULATOR_HOST"] = "localhost:8042"
     db_client = datastore.Client(project="test-project-2")
+    db_client.base_url = "http://localhost:8042"
     yield db_client
     # Cleanup after test
-    for kind in ["Task", "Family"]:
+    for kind in ["TaskTest", "Family"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
@@ -26,25 +27,30 @@ def google_client():
     """
     Fixture to create a Google client connected to the emulator.
     """
-    os.environ["DATASTORE_EMULATOR_HOST"] = "localhost:8044"
-    db_client = datastore.Client(project="test-project-2")
+    if "USE_REAL_DB" in os.environ:
+        database_name = os.environ["DATASTORE_DATABASE_NAME"]
+        project_id = os.environ["DATASTORE_PROJECT_ID"]
+        db_client = datastore.Client(project_id, database=database_name)
+    else:
+        db_client = datastore.Client(project="test-project-1")
+        db_client.base_url = "http://localhost:8044"
     yield db_client
     # Cleanup after test
-    for kind in ["Task", "Family"]:
+    for kind in ["TaskTest", "Family"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
             db_client.delete_multi(keys_to_delete)
 
 
-def test_multi_client_insert_isolation(rust_client, google_client):
+def test_multi_client_insert_isolation(google_client, rust_client):
     """
     Tests whether two clients connected to different emulator instances
     operate on isolated datasets, must return the same result.
     """
     # Create unique keys for each client
-    key1 = rust_client.key("Task", f"test-entity-{uuid.uuid4()}")
-    key2 = google_client.key("Task", f"test-entity-{uuid.uuid4()}")
+    key1 = rust_client.key("TaskTest", f"test-entity-{uuid.uuid4()}")
+    key2 = google_client.key("TaskTest", f"test-entity-{uuid.uuid4()}")
 
     # client1 will communicate with localhost:8042
     entity1 = datastore.Entity(key=key1)
@@ -65,15 +71,15 @@ def test_multi_client_insert_isolation(rust_client, google_client):
     assert retrieved_from_1_for_key1["description"] == retrieved_from_2_for_key2["description"]
 
 
-def test_multi_client_filter_query(rust_client, google_client):
+def test_multi_client_filter_query(google_client, rust_client):
     """
     Tests whether a filter query returns the same result from both emulators.
     """
     test_id = f"test-{uuid.uuid4()}"
 
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         for i in range(3):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity.update(
                 {
@@ -85,13 +91,13 @@ def test_multi_client_filter_query(rust_client, google_client):
 
     # --- Query with filter ---
     # Rust client
-    rust_query = rust_client.query(kind="Task")
+    rust_query = rust_client.query(kind="TaskTest")
     rust_query.add_filter("category", "=", f"category-{test_id}")
     rust_query.add_filter("done", "=", True)
     rust_results = list(rust_query.fetch())
 
     # Google client
-    google_query = google_client.query(kind="Task")
+    google_query = google_client.query(kind="TaskTest")
     google_query.add_filter("category", "=", f"category-{test_id}")
     google_query.add_filter("done", "=", True)
     google_results = list(google_query.fetch())
@@ -106,7 +112,7 @@ def test_multi_client_filter_query(rust_client, google_client):
     assert rust_keys == google_keys
 
 
-def test_aggregation_count_query(rust_client, google_client):
+def test_aggregation_count_query(google_client, rust_client):
     """
     Tests whether a COUNT aggregation query returns the same result from both emulators.
     Inspired by `count_query_property_filter` from client_test.py.
@@ -115,10 +121,10 @@ def test_aggregation_count_query(rust_client, google_client):
     category = f"category-{test_id}"
 
     # --- Setup data ---
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         entities = []
         for i in range(3):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity.update(
                 {
@@ -132,7 +138,7 @@ def test_aggregation_count_query(rust_client, google_client):
     # --- Run aggregation query on both clients ---
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
-        query = client.query(kind="Task")
+        query = client.query(kind="TaskTest")
         query.add_filter("category", "=", category)
         query.add_filter("done", "=", True)
 
@@ -148,7 +154,7 @@ def test_aggregation_count_query(rust_client, google_client):
     assert results["rust"] == 2
 
 
-def test_aggregation_sum_avg_query(rust_client, google_client):
+def test_aggregation_sum_avg_query(google_client, rust_client):
     """
     Tests whether SUM and AVG aggregation queries return the same result from both emulators.
     Inspired by `sum_query_on_kind` and `avg_query_on_kind` from client_test.py.
@@ -157,10 +163,10 @@ def test_aggregation_sum_avg_query(rust_client, google_client):
     category = f"category-{test_id}"
 
     # --- Setup data ---
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         entities = []
         for i, hours in enumerate([5, 3, 1]):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity.update(
                 {
@@ -173,7 +179,7 @@ def test_aggregation_sum_avg_query(rust_client, google_client):
 
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
-        query = client.query(kind="Task")
+        query = client.query(kind="TaskTest")
         query.add_filter("category", "=", category)
 
         aggregation_query = client.aggregation_query(query)
@@ -187,7 +193,6 @@ def test_aggregation_sum_avg_query(rust_client, google_client):
         for agg in agg_results:
             client_results[agg.alias] = agg.value
         results[client_name] = client_results
-
     # --- Assertion ---
     assert results["rust"]["total_hours"] == results["google"]["total_hours"]
     assert results["rust"]["total_hours"] == 9
@@ -196,7 +201,7 @@ def test_aggregation_sum_avg_query(rust_client, google_client):
     assert results["rust"]["avg_hours"] == 3.0
 
 
-def test_delete_multi(rust_client, google_client):
+def test_delete_multi(google_client, rust_client):
     """
     Tests whether `delete_multi` works consistently on both emulators.
     Inspired by `delete_multi_example` from client_test.py.
@@ -204,8 +209,8 @@ def test_delete_multi(rust_client, google_client):
     test_id = f"test-{uuid.uuid4()}"
 
     # --- Setup data and keys on both clients ---
-    rust_keys = [rust_client.key("Task", f"task-{test_id}-{i}") for i in range(3)]
-    google_keys = [google_client.key("Task", f"task-{test_id}-{i}") for i in range(3)]
+    rust_keys = [rust_client.key("TaskTest", f"task-{test_id}-{i}") for i in range(3)]
+    google_keys = [google_client.key("TaskTest", f"task-{test_id}-{i}") for i in range(3)]
 
     for i in range(3):
         rust_entity = datastore.Entity(key=rust_keys[i])
@@ -239,8 +244,7 @@ def test_delete_multi(rust_client, google_client):
     assert google_retrieved[0]["desc"] == "google task 2"
 
 
-@pytest.mark.skip(reason="Google returns: Only ancestor queries are allowed inside transactions")
-def test_transaction_rollback(rust_client, google_client):
+def test_transaction_rollback(google_client, rust_client):
     """
     Tests that a transaction is correctly rolled back on failure.
     Inspired by `transaction_rollback_example` from client_test.py.
@@ -248,22 +252,22 @@ def test_transaction_rollback(rust_client, google_client):
 
     def _setup_and_run_transaction(client):
         # Initial data
-        task1 = datastore.Entity(client.key("Task", "budget_task1"))
+        task1 = datastore.Entity(client.key("TaskTest", "budget_task1"))
         task1.update({"category": "expense", "amount": 400})
-        task2 = datastore.Entity(client.key("Task", "budget_task2"))
+        task2 = datastore.Entity(client.key("TaskTest", "budget_task2"))
         task2.update({"category": "expense", "amount": 300})
         client.put_multi([task1, task2])
 
         # Run transaction that should fail and rollback
         try:
             with client.transaction() as transaction:
-                expense_query = client.query(kind="Task")
+                expense_query = client.query(kind="TaskTest")
                 expense_query.add_filter("category", "=", "expense")
                 expenses = list(expense_query.fetch())
                 current_total = sum(task["amount"] for task in expenses)
 
                 # This new expense exceeds the "budget" of 1000
-                new_expense = datastore.Entity(client.key("Task", "budget_task3"))
+                new_expense = datastore.Entity(client.key("TaskTest", "budget_task3"))
                 new_expense.update({"category": "expense", "amount": 500})
 
                 if current_total + new_expense["amount"] > 1000:
@@ -275,7 +279,7 @@ def test_transaction_rollback(rust_client, google_client):
             pass
 
         # Return the final state of tasks
-        return list(client.query(kind="Task").fetch())
+        return list(client.query(kind="TaskTest").fetch())
 
     # --- Run for both clients ---
     rust_final_tasks = _setup_and_run_transaction(rust_client)
@@ -295,7 +299,7 @@ def test_transaction_rollback(rust_client, google_client):
     assert rust_task_data == expected_data
 
 
-def test_not_equals_and_not_in_query(rust_client, google_client):
+def test_not_equals_and_not_in_query(google_client, rust_client):
     """
     Tests '!=' and 'NOT_IN' queries work consistently on both emulators.
     Inspired by `not_equals_query` and `not_in_query` from client_test.py.
@@ -304,10 +308,10 @@ def test_not_equals_and_not_in_query(rust_client, google_client):
     categories = ["work", "chores", "school", "personal"]
 
     # --- Setup data ---
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         entities = []
         for i, category in enumerate(categories):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity.update({"category": category, "id": i})
             entities.append(entity)
@@ -317,12 +321,12 @@ def test_not_equals_and_not_in_query(rust_client, google_client):
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
         # Not equals query
-        ne_query = client.query(kind="Task")
+        ne_query = client.query(kind="TaskTest")
         ne_query.add_filter("category", "!=", "work")
         ne_results = {e["category"] for e in ne_query.fetch()}
 
         # Not in query
-        not_in_query = client.query(kind="Task")
+        not_in_query = client.query(kind="TaskTest")
         not_in_query.add_filter("category", "NOT_IN", ["work", "chores"])
         not_in_results = {e["category"] for e in not_in_query.fetch()}
 
@@ -341,7 +345,7 @@ def test_not_equals_and_not_in_query(rust_client, google_client):
     assert results["rust"]["not_in"] == {"school", "personal"}
 
 
-def test_in_query(rust_client, google_client):
+def test_in_query(google_client, rust_client):
     """
     Tests 'IN' queries work consistently on both emulators.
     Inspired by `in_query` from client_test.py.
@@ -350,10 +354,10 @@ def test_in_query(rust_client, google_client):
     priorities = [1, 2, 3, 4, 4, 5]
 
     # --- Setup data ---
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         entities = []
         for i, priority in enumerate(priorities):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity.update({"priority": priority})
             entities.append(entity)
@@ -362,7 +366,7 @@ def test_in_query(rust_client, google_client):
     # --- Run IN query ---
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
-        query = client.query(kind="Task")
+        query = client.query(kind="TaskTest")
         query.add_filter("priority", "IN", [4, 5])
         # Use a set of priorities for comparison, as order is not guaranteed
         results[client_name] = sorted([e["priority"] for e in query.fetch()])
@@ -373,7 +377,7 @@ def test_in_query(rust_client, google_client):
     assert results["rust"] == [4, 4, 5]
 
 
-def test_allocate_ids(rust_client, google_client):
+def test_allocate_ids(google_client, rust_client):
     """
     Tests that `allocate_ids` works consistently.
     Inspired by `allocate_ids_example` from client_test.py.
@@ -412,8 +416,7 @@ def test_allocate_ids(rust_client, google_client):
     assert rust_count == 2
 
 
-@pytest.mark.skip(reason="Todo: Implement pagination test for Rust client")
-def test_pagination(rust_client, google_client):
+def test_pagination(google_client, rust_client):
     """
     Tests that query pagination works consistently.
     Inspired by `fetch_paginated_entities` from client_test.py.
@@ -423,23 +426,23 @@ def test_pagination(rust_client, google_client):
     page_size = 10
 
     # --- Setup data ---
-    for client in [rust_client, google_client]:
+    for client in [google_client, rust_client]:
         entities = []
         for i in range(num_entities):
-            key = client.key("Task", f"task-{test_id}-{i}")
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
             entity = datastore.Entity(key=key)
             entity["test_id"] = test_id
             entity["order"] = i
             entities.append(entity)
         client.put_multi(entities)
-
+    sleep(10)  # Ensure data is committed before querying
     # --- Paginate through results for both clients ---
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
         all_entities = []
         cursor = None
         while True:
-            query = client.query(kind="Task")
+            query = client.query(kind="TaskTest")
             query.add_filter("test_id", "=", test_id)
             query.order = ["order"]
 
