@@ -81,24 +81,28 @@ impl DatastoreService for DatastoreEmulator {
         let start_time = SystemTime::now();
         let req = request.into_inner();
         let storage = self.storage.lock().unwrap();
-        // Extract the aggregation query from the request
-        let aggregation_query = match req.query_type {
+        // Extract the query from the request
+        let query_obj = match req.query_type {
             Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
             _ => {
                 // implement other query types if needed
-                return Err(Status::invalid_argument(
-                    "Missing or invalid aggregation query",
-                ));
+                return Err(Status::invalid_argument("Missing or invalid query"));
             }
         };
-        let kind_name = aggregation_query.kind[0].name.clone();
+        let kind_name = query_obj
+            .kind
+            .get(0)
+            .map(|k| k.name.clone())
+            .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
 
         let batch = storage.get_entities(
             req.project_id.clone(),
             kind_name,
-            aggregation_query.filter.clone(),
-            aggregation_query.limit,
-            aggregation_query.start_cursor.clone(),
+            query_obj.filter.clone(),
+            query_obj.limit,
+            query_obj.start_cursor.clone(),
+            query_obj.projection.clone(),
+            query_obj.order.clone(),
         );
         let mut fields = BTreeMap::new();
 
@@ -121,7 +125,7 @@ impl DatastoreService for DatastoreEmulator {
 
         Ok(Response::new(RunQueryResponse {
             transaction: vec![],
-            query: Some(aggregation_query),
+            query: Some(query_obj),
             batch: Some(batch),
             // todo: create real metrics
             explain_metrics: Some(ExplainMetrics {

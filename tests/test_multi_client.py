@@ -4,6 +4,7 @@ from time import sleep
 
 import pytest
 from google.cloud import datastore
+from google.cloud.datastore.query import Or, PropertyFilter
 
 
 @pytest.fixture
@@ -552,3 +553,192 @@ def test_has_ancestor_query(google_client, rust_client):
     assert results["rust"] == expected_keys
     assert results["google"] == expected_keys
     assert results["rust"] == results["google"]
+
+
+def test_composite_or_filter_query(google_client, rust_client):
+    """
+    Tests that a composite OR filter query works consistently.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        entities = [
+            datastore.Entity(key=client.key("TaskTest", f"task-{test_id}-1")),
+            datastore.Entity(key=client.key("TaskTest", f"task-{test_id}-2")),
+            datastore.Entity(key=client.key("TaskTest", f"task-{test_id}-3")),
+            datastore.Entity(key=client.key("TaskTest", f"task-{test_id}-4")),
+        ]
+        entities[0].update({"test_id": test_id, "priority": 5, "done": False})  # Matches priority
+        entities[1].update({"test_id": test_id, "priority": 1, "done": True})  # Matches done
+        entities[2].update({"test_id": test_id, "priority": 5, "done": True})  # Matches both
+        entities[3].update({"test_id": test_id, "priority": 1, "done": False})  # Matches neither
+        client.put_multi(entities)
+
+    # --- Run OR query ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        query = client.query(kind="TaskTest")
+        # Note: The client library combines filters with AND by default.
+        # Here we filter by test_id AND (priority > 4 OR done = True)
+        query.add_filter("test_id", "=", test_id)
+        query.add_filter(
+            filter=Or(
+                [
+                    PropertyFilter("priority", ">", 4),
+                    PropertyFilter("done", "=", True),
+                ]
+            )
+        )
+        # Store key names for comparison
+        results[client_name] = {e.key.name for e in query.fetch()}
+
+    # --- Assertions ---
+    expected_keys = {f"task-{test_id}-1", f"task-{test_id}-2", f"task-{test_id}-3"}
+    assert len(results["rust"]) == 3
+    assert results["rust"] == expected_keys
+    assert results["google"] == expected_keys
+    assert results["rust"] == results["google"]
+
+
+def test_keys_only_query(google_client, rust_client):
+    """
+    Tests that keys-only queries work consistently.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        key = client.key("TaskTest", f"task-{test_id}-1")
+        entity = datastore.Entity(key=key)
+        entity["description"] = "This should not be returned"
+        entity["test_id"] = test_id
+        client.put(entity)
+
+    # --- Run keys-only query ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        query = client.query(kind="TaskTest")
+        query.keys_only()
+        query.add_filter("test_id", "=", test_id)
+
+        fetched_entities = list(query.fetch())
+        assert len(fetched_entities) > 0, f"{client_name} returned no entities"
+
+        # The client library returns an entity with only the key populated.
+        entity = fetched_entities[0]
+        results[client_name] = {
+            "key": entity.key.name,
+            "properties": dict(entity),
+        }
+
+    # --- Assertions ---
+    expected_key_name = f"task-{test_id}-1"
+
+    # Check Rust client
+    assert results["rust"]["key"] == expected_key_name
+    assert results["rust"]["properties"] == {}
+
+    # Check Google client
+    assert results["google"]["key"] == expected_key_name
+    assert results["google"]["properties"] == {}
+
+    # Compare both
+    assert results["rust"] == results["google"]
+
+
+def test_projection_query(google_client, rust_client):
+    """
+    Tests that projection queries work consistently.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        key = client.key("TaskTest", f"task-{test_id}-1")
+        entity = datastore.Entity(key=key)
+        entity.update(
+            {
+                "test_id": test_id,
+                "description": "This should not be projected",
+                "priority": 5,
+                "done": True,
+            }
+        )
+        client.put(entity)
+
+    # --- Run projection query ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        query = client.query(kind="TaskTest")
+        query.add_filter("test_id", "=", test_id)
+        query.projection = ["priority", "done"]
+
+        fetched_entities = list(query.fetch())
+        assert len(fetched_entities) == 1, f"{client_name} returned wrong number of entities"
+
+        entity = fetched_entities[0]
+        results[client_name] = dict(entity)
+
+    # --- Assertions ---
+    expected_properties = {"priority": 5, "done": True}
+
+    assert results["rust"] == expected_properties
+    assert results["google"] == expected_properties
+    assert results["rust"] == results["google"]
+
+
+def test_ordering_query(google_client, rust_client):
+    """
+    Tests that queries with ordering work consistently.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+    tasks = [
+        {"name": "task-a", "priority": 2},
+        {"name": "task-b", "priority": 3},
+        {"name": "task-c", "priority": 1},
+    ]
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        entities = []
+        for task in tasks:
+            key = client.key("TaskTest", f"{task['name']}-{test_id}")
+            entity = datastore.Entity(key=key)
+            entity.update({"test_id": test_id, "priority": task["priority"]})
+            entities.append(entity)
+        client.put_multi(entities)
+
+    # --- Run queries with ordering ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        # Ascending order
+        query_asc = client.query(kind="TaskTest")
+        query_asc.add_filter("test_id", "=", test_id)
+        query_asc.order = "priority"
+        asc_priorities = [e["priority"] for e in query_asc.fetch()]
+
+        # Descending order
+        query_desc = client.query(kind="TaskTest")
+        query_desc.add_filter("test_id", "=", test_id)
+        query_desc.order = "-priority"
+        desc_priorities = [e["priority"] for e in query_desc.fetch()]
+
+        results[client_name] = {
+            "asc": asc_priorities,
+            "desc": desc_priorities,
+        }
+
+    # --- Assertions ---
+    expected_asc = [1, 2, 3]
+    expected_desc = [3, 2, 1]
+
+    # Check ascending
+    assert results["rust"]["asc"] == expected_asc
+    assert results["google"]["asc"] == expected_asc
+    assert results["rust"]["asc"] == results["google"]["asc"]
+
+    # Check descending
+    assert results["rust"]["desc"] == expected_desc
+    assert results["google"]["desc"] == expected_desc
+    assert results["rust"]["desc"] == results["google"]["desc"]

@@ -4,28 +4,47 @@ use crate::google::datastore::import_export::datastore_v3::{
 
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
 use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
+use crate::google::datastore::v1::filter::FilterType;
 use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::query_result_batch::MoreResultsType;
-use crate::google::datastore::v1::{ArrayValue, LatLng, PartitionId, Value};
+use crate::google::datastore::v1::value::ValueType;
+use crate::google::datastore::v1::{
+    property_order, ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value,
+};
+use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
-
-use crate::google::datastore::v1::Filter;
-use crate::google::datastore::v1::filter::FilterType;
-use crate::google::datastore::v1::value::ValueType;
-use prost::Message;
+use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use bincode;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
+use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
+
+fn compare_values(a: &Value, b: &Value) -> Ordering {
+    match (&a.value_type, &b.value_type) {
+        (Some(ValueType::IntegerValue(av)), Some(ValueType::IntegerValue(bv))) => av.cmp(bv),
+        (Some(ValueType::DoubleValue(av)), Some(ValueType::DoubleValue(bv))) => {
+            av.partial_cmp(bv).unwrap_or(Ordering::Equal)
+        }
+        (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
+        (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
+        (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => av
+            .seconds
+            .cmp(&bv.seconds)
+            .then_with(|| av.nanos.cmp(&bv.nanos)),
+        // Add other types if necessary, and handle type mismatches
+        // For now, unequal types are considered equal for sorting purposes, which is a simplification.
+        _ => Ordering::Equal,
+    }
+}
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
@@ -915,7 +934,62 @@ impl DatastoreStorage {
         filter: Option<Filter>,
         limit: Option<i32>,
         start_cursor: Vec<u8>,
+        projection: Vec<Projection>,
+        order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
+        // 1. Filter entities
+        let mut filtered_entities: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|(k, _e)| {
+                k.project_id == project_id_filter
+                    && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
+            })
+            .filter(|(_, entity_metadata)| {
+                if let Some(ref filter_obj) = filter {
+                    if let Some(ref filter_type) = filter_obj.filter_type {
+                        DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // 2. Sort entities
+        if !order.is_empty() {
+            filtered_entities.sort_by(|(_, a_meta), (_, b_meta)| {
+                let mut final_ordering = Ordering::Equal;
+                for order_by in &order {
+                    if final_ordering != Ordering::Equal {
+                        break; // Already decided by a previous order property
+                    }
+
+                    let prop_name = &order_by.property.as_ref().unwrap().name;
+                    let a_val = a_meta.entity.properties.get(prop_name);
+                    let b_val = b_meta.entity.properties.get(prop_name);
+
+                    let ordering = match (a_val, b_val) {
+                        (Some(a), Some(b)) => compare_values(a, b),
+                        (Some(_), None) => Ordering::Greater,
+                        (None, Some(_)) => Ordering::Less,
+                        (None, None) => Ordering::Equal,
+                    };
+
+                    final_ordering =
+                        if order_by.direction == property_order::Direction::Descending as i32 {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        };
+                }
+                final_ordering
+            });
+        }
+
+        // 3. Paginate and apply projections
         let mut results = Vec::new();
         let mut start = 0;
         if !start_cursor.is_empty() {
@@ -927,107 +1001,100 @@ impl DatastoreStorage {
             ) as usize;
         }
 
-        let entities_filter_by_project_id: Vec<_> = self
-            .entities
-            .iter()
-            .filter(|(k, _e)| {
-                k.project_id == project_id_filter
-                    && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
-            })
-            .collect();
-
-        let db_entities_count = entities_filter_by_project_id.len();
+        let db_entities_count = filtered_entities.len();
         let mut current_entities_payload_size: usize = 0;
         let mut new_more_results_state = MoreResultsType::NoMoreResults;
-
-        // This variable will track our position in the `entities_filter_by_project_id` vec
         let mut items_processed_from_start = 0;
 
-        for (_key_struct, entity_metadata) in entities_filter_by_project_id.iter().skip(start) {
+        let is_keys_only = !projection.is_empty()
+            && projection
+                .iter()
+                .all(|p| p.property.as_ref().map_or(false, |pr| pr.name == "__key__"));
+
+        for (_key_struct, entity_metadata) in filtered_entities.iter().skip(start) {
             items_processed_from_start += 1;
 
-            // Apply filter first
-            let passes_filter = if let Some(ref filter_obj) = filter {
-                if let Some(ref filter_type) = filter_obj.filter_type {
-                    DatastoreStorage::apply_filter(entity_metadata, filter_type)
-                } else {
-                    true
-                }
-            } else {
-                true
-            };
-
-            if !passes_filter {
-                continue; // Does not match filter, go to next entity
-            }
-
-            // Now that we know it passes the filter, check limits
-
-            // Check payload limit. The !results.is_empty() check is crucial to prevent a loop
-            // if the very first entity considered is larger than the max payload.
-            let entity_size_bytes = entity_metadata.entity.encoded_len();
+            // Apply limit and payload size checks
+            let entity_size_bytes = entity_metadata.entity.encoded_len(); // This might need adjustment for projections
             if !results.is_empty()
                 && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
             {
                 new_more_results_state = MoreResultsType::NotFinished;
-                // This item was not included, so the cursor for the next request should point to it.
-                // We decrement the counter so the final cursor calculation is correct.
                 items_processed_from_start -= 1;
                 break;
             }
 
-            // Check query limit
             if let Some(limit_value) = limit {
                 if results.len() >= limit_value as usize {
                     new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
-                    // This item was not included, so the cursor for the next request should point to it.
                     items_processed_from_start -= 1;
                     break;
                 }
             }
 
-            // If all checks pass, add the entity to the results
+            // Apply projection
+            let result_entity = if is_keys_only {
+                Entity {
+                    key: entity_metadata.entity.key.clone(),
+                    properties: HashMap::new(),
+                }
+            } else if !projection.is_empty() {
+                let mut projected_properties = HashMap::new();
+                for p in &projection {
+                    if let Some(prop_ref) = &p.property {
+                        if let Some(value) = entity_metadata.entity.properties.get(&prop_ref.name) {
+                            projected_properties.insert(prop_ref.name.clone(), value.clone());
+                        }
+                    }
+                }
+                Entity {
+                    key: entity_metadata.entity.key.clone(),
+                    properties: projected_properties,
+                }
+            } else {
+                entity_metadata.entity.clone()
+            };
+
             results.push(EntityResult {
-                entity: Some(entity_metadata.entity.clone()),
+                entity: Some(result_entity),
                 create_time: Some(entity_metadata.create_time.clone()),
                 update_time: Some(entity_metadata.update_time.clone()),
                 cursor: vec![],
                 version: entity_metadata.version as i64,
             });
-            current_entities_payload_size += entity_size_bytes;
+            current_entities_payload_size += entity_metadata.entity.encoded_len(); // Use original size for payload calculation
         }
 
         let final_cursor_offset = start + items_processed_from_start;
 
         let end_cursor = {
             if final_cursor_offset >= db_entities_count {
-                vec![] // No more results, so no end cursor
+                vec![]
             } else {
                 (final_cursor_offset as u32).to_be_bytes().to_vec()
             }
         };
 
-        // If the loop finished for any reason other than exhausting the entities,
-        // there might be more results.
         if new_more_results_state == MoreResultsType::NoMoreResults
             && final_cursor_offset < db_entities_count
         {
             new_more_results_state = MoreResultsType::NotFinished;
         }
 
+        let entity_result_type = if is_keys_only || !projection.is_empty() {
+            2 // PROJECTION
+        } else {
+            1 // FULL
+        };
+
         crate::google::datastore::v1::QueryResultBatch {
-            entity_result_type: 1, // Corresponds to EntityResultType::FULL
-            // The number of results skipped due to the start cursor.
+            entity_result_type,
             skipped_results: start as i32,
             read_time: None,
-            // A cursor that points to the position after the last skipped result. Will be set when skipped_results != 0.
-            skipped_cursor: vec![], // NO_SKIP_CURSOR
+            skipped_cursor: vec![],
             snapshot_version: 0,
-            //The results for this batch.
             entity_results: results,
-            //The state of the query after the current batch.
             more_results: new_more_results_state as i32,
-            //A cursor that points to the position after the last result in the batch.
             end_cursor,
         }
     }
