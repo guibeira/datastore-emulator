@@ -15,7 +15,7 @@ def rust_client():
     db_client.base_url = "http://localhost:8042"
     yield db_client
     # Cleanup after test
-    for kind in ["TaskTest", "Family"]:
+    for kind in ["TaskTest", "Family", "User"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
@@ -36,7 +36,7 @@ def google_client():
         db_client.base_url = "http://localhost:8044"
     yield db_client
     # Cleanup after test
-    for kind in ["TaskTest", "Family"]:
+    for kind in ["TaskTest", "Family", "User"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
@@ -459,4 +459,96 @@ def test_pagination(google_client, rust_client):
     # --- Assertions ---
     assert len(results["rust"]) == num_entities
     assert len(results["google"]) == num_entities
+    assert results["rust"] == results["google"]
+
+
+def test_comparison_operators_query(google_client, rust_client):
+    """
+    Tests comparison operators (<, <=, >, >=) work consistently.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+    scores = [10, 20, 30, 40]
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        entities = []
+        for i, score in enumerate(scores):
+            key = client.key("TaskTest", f"task-{test_id}-{i}")
+            entity = datastore.Entity(key=key)
+            entity.update({"test_id": test_id, "score": score})
+            entities.append(entity)
+        client.put_multi(entities)
+
+    # --- Define queries and expected results ---
+    queries_to_test = {
+        "less_than": {"operator": "<", "value": 30, "expected_scores": {10, 20}},
+        "less_than_or_equal": {"operator": "<=", "value": 30, "expected_scores": {10, 20, 30}},
+        "greater_than": {"operator": ">", "value": 20, "expected_scores": {30, 40}},
+        "greater_than_or_equal": {"operator": ">=", "value": 20, "expected_scores": {20, 30, 40}},
+    }
+
+    # --- Run queries and assert ---
+    for test_name, params in queries_to_test.items():
+        rust_results = set()
+        google_results = set()
+
+        for client_name, client, resultSet in [
+            ("rust", rust_client, rust_results),
+            ("google", google_client, google_results),
+        ]:
+            query = client.query(kind="TaskTest")
+            query.add_filter("test_id", "=", test_id)
+            query.add_filter("score", params["operator"], params["value"])
+            for entity in query.fetch():
+                resultSet.add(entity["score"])
+
+        assert rust_results == params["expected_scores"], f"Rust client failed on '{test_name}'"
+        assert google_results == params["expected_scores"], f"Google client failed on '{test_name}'"
+        assert rust_results == google_results, f"Mismatch between clients on '{test_name}'"
+
+
+def test_has_ancestor_query(google_client, rust_client):
+    """
+    Tests that HAS_ANCESTOR queries work consistently on both emulators.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+
+    # --- Setup data ---
+    for client in [google_client, rust_client]:
+        # Create a parent entity
+        parent_key = client.key("User", f"user-{test_id}")
+        parent_entity = datastore.Entity(key=parent_key)
+        parent_entity["name"] = "Test User"
+        client.put(parent_entity)
+
+        # Create child entities
+        child_key1 = client.key("TaskTest", "child1", parent=parent_key)
+        child1 = datastore.Entity(key=child_key1)
+        child1["description"] = "Child task 1"
+
+        child_key2 = client.key("TaskTest", "child2", parent=parent_key)
+        child2 = datastore.Entity(key=child_key2)
+        child2["description"] = "Child task 2"
+
+        # Create an unrelated entity
+        unrelated_key = client.key("TaskTest", f"unrelated-{test_id}")
+        unrelated_entity = datastore.Entity(key=unrelated_key)
+        unrelated_entity["description"] = "Unrelated task"
+
+        client.put_multi([child1, child2, unrelated_entity])
+
+    # --- Run HAS_ANCESTOR query ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        parent_key = client.key("User", f"user-{test_id}")
+        query = client.query(kind="TaskTest", ancestor=parent_key)
+
+        # Store the key names for comparison
+        results[client_name] = {e.key.name for e in query.fetch()}
+
+    # --- Assertions ---
+    expected_keys = {"child1", "child2"}
+    assert len(results["rust"]) == 2
+    assert results["rust"] == expected_keys
+    assert results["google"] == expected_keys
     assert results["rust"] == results["google"]
