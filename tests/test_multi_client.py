@@ -435,7 +435,6 @@ def test_pagination(google_client, rust_client):
             entity["order"] = i
             entities.append(entity)
         client.put_multi(entities)
-    sleep(10)  # Ensure data is committed before querying
     # --- Paginate through results for both clients ---
     results = {}
     for client_name, client in [("rust", rust_client), ("google", google_client)]:
