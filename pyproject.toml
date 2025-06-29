@@ -13,6 +13,11 @@ dependencies = [
 ]
 
 
+[tool.poetry.dependencies]
+python = ">=3.12"
+google-cloud-datastore = "2.20.2"
+pytest = {version = ">=8.4.1,<9.0.0"}
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
