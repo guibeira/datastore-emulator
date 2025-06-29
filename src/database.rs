@@ -816,15 +816,31 @@ impl DatastoreStorage {
                                 }
                                 5 => return entity_value.value_type == filter_value.value_type, // EQUAL
                                 6 => {
-                                    /* IN - todo */
+                                    // IN
+                                    if let Some(ValueType::ArrayValue(array_value)) =
+                                        &filter_value.value_type
+                                    {
+                                        return array_value
+                                            .values
+                                            .iter()
+                                            .any(|v| v.value_type == entity_value.value_type);
+                                    }
                                     return false;
-                                } // Defaulting to false for unimplemented IN
+                                }
                                 9 => return entity_value.value_type != filter_value.value_type, // NOT_EQUAL
                                 // Case 11 (HAS_ANCESTOR) is handled above
                                 13 => {
-                                    /* NOT_IN - todo */
-                                    return false;
-                                } // Defaulting to false for unimplemented NOT_IN
+                                    // NOT_IN
+                                    if let Some(ValueType::ArrayValue(array_value)) =
+                                        &filter_value.value_type
+                                    {
+                                        return !array_value
+                                            .values
+                                            .iter()
+                                            .any(|v| v.value_type == entity_value.value_type);
+                                    }
+                                    return true;
+                                }
                                 _ => return false, // Unsupported operator for property or op combination
                             }
                         } else {
