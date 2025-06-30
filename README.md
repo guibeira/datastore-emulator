@@ -36,34 +36,13 @@ See the [test](https://github.com/guibeira/datastore-emulator/blob/main/tests/RE
 
 ## Benchmarks
 
-Here some results with 30 clients and 10 runs each:
+Here are some results with 30 clients and 10 runs each:
 
-Operation: Single Insert
-  - Rust (30 clients, 10 runs each):
-    - Total time: 1.6883 seconds
-    - Avg time per client: 0.0563 seconds
-  - Java (30 clients, 10 runs each):
-    - Total time: 95.1637 seconds
-    - Avg time per client: 3.1721 seconds
-  - Verdict: Rust was 56.37x faster overall.
-
-Operation: Bulk Insert (50)
-  - Rust (30 clients, 10 runs each):
-    - Total time: 17.7474 seconds
-    - Avg time per client: 0.5916 seconds
-  - Java (30 clients, 10 runs each):
-    - Total time: 375.3370 seconds
-    - Avg time per client: 12.5112 seconds
-  - Verdict: Rust was 21.15x faster overall.
-
-Operation: Simple Query
-  - Rust (30 clients, 10 runs each):
-    - Total time: 20.5427 seconds
-    - Avg time per client: 0.6848 seconds
-  - Java (30 clients, 10 runs each):
-    - Total time: 62.8813 seconds
-    - Avg time per client: 2.0960 seconds
-  - Verdict: Rust was 3.06x faster overall.
+| Operation | Total Time (Rust) | Total Time (Java) | Avg Time/Client (Rust) | Avg Time/Client (Java) | Verdict |
+|---|---|---|---|---|---|
+| Single Insert | 1.6883s | 95.1637s | 0.0563s | 3.1721s | Rust 56.37x faster |
+| Bulk Insert (50) | 17.7474s | 375.3370s | 0.5916s | 12.5112s | Rust 21.15x faster |
+| Simple Query | 20.5427s | 62.8813s | 0.6848s | 2.0960s | Rust 3.06x faster |
 
 
 If you want to run the benchmarks yourself, run the following commands:
