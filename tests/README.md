@@ -38,6 +38,13 @@ To ensure full compatibility with the production environment, the most reliable 
     gcloud auth application-default login
     ```
 
+**Create the indexes:**
+-   Ensure that the necessary indexes are created in your Google Cloud Datastore. You can find the required index definitions in the `tests/index.yaml` file in this repository. Use the following command to create them:
+
+    ```bash
+    gcloud datastore indexes create index.yaml --project=<your-project-id> --database=<your-database-name>
+    ```
+
 **Execution:**
 
 To run the tests against your real database, set the following environment variables in the `pytest` command:
