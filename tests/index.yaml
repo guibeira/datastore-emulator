@@ -1,0 +1,44 @@
+indexes:
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: order
+
+- kind: TaskTest
+  properties:
+  - name: category
+  - name: hours
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: score
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: priority
+
+- kind: TaskTest
+  properties:
+  - name: done
+  - name: test_id
+  - name: priority
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: priority
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: done
+  - name: priority
+
+- kind: TaskTest
+  properties:
+  - name: test_id
+  - name: priority
+    direction: desc
