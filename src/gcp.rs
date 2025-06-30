@@ -1,6 +1,7 @@
 use crate::DatastoreEmulator;
 use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
 use crate::google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
+use tracing;
 use crate::google::datastore::v1::datastore_server::Datastore as DatastoreService;
 use crate::google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
@@ -186,7 +187,7 @@ impl DatastoreService for DatastoreEmulator {
 
                 // In a real implementation, we would apply the transaction's mutations here
                 // For now, we'll just remove the transaction after committing
-                println!("Committing transaction: {}", tx_id);
+                tracing::info!("Committing transaction: {}", tx_id);
             } else {
                 return Err(Status::not_found(format!(
                     "Transaction {} not found",
@@ -366,7 +367,7 @@ impl DatastoreService for DatastoreEmulator {
                                 transform_results: vec![],
                             });
                         } else {
-                            println!(
+                            tracing::warn!(
                                 "Entity not found for deletion with key: {:?}",
                                 key_to_delete.path
                             );
@@ -496,10 +497,10 @@ impl DatastoreService for DatastoreEmulator {
             if storage.transactions.contains_key(&transaction_id) {
                 // Clean up the transaction (removes it from storage)
                 storage.clean_transaction(&transaction_id);
-                println!("Transaction {} rolled back successfully", transaction_id);
+                tracing::info!("Transaction {} rolled back successfully", transaction_id);
             } else {
-                println!(
-                    "Warning: Attempted to rollback non-existent transaction: {}",
+                tracing::warn!(
+                    "Attempted to rollback non-existent transaction: {}",
                     transaction_id
                 );
                 // We still return success even if transaction doesn't exist
@@ -667,8 +668,8 @@ impl DatastoreService for DatastoreEmulator {
                 // Check if the entity is found (key should always be present in EntityWithMetadata)
                 if entity_metadata.entity.key.is_none() {
                     // This case should ideally not happen if data is consistent
-                    eprintln!(
-                        "Warning: Entity found in storage without a key in its Entity struct."
+                    tracing::warn!(
+                        "Entity found in storage without a key in its Entity struct."
                     );
                     continue;
                 }

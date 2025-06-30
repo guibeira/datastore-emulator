@@ -1,6 +1,7 @@
 use crate::google::datastore::import_export::datastore_v3::{
     EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
 };
+use tracing;
 
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
 use crate::google::datastore::import_export::dsbackups::OverallExportMetadata;
@@ -226,7 +227,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
     }
 
     let _metadata_file = metadata_file.expect("Could not find .overall_export_metadata file.");
-    dbg!("Found metadata file:", _metadata_file.display());
+    tracing::debug!("Found metadata file: {}", _metadata_file.display());
     // let reader = LogReader::new(_metadata_file.clone())
     //     .expect("Failed to create LogReader for metadata file");
     // dbg!("LogReader created for metadata file:", reader);
@@ -242,19 +243,19 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
                                 return Some(metadata); // Returning the metadata
                             }
                             Err(decode_err) => {
-                                eprintln!("Failed to decode OverallExportMetadata: {}", decode_err);
+                                tracing::error!("Failed to decode OverallExportMetadata: {}", decode_err);
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error reading record {}: {}", i + 1, e); // Translated eprintln
+                        tracing::error!("Error reading record {}: {}", i + 1, e); // Translated eprintln
                         break;
                     }
                 }
             }
         }
         Err(e) => {
-            eprintln!("Error opening file: {}", e);
+            tracing::error!("Error opening file: {}", e);
         }
     }
     None // Returning None as we are not returning the metadata here
@@ -263,7 +264,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
 pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
     let entity_dump_path = std::path::PathBuf::from(export_dir).join("exports");
 
-    println!(
+    tracing::info!(
         "Reading datastore export from: {}",
         entity_dump_path.display()
     );
@@ -280,11 +281,11 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     .kind
                     .as_ref()
                     .map_or_else(String::new, |k| k.kind.clone());
-                println!("Processing kind: {}", kind_name);
+                tracing::info!("Processing kind: {}", kind_name);
                 let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
 
                 if !metadata_path.exists() {
-                    eprintln!(
+                    tracing::error!(
                         "Metadata file for kind {} not found at: {}",
                         kind_name,
                         metadata_path.display()
@@ -294,7 +295,7 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
 
                 let export_metadata = match std::fs::read(&metadata_path)
                     .map_err(|e| {
-                        eprintln!(
+                        tracing::error!(
                             "Failed to read metadata file {}: {}",
                             metadata_path.display(),
                             e
@@ -303,7 +304,7 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     })
                     .and_then(|data| {
                         ExportMetadata::decode(&data[..]).map_err(|e| {
-                            eprintln!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                            tracing::error!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                         })
                     }) {
@@ -333,14 +334,14 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                                             {
                                                 protos_in_file.push(entity_proto);
                                             } else {
-                                                eprintln!(
+                                                tracing::error!(
                                                     "Failed to decode EntityProto from file {}",
                                                     output_file_path.display()
                                                 );
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!(
+                                            tracing::error!(
                                                 "Error reading record {} from file {}: {}",
                                                 i + 1,
                                                 output_file_path.display(),
@@ -351,10 +352,10 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                                     }
                                 }
                             } else {
-                                eprintln!("Error opening file: {}", output_file_path.display());
+                                tracing::error!("Error opening file: {}", output_file_path.display());
                             }
                         } else {
-                            eprintln!("Output file {} does not exist.", output_file_path.display());
+                            tracing::error!("Output file {} does not exist.", output_file_path.display());
                         }
                         protos_in_file
                     })
@@ -364,10 +365,10 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
             })
             .collect();
 
-        println!("Finished reading datastore export.");
+        tracing::info!("Finished reading datastore export.");
         entity_protos
     } else {
-        eprintln!("No overall metadata found in the export directory.");
+        tracing::warn!("No overall metadata found in the export directory.");
         Vec::new()
     }
 }
@@ -492,7 +493,7 @@ impl DatastoreStorage {
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!(
+                tracing::info!(
                     "Data file '{}' not found. Starting with an empty store.",
                     path
                 );
@@ -505,7 +506,7 @@ impl DatastoreStorage {
         file.read_to_end(&mut buffer)?;
 
         if buffer.is_empty() {
-            println!(
+            tracing::info!(
                 "Data file '{}' is empty. Starting with an empty store.",
                 path
             );
@@ -517,11 +518,11 @@ impl DatastoreStorage {
             bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        println!("Loading {} entities from '{}'...", entities.len(), path);
+        tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
         self.entities = entities;
 
         // Bulk rebuild indexes
-        println!("Rebuilding indexes for {} entities...", self.entities.len());
+        tracing::info!("Rebuilding indexes for {} entities...", self.entities.len());
         let mut new_indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>> =
             HashMap::new();
         for (key_struct, metadata) in &self.entities {
@@ -552,13 +553,13 @@ impl DatastoreStorage {
 
         let end_time = SystemTime::now();
         let diff = end_time.duration_since(start_time).unwrap_or_default();
-        println!("Load complete in {} seconds.", diff.as_secs_f64());
+        tracing::info!("Load complete in {} seconds.", diff.as_secs_f64());
         Ok(())
     }
 
     // Add this new method to save data to disk
     pub fn save_to_disk(&self, path: &str) -> std::io::Result<()> {
-        println!("Saving {} entities to '{}'...", self.entities.len(), path);
+        tracing::info!("Saving {} entities to '{}'...", self.entities.len(), path);
 
         // Serialize the whole BTreeMap
         let buffer = bincode::serde::encode_to_vec(&self.entities, bincode::config::standard())
@@ -567,7 +568,7 @@ impl DatastoreStorage {
         // Write the serialized buffer to the file
         let mut file = std::fs::File::create(path)?;
         file.write_all(&buffer)?;
-        println!("Data saved successfully.");
+        tracing::info!("Data saved successfully.");
         Ok(())
     }
 
@@ -579,7 +580,7 @@ impl DatastoreStorage {
     pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
         let dump_entities = read_dump(path);
         let entities_with_metadata = converter_dump(dump_entities);
-        println!(
+        tracing::info!(
             "Importing {} entities from dump at {}",
             entities_with_metadata.len(),
             path

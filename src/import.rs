@@ -1,48 +1,49 @@
 use crate::database::DatastoreStorage;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing;
 
 pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: String) {
-    println!("Importing data from {:?} in the background...", input_url);
+    tracing::info!("Importing data from {:?} in the background...", input_url);
     // check if the file exists,
     // todo: download the file if it does not exist
     let path = std::path::Path::new(&input_url);
     if !path.exists() {
-        println!("File {:?} does not exist.", input_url);
+        tracing::warn!("File {:?} does not exist.", input_url);
         return;
     }
     let folder_name = "dump";
     // unzip the file into the dump directory at dump path as this lib create folder
     if let Ok(_) = extract_file(input_url.clone()) {
-        println!("File {:?} extracted successfully.", input_url);
+        tracing::info!("File {:?} extracted successfully.", input_url);
 
         let start = Instant::now();
         let mut storage = storage.lock().unwrap();
         if let Ok(_) = storage.import_dump(folder_name) {
-            println!("Entities imported successfully from dump directory.");
+            tracing::info!("Entities imported successfully from dump directory.");
         } else {
-            eprintln!("Failed to import entities from dump directory.");
+            tracing::error!("Failed to import entities from dump directory.");
         }
         let duration = start.elapsed();
         let humanized_duration = duration.as_secs_f64();
         let minutes = humanized_duration / 60.0;
         let seconds = humanized_duration % 60.0;
-        println!(
+        tracing::info!(
             "Imported entities in {:02}:{:02} minutes",
             minutes as u64, seconds as u64
         );
         // Clean up the dump directory
         if let Err(e) = std::fs::remove_dir_all(folder_name) {
-            eprintln!("Failed to clean up dump directory: {}", e);
+            tracing::error!("Failed to clean up dump directory: {}", e);
         } else {
-            println!("Dump directory cleaned up successfully.");
+            tracing::info!("Dump directory cleaned up successfully.");
         }
     } else {
-        println!("Failed to extract file {:?}", input_url);
+        tracing::error!("Failed to extract file {:?}", input_url);
         return;
     }
 
-    println!("Background import completed.");
+    tracing::info!("Background import completed.");
 }
 
 fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error>> {
