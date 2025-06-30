@@ -6,6 +6,8 @@ import pytest
 from google.cloud import datastore
 from google.cloud.datastore.query import Or, PropertyFilter
 
+use_real_db = "USE_REAL_DB" in os.environ
+
 
 @pytest.fixture
 def rust_client():
@@ -113,6 +115,7 @@ def test_multi_client_filter_query(google_client, rust_client):
     assert rust_keys == google_keys
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support aggregation queries")
 def test_aggregation_count_query(google_client, rust_client):
     """
     Tests whether a COUNT aggregation query returns the same result from both emulators.
@@ -155,6 +158,7 @@ def test_aggregation_count_query(google_client, rust_client):
     assert results["rust"] == 2
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support aggregation queries")
 def test_aggregation_sum_avg_query(google_client, rust_client):
     """
     Tests whether SUM and AVG aggregation queries return the same result from both emulators.
@@ -245,6 +249,9 @@ def test_delete_multi(google_client, rust_client):
     assert google_retrieved[0]["desc"] == "google task 2"
 
 
+@pytest.mark.skipif(
+    use_real_db is False, reason="Datastore emulator returns: 'Only ancestor queries are allowed inside'"
+)
 def test_transaction_rollback(google_client, rust_client):
     """
     Tests that a transaction is correctly rolled back on failure.
@@ -300,6 +307,7 @@ def test_transaction_rollback(google_client, rust_client):
     assert rust_task_data == expected_data
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support NOT_IN queries")
 def test_not_equals_and_not_in_query(google_client, rust_client):
     """
     Tests '!=' and 'NOT_IN' queries work consistently on both emulators.
@@ -346,6 +354,7 @@ def test_not_equals_and_not_in_query(google_client, rust_client):
     assert results["rust"]["not_in"] == {"school", "personal"}
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support IN queries")
 def test_in_query(google_client, rust_client):
     """
     Tests 'IN' queries work consistently on both emulators.
@@ -417,6 +426,7 @@ def test_allocate_ids(google_client, rust_client):
     assert rust_count == 2
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support pagination")
 def test_pagination(google_client, rust_client):
     """
     Tests that query pagination works consistently.
@@ -555,6 +565,7 @@ def test_has_ancestor_query(google_client, rust_client):
     assert results["rust"] == results["google"]
 
 
+@pytest.mark.skipif(use_real_db is False, reason="Datastore emulator does not support composite OR queries")
 def test_composite_or_filter_query(google_client, rust_client):
     """
     Tests that a composite OR filter query works consistently.
