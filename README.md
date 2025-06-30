@@ -31,28 +31,4 @@ cargo run --release
 
 ## Testing
 
-
-### Prerequisites
-
-- Docker & Docker Compose V2 (`docker compose`)
-- Python 3.x & `pip`
-
-### 1. Run the Emulators
-
-```bash
-docker compose up
-```
-
-The `docker-compose.yml` file orchestrates two emulator instances:
-
-1.  **`datastore-emulator-rust`**: The custom Rust implementation.
-    *   gRPC: `localhost:8042`
-    *   HTTP: `localhost:8043`
-2.  **`datastore-emulator-google`**: The official Google emulator.
-    *   gRPC: `localhost:8044`
-
-With the both emulators running, you can run the tests against both.
-
-```bash
-poetry run pytest
-```
+See the [test](https://github.com/guibeira/datastore-emulator/blob/main/tests/README.md) instructions
