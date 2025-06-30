@@ -58,7 +58,7 @@ install python dependencies:
     poetry install --no-root && poetry env activate
 
 ```
-    and then run the benchmarks:
+and then run the benchmarks:
 
 ```bash
     python benchmark/test_benchmark.py --num-clients 30 --num-runs 10
