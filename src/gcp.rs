@@ -81,24 +81,28 @@ impl DatastoreService for DatastoreEmulator {
         let start_time = SystemTime::now();
         let req = request.into_inner();
         let storage = self.storage.lock().unwrap();
-        // Extract the aggregation query from the request
-        let aggregation_query = match req.query_type {
+        // Extract the query from the request
+        let query_obj = match req.query_type {
             Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
             _ => {
                 // implement other query types if needed
-                return Err(Status::invalid_argument(
-                    "Missing or invalid aggregation query",
-                ));
+                return Err(Status::invalid_argument("Missing or invalid query"));
             }
         };
-        let kind_name = aggregation_query.kind[0].name.clone();
+        let kind_name = query_obj
+            .kind
+            .get(0)
+            .map(|k| k.name.clone())
+            .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
 
         let batch = storage.get_entities(
             req.project_id.clone(),
             kind_name,
-            aggregation_query.filter.clone(),
-            aggregation_query.limit,
-            aggregation_query.start_cursor.clone(),
+            query_obj.filter.clone(),
+            query_obj.limit,
+            query_obj.start_cursor.clone(),
+            query_obj.projection.clone(),
+            query_obj.order.clone(),
         );
         let mut fields = BTreeMap::new();
 
@@ -121,7 +125,7 @@ impl DatastoreService for DatastoreEmulator {
 
         Ok(Response::new(RunQueryResponse {
             transaction: vec![],
-            query: Some(aggregation_query),
+            query: Some(query_obj),
             batch: Some(batch),
             // todo: create real metrics
             explain_metrics: Some(ExplainMetrics {
@@ -633,7 +637,6 @@ impl DatastoreService for DatastoreEmulator {
         };
 
         // Process each aggregation
-        let mut aggregation_results = Vec::new();
         let mut matching_entities = Vec::new();
 
         if let Some(query) = &base_query {
@@ -683,6 +686,8 @@ impl DatastoreService for DatastoreEmulator {
             // todo: what we should do if there is no base query?
         }
 
+        let mut aggregate_properties = HashMap::new();
+
         for aggregation in &aggregation_query.aggregations {
             if let Some(aggregation_operator) = &aggregation.operator {
                 // Check if the aggregation operator is supported
@@ -699,15 +704,7 @@ impl DatastoreService for DatastoreEmulator {
                                 ),
                             ),
                         };
-
-                        aggregation_results.push(crate::google::datastore::v1::AggregationResult {
-                            //alias: aggregation.alias.clone(),
-                            aggregate_properties: {
-                                let mut props = HashMap::new();
-                                props.insert(aggregation.alias.clone(), result_value);
-                                props
-                            },
-                        });
+                        aggregate_properties.insert(aggregation.alias.clone(), result_value);
                     }
                     AggregationOperator::Sum(sum) => {
                         // Implement SUM aggregation
@@ -729,6 +726,13 @@ impl DatastoreService for DatastoreEmulator {
                                 ) = &property.value_type
                                 {
                                     sum_value += *value as f64;
+                                } else if let Some(
+                                    crate::google::datastore::v1::value::ValueType::DoubleValue(
+                                        value,
+                                    ),
+                                ) = &property.value_type
+                                {
+                                    sum_value += *value;
                                 }
                             }
                         }
@@ -743,14 +747,7 @@ impl DatastoreService for DatastoreEmulator {
                                 ),
                             ),
                         };
-
-                        aggregation_results.push(crate::google::datastore::v1::AggregationResult {
-                            aggregate_properties: {
-                                let mut props = HashMap::new();
-                                props.insert(aggregation.alias.clone(), result_value);
-                                props
-                            },
-                        });
+                        aggregate_properties.insert(aggregation.alias.clone(), result_value);
                     }
                     AggregationOperator::Avg(avg) => {
                         // Implement AVERAGE aggregation
@@ -774,6 +771,14 @@ impl DatastoreService for DatastoreEmulator {
                                 {
                                     sum_value += *value as f64;
                                     count += 1;
+                                } else if let Some(
+                                    crate::google::datastore::v1::value::ValueType::DoubleValue(
+                                        value,
+                                    ),
+                                ) = &property.value_type
+                                {
+                                    sum_value += *value;
+                                    count += 1;
                                 }
                             }
                         }
@@ -795,22 +800,19 @@ impl DatastoreService for DatastoreEmulator {
                                 ),
                             ),
                         };
-
-                        aggregation_results.push(crate::google::datastore::v1::AggregationResult {
-                            aggregate_properties: {
-                                let mut props = HashMap::new();
-                                props.insert(aggregation.alias.clone(), result_value);
-                                props
-                            },
-                        });
+                        aggregate_properties.insert(aggregation.alias.clone(), result_value);
                     }
                 }
             }
         }
+        // Create a single AggregationResult with all properties
+        let final_aggregation_result = crate::google::datastore::v1::AggregationResult {
+            aggregate_properties,
+        };
 
         // Create the result batch
         let batch = AggregationResultBatch {
-            aggregation_results,
+            aggregation_results: vec![final_aggregation_result],
             more_results: 3, // NO_MORE_RESULTS
             read_time: Some(read_time.clone()),
         };
@@ -830,8 +832,7 @@ impl DatastoreService for DatastoreEmulator {
 
         let end_time = SystemTime::now();
         let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-
-        Ok(Response::new(RunAggregationQueryResponse {
+        let response = Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
             query: Some(aggregation_query),
             transaction: Vec::new(),
@@ -849,6 +850,7 @@ impl DatastoreService for DatastoreEmulator {
                     debug_stats: Some(debug_stats),
                 }),
             }),
-        }))
+        });
+        Ok(response)
     }
 }

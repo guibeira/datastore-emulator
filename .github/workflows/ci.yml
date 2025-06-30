@@ -1,0 +1,49 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'poetry'
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Install dependencies
+      run: poetry install --no-interaction --no-root
+
+    - name: Set up Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Start emulators
+      run: docker compose up --build -d
+
+    - name: Wait for emulators to be ready
+      run: |
+        echo "Waiting for emulators to start..."
+        sleep 15
+
+    - name: Run tests
+      run: poetry run pytest
+
+    - name: Stop emulators
+      if: always()
+      run: docker compose down
