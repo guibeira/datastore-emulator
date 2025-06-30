@@ -1,4 +1,7 @@
 # Datastore Emulator in Rust
+<p align="center">
+  <img src="https://github.com/guibeira/datastore-emulator/blob/main/logo.png?raw=true" alt="Project's logo"/>
+</p>
 
 This project is a custom implementation of the Google Cloud Datastore emulator, written in Rust. It is designed to be a lightweight, high-performance alternative to the official Google emulator for local development and testing.
 
