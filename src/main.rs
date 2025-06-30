@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::signal; // Import the tokio signal module
 use tonic::transport::Server;
+use tracing;
+use tracing_subscriber::EnvFilter;
 
 pub mod api;
 pub mod database;
@@ -37,11 +39,11 @@ pub struct DatastoreEmulator {
 
 impl Default for DatastoreEmulator {
     fn default() -> Self {
-        println!("Initializing Datastore Emulator...");
+        tracing::info!("Initializing Datastore Emulator...");
         let mut storage = DatastoreStorage::default();
         // Attempt to load data from disk on startup
         if let Err(e) = storage.load_from_disk("datastore.bin") {
-            eprintln!("WARNING: Could not load data from disk: {}", e);
+            tracing::warn!("Could not load data from disk: {}", e);
         }
         Self {
             storage: Arc::new(Mutex::new(storage)),
@@ -51,14 +53,16 @@ impl Default for DatastoreEmulator {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::init();
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,h2=off"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // --- gRPC Server Setup ---
     let args: Vec<String> = env::args().collect();
     let grpc_host = args.get(1).map_or("127.0.0.1", |s| s.as_str());
     let grpc_port_str = args.get(2).map_or("8042", |s| s.as_str());
     let grpc_port: u16 = grpc_port_str.parse().unwrap_or_else(|_| {
-        eprintln!(
+        tracing::error!(
             "Invalid gRPC port number '{}', using default 8042.",
             grpc_port_str
         );
@@ -68,9 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let grpc_addr: SocketAddr = format!("{}:{}", grpc_host, grpc_port)
         .parse()
         .unwrap_or_else(|e| {
-            eprintln!(
+            tracing::error!(
                 "Invalid gRPC address format '{}:{}', error: {}. Using default 127.0.0.1:8042.",
-                grpc_host, grpc_port, e
+                grpc_host,
+                grpc_port,
+                e
             );
             SocketAddr::from(([127, 0, 0, 1], 8042))
         });
@@ -89,8 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http_router = create_router(storage_for_http);
     let http_server = axum::Server::bind(&http_addr).serve(http_router.into_make_service());
 
-    println!("Datastore emulator (gRPC) listening on {}", grpc_addr);
-    println!("HTTP server listening on {}", http_addr);
+    tracing::info!("Datastore emulator (gRPC) listening on {}", grpc_addr);
+    tracing::info!("HTTP server listening on {}", http_addr);
 
     let datastore_service = DatastoreServer::new(emulator)
         .max_encoding_message_size(16 * 1024 * 1024) // 16 MB
@@ -118,20 +124,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
         } => {
             if let Err(e) = res {
-                eprintln!("One of the servers failed: {}", e);
+                tracing::error!("One of the servers failed: {}", e);
             }
         },
 
         // Branch 2: Wait for the shutdown signal (Ctrl+C)
         _ = signal::ctrl_c() => {
-            println!("\nShutdown signal received. Saving data to disk...");
+            tracing::info!("\nShutdown signal received. Saving data to disk...");
             let storage = storage_for_shutdown.lock().unwrap();
             if let Err(e) = storage.save_to_disk("datastore.bin") {
-                eprintln!("ERROR: Failed to save data to disk: {}", e);
+                tracing::error!("Failed to save data to disk: {}", e);
             }
         },
     }
 
-    println!("Shutdown complete.");
+    tracing::info!("Shutdown complete.");
     Ok(())
 }
