@@ -1,21 +1,80 @@
 use crate::database::DatastoreStorage;
+use google_cloud_storage::client::{Client, ClientConfig};
+use google_cloud_storage::http::objects::download::Range;
+use google_cloud_storage::http::objects::get::GetObjectRequest;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::io::AsyncWriteExt;
 use tracing;
+
+async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (bucket, object) = gcs_url
+        .strip_prefix("gs://")
+        .and_then(|s| s.split_once('/'))
+        .ok_or("Invalid GCS URL format")?;
+
+    tracing::info!("Downloading gs://{}/{}...", bucket, object);
+
+    // Create a client.
+    // The `with_auth()` method tries to authenticate using multiple sources.
+    let config = ClientConfig::default().with_auth().await?;
+    let client = Client::new(config);
+
+    // Get the object
+    let file_bytes = client
+        .download_object(
+            &GetObjectRequest {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                ..Default::default()
+            },
+            &Range::default(),
+        )
+        .await?;
+
+    // Create a temporary file to store the download
+    let file_name = object.split('/').last().unwrap_or("datastore_export.zip");
+    let mut temp_path = std::env::temp_dir();
+    temp_path.push(file_name);
+
+    let local_path_str = temp_path.to_str().ok_or("Invalid temp path")?.to_string();
+
+    let mut dest = tokio::fs::File::create(&temp_path).await?;
+
+    // Write the content to the file
+    dest.write_all(&file_bytes).await?;
+    dest.flush().await?;
+
+    tracing::info!("Downloaded to {}", &local_path_str);
+
+    Ok(local_path_str)
+}
 
 pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: String) {
     tracing::info!("Importing data from {:?} in the background...", input_url);
-    // check if the file exists,
-    // todo: download the file if it does not exist
-    let path = std::path::Path::new(&input_url);
-    if !path.exists() {
-        tracing::warn!("File {:?} does not exist.", input_url);
-        return;
-    }
+
+    let local_file_path = if input_url.starts_with("gs://") {
+        match download_gcs_file(&input_url).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to download file from GCS: {}", e);
+                return;
+            }
+        }
+    } else {
+        // It's a local file, check if it exists
+        let path = std::path::Path::new(&input_url);
+        if !path.exists() {
+            tracing::warn!("File {:?} does not exist.", input_url);
+            return;
+        }
+        input_url.clone()
+    };
+
     let folder_name = "dump";
     // unzip the file into the dump directory at dump path as this lib create folder
-    if let Ok(_) = extract_file(input_url.clone()) {
-        tracing::info!("File {:?} extracted successfully.", input_url);
+    if let Ok(_) = extract_file(local_file_path.clone()) {
+        tracing::info!("File {:?} extracted successfully.", local_file_path);
 
         let start = Instant::now();
         let mut storage = storage.lock().unwrap();
@@ -30,7 +89,8 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
         let seconds = humanized_duration % 60.0;
         tracing::info!(
             "Imported entities in {:02}:{:02} minutes",
-            minutes as u64, seconds as u64
+            minutes as u64,
+            seconds as u64
         );
         // Clean up the dump directory
         if let Err(e) = std::fs::remove_dir_all(folder_name) {
@@ -39,8 +99,21 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
             tracing::info!("Dump directory cleaned up successfully.");
         }
     } else {
-        tracing::error!("Failed to extract file {:?}", input_url);
+        tracing::error!("Failed to extract file {:?}", local_file_path);
         return;
+    }
+
+    // Clean up downloaded file if it was from GCS
+    if input_url.starts_with("gs://") {
+        if let Err(e) = std::fs::remove_file(&local_file_path) {
+            tracing::warn!(
+                "Failed to remove temporary downloaded file {}: {}",
+                local_file_path,
+                e
+            );
+        } else {
+            tracing::info!("Temporary downloaded file {} removed.", local_file_path);
+        }
     }
 
     tracing::info!("Background import completed.");
