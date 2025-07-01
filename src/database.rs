@@ -262,15 +262,10 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
 }
 
 pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
-    let entity_dump_path = std::path::PathBuf::from(export_dir).join("exports");
-
     tracing::info!(
         "Reading datastore export from: {}",
-        entity_dump_path.display()
+        export_dir
     );
-    let export_dir = entity_dump_path
-        .to_str()
-        .expect("Invalid export directory path");
     let overall_metadata = read_overall_metadata(export_dir);
     if let Some(metadata) = overall_metadata {
         let entity_protos: Vec<EntityProto> = metadata
