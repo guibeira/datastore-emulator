@@ -12,6 +12,7 @@ use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::{
     property_order, ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value,
 };
+use chrono::DateTime;
 use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
@@ -31,6 +32,7 @@ const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (&a.value_type, &b.value_type) {
+        (Some(ValueType::NullValue(_)), Some(ValueType::NullValue(_))) => Ordering::Equal,
         (Some(ValueType::IntegerValue(av)), Some(ValueType::IntegerValue(bv))) => av.cmp(bv),
         (Some(ValueType::DoubleValue(av)), Some(ValueType::DoubleValue(bv))) => {
             av.partial_cmp(bv).unwrap_or(Ordering::Equal)
@@ -41,10 +43,55 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
             .seconds
             .cmp(&bv.seconds)
             .then_with(|| av.nanos.cmp(&bv.nanos)),
+        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
+            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
+        }
+        (Some(ValueType::GeoPointValue(av)), Some(ValueType::GeoPointValue(bv))) => av
+            .latitude
+            .partial_cmp(&bv.latitude)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                av.longitude
+                    .partial_cmp(&bv.longitude)
+                    .unwrap_or(Ordering::Equal)
+            }),
         // Add other types if necessary, and handle type mismatches
         // For now, unequal types are considered equal for sorting purposes, which is a simplification.
         _ => Ordering::Equal,
     }
+}
+
+fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(value_type) = &value.value_type {
+        let mut process_value = |v_type: &ValueType| match v_type {
+            ValueType::StringValue(s) => values.push(s.clone()),
+            ValueType::IntegerValue(i) => values.push(i.to_string()),
+            ValueType::DoubleValue(d) => values.push(d.to_string()),
+            ValueType::BooleanValue(b) => values.push(b.to_string()),
+            ValueType::TimestampValue(t) => {
+                if let Some(dt) = DateTime::from_timestamp(t.seconds, t.nanos as u32) {
+                    values.push(dt.to_rfc3339())
+                }
+            }
+            ValueType::KeyValue(k) => {
+                values.push(format!("{:?}", KeyStruct::from_datastore_key(k)))
+            }
+            _ => {} // Other types not indexed
+        };
+
+        match value_type {
+            ValueType::ArrayValue(array_value) => {
+                for v in &array_value.values {
+                    if let Some(inner_value_type) = &v.value_type {
+                        process_value(inner_value_type);
+                    }
+                }
+            }
+            other => process_value(other),
+        }
+    }
+    values
 }
 
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
@@ -522,24 +569,15 @@ impl DatastoreStorage {
             HashMap::new();
         for (key_struct, metadata) in &self.entities {
             for (prop_name, prop_value) in &metadata.entity.properties {
-                if let Some(value_type) = &prop_value.value_type {
-                    // Extract a value as string for indexing
-                    let value_str = match value_type {
-                        crate::google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
-                        crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
-                            i.to_string()
-                        }
-                        // todo: implement other types
-                        _ => continue,
-                    };
-
-                    // Get the kind of the entity
+                if !prop_value.exclude_from_indexes {
                     if let Some((kind, _)) = key_struct.path_elements.last() {
-                        let index_key = (kind.clone(), prop_name.clone(), value_str);
-                        new_indexes
-                            .entry(index_key)
-                            .or_default()
-                            .insert(key_struct.clone());
+                        for value_str in get_indexable_strings_for_value(prop_value) {
+                            let index_key = (kind.clone(), prop_name.clone(), value_str);
+                            new_indexes
+                                .entry(index_key)
+                                .or_default()
+                                .insert(key_struct.clone());
+                        }
                     }
                 }
             }
@@ -1098,24 +1136,15 @@ impl DatastoreStorage {
     pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // For each property of an entity, creates an index
         for (prop_name, prop_value) in &entity.properties {
-            if let Some(value_type) = &prop_value.value_type {
-                // Extract a value as string for indexing
-                let value_str = match value_type {
-                    crate::google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
-                    crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
-                        i.to_string()
-                    }
-                    // todo: implement other types
-                    _ => continue,
-                };
-
-                // Get the kind of the entity
+            if !prop_value.exclude_from_indexes {
                 if let Some((kind, _)) = key_struct.path_elements.last() {
-                    let index_key = (kind.clone(), prop_name.clone(), value_str);
-                    self.indexes
-                        .entry(index_key)
-                        .or_default()
-                        .insert(key_struct.clone());
+                    for value_str in get_indexable_strings_for_value(prop_value) {
+                        let index_key = (kind.clone(), prop_name.clone(), value_str);
+                        self.indexes
+                            .entry(index_key)
+                            .or_default()
+                            .insert(key_struct.clone());
+                    }
                 }
             }
         }
@@ -1124,27 +1153,18 @@ impl DatastoreStorage {
     pub fn remove_from_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // For each property of an entity, remove its KeyStruct from the index
         for (prop_name, prop_value) in &entity.properties {
-            if let Some(value_type) = &prop_value.value_type {
-                // Extract a value as string for indexing
-                let value_str = match value_type {
-                    crate::google::datastore::v1::value::ValueType::StringValue(s) => s.clone(),
-                    crate::google::datastore::v1::value::ValueType::IntegerValue(i) => {
-                        i.to_string()
-                    }
-                    // todo: implement other types
-                    _ => continue,
-                };
-
-                // Get the kind of the entity
+            if !prop_value.exclude_from_indexes {
                 if let Some((kind, _)) = key_struct.path_elements.last() {
-                    let index_key = (kind.clone(), prop_name.clone(), value_str);
-                    if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                        indexed_keys_set.remove(key_struct);
-                        // Optional: if indexed_keys_set is empty after removal,
-                        // we could remove the index_key itself from self.indexes.
-                        // if indexed_keys_set.is_empty() {
-                        //     self.indexes.remove(&index_key);
-                        // }
+                    for value_str in get_indexable_strings_for_value(prop_value) {
+                        let index_key = (kind.clone(), prop_name.clone(), value_str);
+                        if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                            indexed_keys_set.remove(key_struct);
+                            // Optional: if indexed_keys_set is empty after removal,
+                            // we could remove the index_key itself from self.indexes.
+                            // if indexed_keys_set.is_empty() {
+                            //     self.indexes.remove(&index_key);
+                            // }
+                        }
                     }
                 }
             }
