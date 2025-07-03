@@ -261,7 +261,8 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
 
 pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
     let mut metadata_file = None;
-    for entry in std::fs::read_dir(export_dir).expect("Failed to read export directory") {
+    let path_to_search = std::path::Path::new(export_dir).join("exports");
+    for entry in std::fs::read_dir(path_to_search).expect("Failed to read export directory") {
         let entry = entry.expect("Failed to read directory entry");
         if entry
             .file_name()
@@ -324,7 +325,7 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     .as_ref()
                     .map_or_else(String::new, |k| k.kind.clone());
                 tracing::info!("Processing kind: {}", kind_name);
-                let metadata_path = std::path::PathBuf::from(export_dir).join(&export_entry.path);
+                let metadata_path = std::path::PathBuf::from(export_dir).join("exports").join(&export_entry.path);
 
                 if !metadata_path.exists() {
                     tracing::error!(
@@ -1043,7 +1044,7 @@ impl DatastoreStorage {
         let is_keys_only = !projection.is_empty()
             && projection
                 .iter()
-                .all(|p| p.property.as_ref().map_or(false, |pr| pr.name == "__key__"));
+                .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
 
         for (_key_struct, entity_metadata) in filtered_entities.iter().skip(start) {
             items_processed_from_start += 1;

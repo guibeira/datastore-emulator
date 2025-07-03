@@ -1,4 +1,6 @@
 use crate::database::DatastoreStorage;
+use crate::operation::{Operations, OperationStatus};
+use chrono::Utc;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
@@ -33,7 +35,7 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
         .await?;
 
     // Create a temporary file to store the download
-    let file_name = object.split('/').last().unwrap_or("datastore_export.zip");
+    let file_name = object.split('/').next_back().unwrap_or("datastore_export.zip");
     let mut temp_path = std::env::temp_dir();
     temp_path.push(file_name);
 
@@ -50,7 +52,12 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
     Ok(local_path_str)
 }
 
-pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: String) {
+pub async fn bg_import_data(
+    storage: Arc<Mutex<DatastoreStorage>>,
+    operations: Operations,
+    operation_id: String,
+    input_url: String,
+) {
     tracing::info!("Importing data from {:?} in the background...", input_url);
 
     let local_file_path = if input_url.starts_with("gs://") {
@@ -58,6 +65,12 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Failed to download file from GCS: {}", e);
+                let mut operations = operations.lock().unwrap();
+                if let Some(state) = operations.get_mut(&operation_id) {
+                    state.status = OperationStatus::Failed;
+                    state.end_time = Some(Utc::now());
+                    state.error = Some(e.to_string());
+                }
                 return;
             }
         }
@@ -66,6 +79,12 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
         let path = std::path::Path::new(&input_url);
         if !path.exists() {
             tracing::warn!("File {:?} does not exist.", input_url);
+            let mut operations = operations.lock().unwrap();
+            if let Some(state) = operations.get_mut(&operation_id) {
+                state.status = OperationStatus::Failed;
+                state.end_time = Some(Utc::now());
+                state.error = Some(format!("File not found: {}", input_url));
+            }
             return;
         }
         input_url.clone()
@@ -80,8 +99,19 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
         let mut storage = storage.lock().unwrap();
         if let Ok(_) = storage.import_dump(folder_name) {
             tracing::info!("Entities imported successfully from dump directory.");
+            let mut operations = operations.lock().unwrap();
+            if let Some(state) = operations.get_mut(&operation_id) {
+                state.status = OperationStatus::Successful;
+                state.end_time = Some(Utc::now());
+            }
         } else {
             tracing::error!("Failed to import entities from dump directory.");
+            let mut operations = operations.lock().unwrap();
+            if let Some(state) = operations.get_mut(&operation_id) {
+                state.status = OperationStatus::Failed;
+                state.end_time = Some(Utc::now());
+                state.error = Some("Failed to import entities".to_string());
+            }
         }
         let duration = start.elapsed();
         let humanized_duration = duration.as_secs_f64();
@@ -100,6 +130,12 @@ pub async fn bg_import_data(storage: Arc<Mutex<DatastoreStorage>>, input_url: St
         }
     } else {
         tracing::error!("Failed to extract file {:?}", local_file_path);
+        let mut operations = operations.lock().unwrap();
+        if let Some(state) = operations.get_mut(&operation_id) {
+            state.status = OperationStatus::Failed;
+            state.end_time = Some(Utc::now());
+            state.error = Some(format!("Failed to extract file {}", local_file_path));
+        }
         return;
     }
 

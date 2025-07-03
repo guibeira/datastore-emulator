@@ -1,13 +1,16 @@
-use crate::database::DatastoreStorage;
 use crate::import::bg_import_data;
+use crate::operation::{OperationState, OperationStatus};
+use crate::state::AppState;
 use axum::{
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
     Json, Router,
     extract::{Path, State},
     routing::post,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -18,13 +21,6 @@ pub struct WelcomeRequest {
 #[derive(Serialize)]
 pub struct WelcomeResponse {
     pub msg: String,
-}
-
-pub async fn welcome_handler(Json(payload): Json<WelcomeRequest>) -> Json<WelcomeResponse> {
-    let response = WelcomeResponse {
-        msg: format!("welcome {}", payload.name),
-    };
-    Json(response)
 }
 
 #[derive(Deserialize)]
@@ -60,7 +56,7 @@ pub struct CommonMetadata {
 }
 
 pub async fn import_handler(
-    State(storage): State<Arc<Mutex<DatastoreStorage>>>,
+    State(state): State<AppState>,
     Path(project_id): Path<String>,
     Json(payload): Json<ImportRequest>,
 ) -> Json<ImportResponse> {
@@ -71,7 +67,23 @@ pub async fn import_handler(
         .to_string();
     let _action_parameter = path_parameters.next().unwrap_or("import").to_string();
     let operation_id = Uuid::new_v4().to_string();
-    tokio::spawn(bg_import_data(storage.clone(), payload.input_url.clone())); // Start background import task
+    let operation_state = OperationState {
+        status: OperationStatus::Processing,
+        start_time: Utc::now(),
+        end_time: None,
+        error: None,
+    };
+    state
+        .operations
+        .lock()
+        .unwrap()
+        .insert(operation_id.clone(), operation_state);
+    tokio::spawn(bg_import_data(
+        state.storage.clone(),
+        state.operations.clone(),
+        operation_id.clone(),
+        payload.input_url.clone(),
+    ));
     let response = ImportResponse {
         name: format!("projects/{}/operations/{}", project_id, operation_id),
         metadata: ImportMetadata {
@@ -89,9 +101,24 @@ pub async fn import_handler(
     Json(response)
 }
 
-pub fn create_router(storage: Arc<Mutex<DatastoreStorage>>) -> Router {
+pub async fn get_operation_status(
+    State(state): State<AppState>,
+    Path((_project_id, operation_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let operations = state.operations.lock().unwrap();
+    if let Some(state) = operations.get(&operation_id) {
+        (StatusCode::OK, Json(state.clone())).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Operation not found").into_response()
+    }
+}
+
+pub fn create_router(state: AppState) -> Router {
     Router::new()
-        .route("/", post(welcome_handler))
         .route("/v1/projects/:project_id", post(import_handler))
-        .with_state(storage)
+        .route(
+            "/v1/projects/:project_id/operations/:operation_id",
+            get(get_operation_status),
+        )
+        .with_state(state)
 }
