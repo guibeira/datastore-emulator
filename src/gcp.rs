@@ -91,8 +91,7 @@ impl DatastoreService for DatastoreEmulator {
             }
         };
         let kind_name = query_obj
-            .kind
-            .get(0)
+            .kind.first()
             .map(|k| k.name.clone())
             .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
 

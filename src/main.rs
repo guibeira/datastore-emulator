@@ -1,12 +1,13 @@
 use crate::api::create_router;
 use crate::google::datastore::v1::datastore_server::DatastoreServer;
+use crate::state::AppState;
 use clap::Parser;
 use database::DatastoreStorage;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::signal; // Import the tokio signal module
 use tonic::transport::Server;
-use tracing;
 use tracing_subscriber::EnvFilter;
 
 pub mod api;
@@ -14,6 +15,8 @@ pub mod database;
 pub mod gcp;
 pub mod import;
 pub mod leveldb;
+pub mod operation;
+pub mod state;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -102,7 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
     let emulator = DatastoreEmulator::new(store_on_disk);
-    let storage_for_http = emulator.storage.clone();
+    let app_state = AppState {
+        storage: emulator.storage.clone(),
+        operations: Arc::new(Mutex::new(HashMap::new())),
+    };
     let storage_for_shutdown = emulator.storage.clone(); // Clone for the shutdown handler
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -112,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // --- HTTP Server Setup ---
     let http_addr: SocketAddr = format!("{}:{}", cli.http_host, cli.http_port).parse()?;
-    let http_router = create_router(storage_for_http);
+    let http_router = create_router(app_state.clone());
     let http_server = axum::Server::bind(&http_addr).serve(http_router.into_make_service());
 
     tracing::info!("Datastore emulator (gRPC) listening on {}", grpc_addr);
@@ -151,13 +157,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Branch 2: Wait for the shutdown signal (Ctrl+C)
         _ = signal::ctrl_c() => {
             if store_on_disk {
-                tracing::info!("\nShutdown signal received. Saving data to disk...");
+                tracing::info!("
+Shutdown signal received. Saving data to disk...");
                 let storage = storage_for_shutdown.lock().unwrap();
                 if let Err(e) = storage.save_to_disk("datastore.bin") {
                     tracing::error!("Failed to save data to disk: {}", e);
                 }
             } else {
-                tracing::info!("\nShutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
+                tracing::info!("
+Shutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
             }
         },
     }
