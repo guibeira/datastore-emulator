@@ -1,5 +1,5 @@
 use crate::database::DatastoreStorage;
-use crate::operation::{Operations, OperationStatus};
+use crate::operation::{OperationStatus, Operations};
 use chrono::Utc;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
@@ -35,7 +35,10 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
         .await?;
 
     // Create a temporary file to store the download
-    let file_name = object.split('/').next_back().unwrap_or("datastore_export.zip");
+    let file_name = object
+        .split('/')
+        .next_back()
+        .unwrap_or("datastore_export.zip");
     let mut temp_path = std::env::temp_dir();
     temp_path.push(file_name);
 
@@ -76,6 +79,7 @@ pub async fn bg_import_data(
         }
     } else {
         // It's a local file, check if it exists
+        tracing::info!("Using local file path: {:?}", input_url);
         let path = std::path::Path::new(&input_url);
         if !path.exists() {
             tracing::warn!("File {:?} does not exist.", input_url);
