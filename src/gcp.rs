@@ -1,7 +1,6 @@
 use crate::DatastoreEmulator;
 use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
 use crate::google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
-use tracing;
 use crate::google::datastore::v1::datastore_server::Datastore as DatastoreService;
 use crate::google::datastore::v1::{
     AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest,
@@ -17,6 +16,7 @@ use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 use tonic::{Request, Response, Status};
+use tracing;
 
 #[tonic::async_trait]
 impl DatastoreService for DatastoreEmulator {
@@ -91,10 +91,10 @@ impl DatastoreService for DatastoreEmulator {
             }
         };
         let kind_name = query_obj
-            .kind.first()
+            .kind
+            .first()
             .map(|k| k.name.clone())
             .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
-
         let batch = storage.get_entities(
             req.project_id.clone(),
             kind_name,
@@ -667,9 +667,7 @@ impl DatastoreService for DatastoreEmulator {
                 // Check if the entity is found (key should always be present in EntityWithMetadata)
                 if entity_metadata.entity.key.is_none() {
                     // This case should ideally not happen if data is consistent
-                    tracing::warn!(
-                        "Entity found in storage without a key in its Entity struct."
-                    );
+                    tracing::warn!("Entity found in storage without a key in its Entity struct.");
                     continue;
                 }
 

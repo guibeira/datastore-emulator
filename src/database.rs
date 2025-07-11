@@ -1,6 +1,7 @@
 use crate::google::datastore::import_export::datastore_v3::{
     EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
 };
+use crate::google::datastore::v1::key::PathElement;
 use tracing;
 
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
@@ -10,7 +11,7 @@ use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::query_result_batch::MoreResultsType;
 use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::{
-    property_order, ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value,
+    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value, property_order,
 };
 use chrono::DateTime;
 use prost::Message;
@@ -22,13 +23,14 @@ use std::sync::{Arc, Mutex};
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use bincode;
-use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
+const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (&a.value_type, &b.value_type) {
@@ -291,7 +293,10 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
                                 return Some(metadata); // Returning the metadata
                             }
                             Err(decode_err) => {
-                                tracing::error!("Failed to decode OverallExportMetadata: {}", decode_err);
+                                tracing::error!(
+                                    "Failed to decode OverallExportMetadata: {}",
+                                    decode_err
+                                );
                             }
                         }
                     }
@@ -310,10 +315,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
 }
 
 pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
-    tracing::info!(
-        "Reading datastore export from: {}",
-        export_dir
-    );
+    tracing::info!("Reading datastore export from: {}", export_dir);
     let overall_metadata = read_overall_metadata(export_dir);
     if let Some(metadata) = overall_metadata {
         let entity_protos: Vec<EntityProto> = metadata
@@ -325,7 +327,9 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     .as_ref()
                     .map_or_else(String::new, |k| k.kind.clone());
                 tracing::info!("Processing kind: {}", kind_name);
-                let metadata_path = std::path::PathBuf::from(export_dir).join("exports").join(&export_entry.path);
+                let metadata_path = std::path::PathBuf::from(export_dir)
+                    .join("exports")
+                    .join(&export_entry.path);
 
                 if !metadata_path.exists() {
                     tracing::error!(
@@ -347,7 +351,11 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     })
                     .and_then(|data| {
                         ExportMetadata::decode(&data[..]).map_err(|e| {
-                            tracing::error!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                            tracing::error!(
+                                "Failed to decode ExportMetadata for {}: {}",
+                                kind_name,
+                                e
+                            );
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                         })
                     }) {
@@ -395,10 +403,16 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                                     }
                                 }
                             } else {
-                                tracing::error!("Error opening file: {}", output_file_path.display());
+                                tracing::error!(
+                                    "Error opening file: {}",
+                                    output_file_path.display()
+                                );
                             }
                         } else {
-                            tracing::error!("Output file {} does not exist.", output_file_path.display());
+                            tracing::error!(
+                                "Output file {} does not exist.",
+                                output_file_path.display()
+                            );
                         }
                         protos_in_file
                     })
@@ -961,7 +975,45 @@ impl DatastoreStorage {
 
         self.entities.get(&key_struct).cloned()
     }
+    fn get_metadata(&self, metadata_key: &str) -> Vec<EntityResult> {
+        let mut results = vec![];
 
+        match metadata_key {
+            "__kind__" => {
+                for (key_struct, entity_metadata) in &self.entities {
+                    if let Some((kind, _)) = key_struct.path_elements.last() {
+                        let entity = EntityResult {
+                            entity: Some(Entity {
+                                properties: HashMap::new(),
+                                key: Some(Key {
+                                    partition_id: Some(PartitionId {
+                                        project_id: key_struct.project_id.clone(),
+                                        namespace_id: key_struct.namespace.clone(),
+                                        database_id: "".to_string(), // Placeholder
+                                    }),
+                                    path: vec![PathElement {
+                                        kind: "__kind__".to_string(),
+                                        id_type: Some(IdType::Name(kind.clone())),
+                                    }],
+                                }),
+                            }),
+
+                            version: 0,
+                            create_time: None,
+                            update_time: None,
+                            cursor: vec![],
+                        };
+                        results.push(entity);
+                    }
+                }
+            }
+            _ => {
+                // For other metadata kinds, return an empty result set
+                tracing::warn!("Unsupported metadata kind: {}", metadata_key);
+            }
+        }
+        results
+    }
     pub fn get_entities(
         &self,
         project_id_filter: String,
@@ -973,6 +1025,22 @@ impl DatastoreStorage {
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
         // 1. Filter entities
+        if METADATA_KINDS.contains(&kind_name.as_str()) {
+            // If the kind is a metadata kind, we return an empty result set
+            let mut results = self.get_metadata(&kind_name);
+
+            return crate::google::datastore::v1::QueryResultBatch {
+                entity_result_type: 0, // EMPTY
+                skipped_results: 0,
+                read_time: None,
+                skipped_cursor: vec![],
+                snapshot_version: 0,
+                entity_results: results,
+                more_results: MoreResultsType::NoMoreResults as i32,
+                end_cursor: vec![],
+            };
+        }
+
         let mut filtered_entities: Vec<_> = self
             .entities
             .iter()
