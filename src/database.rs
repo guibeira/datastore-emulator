@@ -809,24 +809,24 @@ impl DatastoreStorage {
 
                             if let Some(entity_value) = entity_value_opt {
                                 match property_filter.op {
-                                    0 => return true, // OPERATOR_UNSPECIFIED
+                                    0 => true, // OPERATOR_UNSPECIFIED
                                     1 => {
                                         // LESS_THAN
-                                        return compare_values(&entity_value, filter_value).is_lt();
+                                        compare_values(&entity_value, filter_value).is_lt()
                                     }
                                     2 => {
                                         // LESS_THAN_OR_EQUAL
-                                        return compare_values(&entity_value, filter_value).is_le();
+                                        compare_values(&entity_value, filter_value).is_le()
                                     }
                                     3 => {
                                         // GREATER_THAN
-                                        return compare_values(&entity_value, filter_value).is_gt();
+                                        compare_values(&entity_value, filter_value).is_gt()
                                     }
                                     4 => {
                                         // GREATER_THAN_OR_EQUAL
-                                        return compare_values(&entity_value, filter_value).is_ge();
+                                        compare_values(&entity_value, filter_value).is_ge()
                                     }
-                                    5 => return entity_value.value_type == filter_value.value_type, // EQUAL
+                                    5 => entity_value.value_type == filter_value.value_type, // EQUAL
                                     6 => {
                                         // IN
                                         if let Some(ValueType::ArrayValue(array_value)) =
@@ -837,9 +837,9 @@ impl DatastoreStorage {
                                                 .iter()
                                                 .any(|v| v.value_type == entity_value.value_type);
                                         }
-                                        return false;
+                                        false
                                     }
-                                    9 => return entity_value.value_type != filter_value.value_type, // NOT_EQUAL
+                                    9 => entity_value.value_type != filter_value.value_type, // NOT_EQUAL
                                     // Case 11 (HAS_ANCESTOR) is handled above
                                     13 => {
                                         // NOT_IN
@@ -851,13 +851,13 @@ impl DatastoreStorage {
                                                 .iter()
                                                 .any(|v| v.value_type == entity_value.value_type);
                                         }
-                                        return true;
+                                        true
                                     }
-                                    _ => return false, // Unsupported operator for property or op combination
+                                    _ => false, // Unsupported operator for property or op combination
                                 }
                             } else {
                                 // Property not found in entity for regular filters (and not HAS_ANCESTOR)
-                                return false;
+                                false
                             }
                         }
                     } else {
