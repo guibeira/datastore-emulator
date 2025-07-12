@@ -18,7 +18,7 @@ def rust_client():
     db_client.base_url = "http://localhost:8042"
     yield db_client
     # Cleanup after test
-    for kind in ["TaskTest", "Family", "User"]:
+    for kind in ["TaskTest", "Family", "User", "TestKind1", "TestKind2"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
@@ -39,11 +39,125 @@ def google_client():
         db_client.base_url = "http://localhost:8044"
     yield db_client
     # Cleanup after test
-    for kind in ["TaskTest", "Family", "User"]:
+    for kind in ["TaskTest", "Family", "User", "TestKind1", "TestKind2"]:
         query = db_client.query(kind=kind)
         keys_to_delete = [entity.key for entity in query.fetch()]
         if keys_to_delete:
             db_client.delete_multi(keys_to_delete)
+
+
+def test_multi_client_kind_metadata_query(google_client, rust_client):
+    """
+    Tests whether two clients connected to different emulator instances
+    can filter and order metadata queries.
+    """
+    # Insert items of different kinds for future metadata query
+    kinds = ["Family", "TaskTest", "User"]
+    for client in [rust_client, google_client]:
+        for kind in kinds:
+            key = client.key(kind, f"test-entity-{uuid.uuid4()}")
+            entity = datastore.Entity(key=key)
+            entity["description"] = "Description"
+            client.put(entity)
+
+    # Rust client
+    rust_query = rust_client.query(kind="__kind__")
+    # Filter for kinds greater than "Family"
+    rust_results = list(rust_query.fetch())
+    rust_kind_names = [e.key.name for e in rust_results]
+
+    # Google client
+    google_query = google_client.query(kind="__kind__")
+    google_results = list(google_query.fetch())
+    google_kind_names = [e.key.name for e in google_results]
+
+    # --- Assertions ---
+    for kind in kinds:
+        assert kind in rust_kind_names
+        assert kind in google_kind_names
+
+
+def test_multi_client_namespace_query(google_client, rust_client):
+    """
+    Tests __namespace__ metadata queries.
+    """
+    # Insert entities into different namespaces
+    for client in [rust_client, google_client]:
+        # Default namespace
+        key1 = client.key("TaskTest", "task1")
+        entity1 = datastore.Entity(key=key1)
+        client.put(entity1)
+
+        # Custom namespace
+        key2 = client.key("TaskTest", "task2", namespace="my-namespace")
+        entity2 = datastore.Entity(key=key2)
+        client.put(entity2)
+
+    # --- Query for namespaces ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        query = client.query(kind="__namespace__")
+        query.keys_only()
+        # The key for default namespace is ID 1. id_or_name returns the ID.
+        # The key for custom namespace is its name. id_or_name returns the name.
+        namespaces = {e.key.id_or_name for e in query.fetch()}
+        results[client_name] = namespaces
+
+    # --- Assertions ---
+    # The default namespace is represented by key with ID 1.
+    # The custom namespace is represented by key with name 'my-namespace'.
+    expected_namespaces = {1, "my-namespace"}
+    assert results["rust"] == expected_namespaces
+    assert results["google"] == expected_namespaces
+    assert results["rust"] == results["google"]
+
+
+def test_multi_client_property_query(google_client, rust_client):
+    """
+    Tests __property__ metadata queries.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+    for client in [rust_client, google_client]:
+        # Kind 'TestKind1'
+        key1 = client.key("TestKind1", f"tk1-{test_id}")
+        entity1 = datastore.Entity(key=key1)
+        entity1.update(
+            {
+                "prop_str": "hello",
+                "prop_int": 123,
+                "prop_bool": True,
+            }
+        )
+        client.put(entity1)
+
+    # --- Query for all properties ---
+    results = {}
+    for client_name, client in [("rust", rust_client), ("google", google_client)]:
+        props_by_kind = {}
+        ancestor = client.key("__kind__", "TestKind1")
+        query = client.query(kind="__property__", ancestor=ancestor)
+
+        # query = client.query(kind="__property__")
+        for entity in query.fetch():
+            kind = entity.key.parent.name
+            prop_name = entity.key.name
+            representations = sorted(entity.get("property_representation", []))
+            if kind not in props_by_kind:
+                props_by_kind[kind] = {}
+            props_by_kind[kind][prop_name] = representations
+
+        results[client_name] = props_by_kind
+
+    # --- Assertions for all properties ---
+    expected = {
+        "TestKind1": {
+            "prop_str": ["STRING"],
+            "prop_int": ["INT64"],
+            "prop_bool": ["BOOLEAN"],
+        },
+    }
+    assert results["rust"] == expected
+    assert results["google"] == expected
 
 
 def test_multi_client_insert_isolation(google_client, rust_client):
