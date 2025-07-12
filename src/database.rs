@@ -1,6 +1,7 @@
 use crate::google::datastore::import_export::datastore_v3::{
     EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
 };
+use crate::google::datastore::v1::key::PathElement;
 use tracing;
 
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
@@ -10,7 +11,7 @@ use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::query_result_batch::MoreResultsType;
 use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::{
-    property_order, ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value,
+    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value, property_order,
 };
 use chrono::DateTime;
 use prost::Message;
@@ -22,13 +23,38 @@ use std::sync::{Arc, Mutex};
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use bincode;
-use serde::{de::Error, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
+const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
+
+fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
+    let mut representations = Vec::new();
+    if let Some(value_type) = &value.value_type {
+        match value_type {
+            ValueType::NullValue(_) => representations.push("NULL"),
+            ValueType::BooleanValue(_) => representations.push("BOOLEAN"),
+            ValueType::IntegerValue(_) => representations.push("INT64"),
+            ValueType::DoubleValue(_) => representations.push("DOUBLE"),
+            ValueType::TimestampValue(_) => representations.push("INT64"),
+            ValueType::KeyValue(_) => representations.push("REFERENCE"),
+            ValueType::StringValue(_) => representations.push("STRING"),
+            ValueType::BlobValue(_) => representations.push("STRING"),
+            ValueType::GeoPointValue(_) => representations.push("POINT"),
+            ValueType::EntityValue(_) => representations.push("STRING"),
+            ValueType::ArrayValue(array_value) => {
+                for v in &array_value.values {
+                    representations.extend(get_representation_for_value(v));
+                }
+            }
+        }
+    }
+    representations
+}
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (&a.value_type, &b.value_type) {
@@ -291,7 +317,10 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
                                 return Some(metadata); // Returning the metadata
                             }
                             Err(decode_err) => {
-                                tracing::error!("Failed to decode OverallExportMetadata: {}", decode_err);
+                                tracing::error!(
+                                    "Failed to decode OverallExportMetadata: {}",
+                                    decode_err
+                                );
                             }
                         }
                     }
@@ -310,10 +339,7 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
 }
 
 pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
-    tracing::info!(
-        "Reading datastore export from: {}",
-        export_dir
-    );
+    tracing::info!("Reading datastore export from: {}", export_dir);
     let overall_metadata = read_overall_metadata(export_dir);
     if let Some(metadata) = overall_metadata {
         let entity_protos: Vec<EntityProto> = metadata
@@ -325,7 +351,9 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     .as_ref()
                     .map_or_else(String::new, |k| k.kind.clone());
                 tracing::info!("Processing kind: {}", kind_name);
-                let metadata_path = std::path::PathBuf::from(export_dir).join("exports").join(&export_entry.path);
+                let metadata_path = std::path::PathBuf::from(export_dir)
+                    .join("exports")
+                    .join(&export_entry.path);
 
                 if !metadata_path.exists() {
                     tracing::error!(
@@ -347,7 +375,11 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                     })
                     .and_then(|data| {
                         ExportMetadata::decode(&data[..]).map_err(|e| {
-                            tracing::error!("Failed to decode ExportMetadata for {}: {}", kind_name, e);
+                            tracing::error!(
+                                "Failed to decode ExportMetadata for {}: {}",
+                                kind_name,
+                                e
+                            );
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                         })
                     }) {
@@ -395,10 +427,16 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
                                     }
                                 }
                             } else {
-                                tracing::error!("Error opening file: {}", output_file_path.display());
+                                tracing::error!(
+                                    "Error opening file: {}",
+                                    output_file_path.display()
+                                );
                             }
                         } else {
-                            tracing::error!("Output file {} does not exist.", output_file_path.display());
+                            tracing::error!(
+                                "Output file {} does not exist.",
+                                output_file_path.display()
+                            );
                         }
                         protos_in_file
                     })
@@ -759,147 +797,68 @@ impl DatastoreStorage {
                             false
                         }
                         // Regular property filters
-                        else if let Some(entity_value) =
-                            entity_metadata.entity.properties.get(&property.name)
-                        {
-                            match property_filter.op {
-                                0 => return true, // OPERATOR_UNSPECIFIED
-                                1 => {
-                                    // LESS_THAN
-                                    match (&entity_value.value_type, &filter_value.value_type) {
-                                        (
-                                            Some(ValueType::IntegerValue(ev)),
-                                            Some(ValueType::IntegerValue(fv)),
-                                        ) => return ev < fv,
-                                        (
-                                            Some(ValueType::DoubleValue(ev)),
-                                            Some(ValueType::DoubleValue(fv)),
-                                        ) => return ev < fv,
-                                        (
-                                            Some(ValueType::StringValue(ev)),
-                                            Some(ValueType::StringValue(fv)),
-                                        ) => return ev < fv,
-                                        (
-                                            Some(ValueType::TimestampValue(ev)),
-                                            Some(ValueType::TimestampValue(fv)),
-                                        ) => {
-                                            return ev.seconds < fv.seconds
-                                                || (ev.seconds == fv.seconds
-                                                    && ev.nanos < fv.nanos);
+                        else {
+                            let entity_value_opt = if property.name == "__key__" {
+                                entity_metadata.entity.key.as_ref().map(|k| Value {
+                                    value_type: Some(ValueType::KeyValue(k.clone())),
+                                    ..Default::default()
+                                })
+                            } else {
+                                entity_metadata.entity.properties.get(&property.name).cloned()
+                            };
+
+                            if let Some(entity_value) = entity_value_opt {
+                                match property_filter.op {
+                                    0 => true, // OPERATOR_UNSPECIFIED
+                                    1 => {
+                                        // LESS_THAN
+                                        compare_values(&entity_value, filter_value).is_lt()
+                                    }
+                                    2 => {
+                                        // LESS_THAN_OR_EQUAL
+                                        compare_values(&entity_value, filter_value).is_le()
+                                    }
+                                    3 => {
+                                        // GREATER_THAN
+                                        compare_values(&entity_value, filter_value).is_gt()
+                                    }
+                                    4 => {
+                                        // GREATER_THAN_OR_EQUAL
+                                        compare_values(&entity_value, filter_value).is_ge()
+                                    }
+                                    5 => entity_value.value_type == filter_value.value_type, // EQUAL
+                                    6 => {
+                                        // IN
+                                        if let Some(ValueType::ArrayValue(array_value)) =
+                                            &filter_value.value_type
+                                        {
+                                            return array_value
+                                                .values
+                                                .iter()
+                                                .any(|v| v.value_type == entity_value.value_type);
                                         }
-                                        _ => return false, // Type mismatch or unsupported for comparison
+                                        false
                                     }
-                                }
-                                2 => {
-                                    // LESS_THAN_OR_EQUAL
-                                    match (&entity_value.value_type, &filter_value.value_type) {
-                                        (
-                                            Some(ValueType::IntegerValue(ev)),
-                                            Some(ValueType::IntegerValue(fv)),
-                                        ) => return ev <= fv,
-                                        (
-                                            Some(ValueType::DoubleValue(ev)),
-                                            Some(ValueType::DoubleValue(fv)),
-                                        ) => return ev <= fv,
-                                        (
-                                            Some(ValueType::StringValue(ev)),
-                                            Some(ValueType::StringValue(fv)),
-                                        ) => return ev <= fv,
-                                        (
-                                            Some(ValueType::TimestampValue(ev)),
-                                            Some(ValueType::TimestampValue(fv)),
-                                        ) => {
-                                            return ev.seconds < fv.seconds
-                                                || (ev.seconds == fv.seconds
-                                                    && ev.nanos <= fv.nanos);
+                                    9 => entity_value.value_type != filter_value.value_type, // NOT_EQUAL
+                                    // Case 11 (HAS_ANCESTOR) is handled above
+                                    13 => {
+                                        // NOT_IN
+                                        if let Some(ValueType::ArrayValue(array_value)) =
+                                            &filter_value.value_type
+                                        {
+                                            return !array_value
+                                                .values
+                                                .iter()
+                                                .any(|v| v.value_type == entity_value.value_type);
                                         }
-                                        _ => return false,
+                                        true
                                     }
+                                    _ => false, // Unsupported operator for property or op combination
                                 }
-                                3 => {
-                                    // GREATER_THAN
-                                    match (&entity_value.value_type, &filter_value.value_type) {
-                                        (
-                                            Some(ValueType::IntegerValue(ev)),
-                                            Some(ValueType::IntegerValue(fv)),
-                                        ) => return ev > fv,
-                                        (
-                                            Some(ValueType::DoubleValue(ev)),
-                                            Some(ValueType::DoubleValue(fv)),
-                                        ) => return ev > fv,
-                                        (
-                                            Some(ValueType::StringValue(ev)),
-                                            Some(ValueType::StringValue(fv)),
-                                        ) => return ev > fv,
-                                        (
-                                            Some(ValueType::TimestampValue(ev)),
-                                            Some(ValueType::TimestampValue(fv)),
-                                        ) => {
-                                            return ev.seconds > fv.seconds
-                                                || (ev.seconds == fv.seconds
-                                                    && ev.nanos > fv.nanos);
-                                        }
-                                        _ => return false,
-                                    }
-                                }
-                                4 => {
-                                    // GREATER_THAN_OR_EQUAL
-                                    match (&entity_value.value_type, &filter_value.value_type) {
-                                        (
-                                            Some(ValueType::IntegerValue(ev)),
-                                            Some(ValueType::IntegerValue(fv)),
-                                        ) => return ev >= fv,
-                                        (
-                                            Some(ValueType::DoubleValue(ev)),
-                                            Some(ValueType::DoubleValue(fv)),
-                                        ) => return ev >= fv,
-                                        (
-                                            Some(ValueType::StringValue(ev)),
-                                            Some(ValueType::StringValue(fv)),
-                                        ) => return ev >= fv,
-                                        (
-                                            Some(ValueType::TimestampValue(ev)),
-                                            Some(ValueType::TimestampValue(fv)),
-                                        ) => {
-                                            return ev.seconds > fv.seconds
-                                                || (ev.seconds == fv.seconds
-                                                    && ev.nanos >= fv.nanos);
-                                        }
-                                        _ => return false,
-                                    }
-                                }
-                                5 => return entity_value.value_type == filter_value.value_type, // EQUAL
-                                6 => {
-                                    // IN
-                                    if let Some(ValueType::ArrayValue(array_value)) =
-                                        &filter_value.value_type
-                                    {
-                                        return array_value
-                                            .values
-                                            .iter()
-                                            .any(|v| v.value_type == entity_value.value_type);
-                                    }
-                                    return false;
-                                }
-                                9 => return entity_value.value_type != filter_value.value_type, // NOT_EQUAL
-                                // Case 11 (HAS_ANCESTOR) is handled above
-                                13 => {
-                                    // NOT_IN
-                                    if let Some(ValueType::ArrayValue(array_value)) =
-                                        &filter_value.value_type
-                                    {
-                                        return !array_value
-                                            .values
-                                            .iter()
-                                            .any(|v| v.value_type == entity_value.value_type);
-                                    }
-                                    return true;
-                                }
-                                _ => return false, // Unsupported operator for property or op combination
+                            } else {
+                                // Property not found in entity for regular filters (and not HAS_ANCESTOR)
+                                false
                             }
-                        } else {
-                            // Property not found in entity for regular filters (and not HAS_ANCESTOR)
-                            return false;
                         }
                     } else {
                         // Filter value is missing
@@ -961,7 +920,171 @@ impl DatastoreStorage {
 
         self.entities.get(&key_struct).cloned()
     }
+    fn get_metadata(&self, metadata_key: &str, project_id: &str) -> Vec<EntityWithMetadata> {
+        let mut results = Vec::new();
 
+        match metadata_key {
+            "__kind__" => {
+                let mut unique_kinds = HashSet::new();
+                for key_struct in self.entities.keys() {
+                    // TODO: This should also filter by namespace from the query
+                    if key_struct.project_id == project_id {
+                        if let Some((kind, _)) = key_struct.path_elements.last() {
+                            unique_kinds.insert((
+                                kind.clone(),
+                                key_struct.project_id.clone(),
+                                key_struct.namespace.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                results = unique_kinds
+                    .into_iter()
+                    .map(|(kind, project_id, namespace)| EntityWithMetadata {
+                        version: 1,
+                        create_time: prost_types::Timestamp::default(),
+                        update_time: prost_types::Timestamp::default(),
+                        entity: Entity {
+                            properties: HashMap::new(),
+                            key: Some(Key {
+                                partition_id: Some(PartitionId {
+                                    project_id,
+                                    namespace_id: namespace,
+                                    database_id: "".to_string(),
+                                }),
+                                path: vec![PathElement {
+                                    kind: "__kind__".to_string(),
+                                    id_type: Some(IdType::Name(kind)),
+                                }],
+                            }),
+                        },
+                    })
+                    .collect();
+            }
+            "__namespace__" => {
+                let mut unique_namespaces = HashSet::new();
+                for key_struct in self.entities.keys() {
+                    if key_struct.project_id == project_id {
+                        unique_namespaces.insert(key_struct.namespace.clone());
+                    }
+                }
+
+                results = unique_namespaces
+                    .into_iter()
+                    .map(|namespace| {
+                        let id_type = if namespace.is_empty() {
+                            IdType::Id(1)
+                        } else {
+                            IdType::Name(namespace)
+                        };
+                        EntityWithMetadata {
+                            version: 1,
+                            create_time: prost_types::Timestamp::default(),
+                            update_time: prost_types::Timestamp::default(),
+                            entity: Entity {
+                                properties: HashMap::new(),
+                                key: Some(Key {
+                                    partition_id: Some(PartitionId {
+                                        project_id: project_id.to_string(),
+                                        namespace_id: "".to_string(),
+                                        database_id: "".to_string(),
+                                    }),
+                                    path: vec![PathElement {
+                                        kind: "__namespace__".to_string(),
+                                        id_type: Some(id_type),
+                                    }],
+                                }),
+                            },
+                        }
+                    })
+                    .collect();
+            }
+            "__property__" => {
+                // map from (kind, property_name, namespace) to set of representations
+                let mut props_by_kind: HashMap<(String, String, String), HashSet<&'static str>> =
+                    HashMap::new();
+
+                for (key_struct, entity_meta) in &self.entities {
+                    if key_struct.project_id != project_id {
+                        continue;
+                    }
+                    // TODO: This should be filtered by the query's namespace.
+                    if let Some((kind, _)) = key_struct.path_elements.last() {
+                        for (prop_name, prop_value) in &entity_meta.entity.properties {
+                            if !prop_value.exclude_from_indexes {
+                                let representations = get_representation_for_value(prop_value);
+                                let entry = props_by_kind
+                                    .entry((
+                                        kind.clone(),
+                                        prop_name.clone(),
+                                        key_struct.namespace.clone(),
+                                    ))
+                                    .or_default();
+                                entry.extend(representations);
+                            }
+                        }
+                    }
+                }
+
+                results = props_by_kind
+                    .into_iter()
+                    .map(|((kind, prop_name, namespace), representations)| {
+                        let property_key = Key {
+                            partition_id: Some(PartitionId {
+                                project_id: project_id.to_string(),
+                                namespace_id: namespace,
+                                database_id: "".to_string(),
+                            }),
+                            path: vec![
+                                PathElement {
+                                    kind: "__kind__".to_string(),
+                                    id_type: Some(IdType::Name(kind)),
+                                },
+                                PathElement {
+                                    kind: "__property__".to_string(),
+                                    id_type: Some(IdType::Name(prop_name)),
+                                },
+                            ],
+                        };
+
+                        let mut properties = HashMap::new();
+                        let array_values: Vec<Value> = representations
+                            .into_iter()
+                            .map(|rep| Value {
+                                value_type: Some(ValueType::StringValue(rep.to_string())),
+                                ..Default::default()
+                            })
+                            .collect();
+                        properties.insert(
+                            "property_representation".to_string(),
+                            Value {
+                                value_type: Some(ValueType::ArrayValue(ArrayValue {
+                                    values: array_values,
+                                })),
+                                ..Default::default()
+                            },
+                        );
+
+                        EntityWithMetadata {
+                            version: 1,
+                            create_time: prost_types::Timestamp::default(),
+                            update_time: prost_types::Timestamp::default(),
+                            entity: Entity {
+                                key: Some(property_key),
+                                properties,
+                            },
+                        }
+                    })
+                    .collect();
+            }
+            _ => {
+                // For other metadata kinds, return an empty result set
+                tracing::warn!("Unsupported metadata kind: {}", metadata_key);
+            }
+        }
+        results
+    }
     pub fn get_entities(
         &self,
         project_id_filter: String,
@@ -972,30 +1095,50 @@ impl DatastoreStorage {
         projection: Vec<Projection>,
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
-        // 1. Filter entities
-        let mut filtered_entities: Vec<_> = self
-            .entities
-            .iter()
-            .filter(|(k, _e)| {
-                k.project_id == project_id_filter
-                    && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
-            })
-            .filter(|(_, entity_metadata)| {
-                if let Some(ref filter_obj) = filter {
-                    if let Some(ref filter_type) = filter_obj.filter_type {
-                        DatastoreStorage::apply_filter(entity_metadata, filter_type)
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            })
-            .collect();
+        let metadata_holder: Vec<EntityWithMetadata>;
+        let mut filtered_entities: Vec<&EntityWithMetadata> =
+            if METADATA_KINDS.contains(&kind_name.as_str()) {
+                // If the kind is a metadata kind, we return an empty result set
+                metadata_holder = self.get_metadata(&kind_name, &project_id_filter);
+                metadata_holder
+                    .iter()
+                    .filter(|entity_metadata| {
+                        if let Some(ref filter_obj) = filter {
+                            if let Some(ref filter_type) = filter_obj.filter_type {
+                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            } else {
+                self.entities
+                    .iter()
+                    .filter(|(k, _e)| {
+                        k.project_id == project_id_filter
+                            && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
+                    })
+                    .filter(|(_, entity_metadata)| {
+                        if let Some(ref filter_obj) = filter {
+                            if let Some(ref filter_type) = filter_obj.filter_type {
+                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|(_key_struct, entity_metadata)| entity_metadata)
+                    .collect()
+            };
 
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_by(|(_, a_meta), (_, b_meta)| {
+            filtered_entities.sort_by(|a_meta, b_meta| {
                 let mut final_ordering = Ordering::Equal;
                 for order_by in &order {
                     if final_ordering != Ordering::Equal {
@@ -1003,10 +1146,25 @@ impl DatastoreStorage {
                     }
 
                     let prop_name = &order_by.property.as_ref().unwrap().name;
-                    let a_val = a_meta.entity.properties.get(prop_name);
-                    let b_val = b_meta.entity.properties.get(prop_name);
 
-                    let ordering = match (a_val, b_val) {
+                    let a_val = if prop_name == "__key__" {
+                        a_meta.entity.key.as_ref().map(|k| Value {
+                            value_type: Some(ValueType::KeyValue(k.clone())),
+                            ..Default::default()
+                        })
+                    } else {
+                        a_meta.entity.properties.get(prop_name).cloned()
+                    };
+                    let b_val = if prop_name == "__key__" {
+                        b_meta.entity.key.as_ref().map(|k| Value {
+                            value_type: Some(ValueType::KeyValue(k.clone())),
+                            ..Default::default()
+                        })
+                    } else {
+                        b_meta.entity.properties.get(prop_name).cloned()
+                    };
+
+                    let ordering = match (a_val.as_ref(), b_val.as_ref()) {
                         (Some(a), Some(b)) => compare_values(a, b),
                         (Some(_), None) => Ordering::Greater,
                         (None, Some(_)) => Ordering::Less,
@@ -1046,7 +1204,7 @@ impl DatastoreStorage {
                 .iter()
                 .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
 
-        for (_key_struct, entity_metadata) in filtered_entities.iter().skip(start) {
+        for entity_metadata in filtered_entities.iter().skip(start) {
             items_processed_from_start += 1;
 
             // Apply limit and payload size checks
