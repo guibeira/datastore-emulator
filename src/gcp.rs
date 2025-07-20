@@ -11,9 +11,10 @@ use crate::google::datastore::v1::{
     commit_request::TransactionSelector, key::PathElement, key::path_element::IdType,
     mutation::Operation,
 };
-use prost_types::value::Kind;
-use prost_types::{Duration, Struct, Value as ValueProps};
-use std::collections::{BTreeMap, HashMap};
+use prost_types;
+use prost_wkt_types::value::Kind;
+use prost_wkt_types::{Duration, Struct, Value as ValueProps};
+use std::collections::HashMap;
 use std::time::SystemTime;
 use tonic::{Request, Response, Status};
 use tracing;
@@ -22,7 +23,7 @@ use tracing;
 impl DatastoreService for DatastoreEmulator {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         let req = request.into_inner();
-        let timestamp = prost_types::Timestamp {
+        let timestamp = prost_wkt_types::Timestamp {
             seconds: 0,
             nanos: 0,
         };
@@ -50,8 +51,14 @@ impl DatastoreService for DatastoreEmulator {
             if let Some(entity) = result_entity {
                 found.push(EntityResult {
                     entity: Some(entity.entity.clone()),
-                    create_time: Some(entity.create_time.clone()),
-                    update_time: Some(entity.update_time.clone()),
+                    create_time: Some(prost_wkt_types::Timestamp {
+                        seconds: entity.create_time.seconds,
+                        nanos: entity.create_time.nanos,
+                    }),
+                    update_time: Some(prost_wkt_types::Timestamp {
+                        seconds: entity.update_time.seconds,
+                        nanos: entity.update_time.nanos,
+                    }),
                     cursor: vec![],
                     version: entity.version as i64,
                 });
@@ -61,7 +68,7 @@ impl DatastoreService for DatastoreEmulator {
         let end_time = SystemTime::now();
         let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
 
-        let read_time = prost_types::Timestamp {
+        let read_time = prost_wkt_types::Timestamp {
             seconds: total_time_duration.as_secs() as i64,
             nanos: total_time_duration.as_nanos() as i32,
         };
@@ -104,7 +111,7 @@ impl DatastoreService for DatastoreEmulator {
             query_obj.projection.clone(),
             query_obj.order.clone(),
         );
-        let mut fields = BTreeMap::new();
+        let mut fields = HashMap::new();
 
         let amount_results = batch.entity_results.len() as i64;
 
@@ -207,8 +214,14 @@ impl DatastoreService for DatastoreEmulator {
                                     crate::google::datastore::v1::MutationResult {
                                         key: Some(final_key),
                                         version: metadata.version as i64,
-                                        create_time: Some(metadata.create_time.clone()),
-                                        update_time: Some(metadata.update_time.clone()),
+                                        create_time: Some(prost_wkt_types::Timestamp {
+                                            seconds: metadata.create_time.seconds,
+                                            nanos: metadata.create_time.nanos,
+                                        }),
+                                        update_time: Some(prost_wkt_types::Timestamp {
+                                            seconds: metadata.update_time.seconds,
+                                            nanos: metadata.update_time.nanos,
+                                        }),
                                         conflict_detected: false,
                                         transform_results: vec![],
                                     },
@@ -254,13 +267,13 @@ impl DatastoreService for DatastoreEmulator {
 
                             existing_entity_metadata.entity = entity.clone(); // `entity` is from the request
                             existing_entity_metadata.version += 1;
-                            existing_entity_metadata.update_time = timestamp_now.clone();
+                            existing_entity_metadata.update_time = timestamp_now;
 
                             // Store all data needed after this block, then the borrow of existing_entity_metadata ends
                             opt_updated_data = Some((
                                 existing_entity_metadata.entity.clone(), // For update_indexes
                                 existing_entity_metadata.version,        // For MutationResult
-                                existing_entity_metadata.create_time.clone(), // For MutationResult
+                                existing_entity_metadata.create_time, // For MutationResult
                                 timestamp_now, // For MutationResult (it's existing_entity_metadata.update_time)
                             ));
                         } // Mutable borrow of storage.entities (existing_entity_metadata) ends here.
@@ -274,8 +287,14 @@ impl DatastoreService for DatastoreEmulator {
                             mutation_results.push(crate::google::datastore::v1::MutationResult {
                                 key: entity.key.clone(), // Key from the original request entity
                                 version: version as i64,
-                                create_time: Some(create_time),
-                                update_time: Some(update_time),
+                                create_time: Some(prost_wkt_types::Timestamp {
+                                    seconds: create_time.seconds,
+                                    nanos: create_time.nanos,
+                                }),
+                                update_time: Some(prost_wkt_types::Timestamp {
+                                    seconds: update_time.seconds,
+                                    nanos: update_time.nanos,
+                                }),
                                 conflict_detected: false,
                                 transform_results: vec![],
                             });
@@ -307,7 +326,7 @@ impl DatastoreService for DatastoreEmulator {
                         let entry = storage.entities.entry(key_struct.clone());
                         let version;
                         let create_time;
-                        let update_time = timestamp_now.clone();
+                        let update_time = timestamp_now;
 
                         match entry {
                             std::collections::btree_map::Entry::Occupied(mut occupied_entry) => {
@@ -315,20 +334,20 @@ impl DatastoreService for DatastoreEmulator {
                                 let metadata = occupied_entry.get_mut();
                                 metadata.entity = entity.clone();
                                 metadata.version += 1;
-                                metadata.update_time = update_time.clone();
+                                metadata.update_time = update_time;
                                 version = metadata.version;
-                                create_time = metadata.create_time.clone();
+                                create_time = metadata.create_time;
                             }
                             std::collections::btree_map::Entry::Vacant(vacant_entry) => {
                                 //dbg!("Upserting (insert path) entity", &key.path);
                                 let new_metadata = EntityWithMetadata {
                                     entity: entity.clone(),
                                     version: 1,
-                                    create_time: timestamp_now.clone(),
-                                    update_time: update_time.clone(),
+                                    create_time: timestamp_now,
+                                    update_time,
                                 };
                                 version = new_metadata.version;
-                                create_time = new_metadata.create_time.clone();
+                                create_time = new_metadata.create_time;
                                 vacant_entry.insert(new_metadata);
                             }
                         }
@@ -339,8 +358,14 @@ impl DatastoreService for DatastoreEmulator {
                         mutation_results.push(crate::google::datastore::v1::MutationResult {
                             key: Some(key),
                             version: version as i64,
-                            create_time: Some(create_time.clone()),
-                            update_time: Some(update_time.clone()),
+                            create_time: Some(prost_wkt_types::Timestamp {
+                                seconds: create_time.seconds,
+                                nanos: create_time.nanos,
+                            }),
+                            update_time: Some(prost_wkt_types::Timestamp {
+                                seconds: update_time.seconds,
+                                nanos: update_time.nanos,
+                            }),
                             conflict_detected: false,
                             transform_results: vec![],
                         });
@@ -360,8 +385,14 @@ impl DatastoreService for DatastoreEmulator {
                             mutation_results.push(crate::google::datastore::v1::MutationResult {
                                 key: Some(key_to_delete.clone()), // Return the original key from request
                                 version: removed_entity_metadata.version as i64, // Use actual version
-                                create_time: Some(removed_entity_metadata.create_time.clone()),
-                                update_time: Some(timestamp_now), // Deletion time could be now
+                                create_time: Some(prost_wkt_types::Timestamp {
+                                    seconds: removed_entity_metadata.create_time.seconds,
+                                    nanos: removed_entity_metadata.create_time.nanos,
+                                }),
+                                update_time: Some(prost_wkt_types::Timestamp {
+                                    seconds: timestamp_now.seconds,
+                                    nanos: timestamp_now.nanos,
+                                }), // Deletion time could be now
                                 conflict_detected: false,
                                 transform_results: vec![],
                             });
@@ -399,7 +430,7 @@ impl DatastoreService for DatastoreEmulator {
         // Get current time for the commit timestamp
         let end_time = SystemTime::now();
         let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-        let total_duration = prost_types::Timestamp {
+        let total_duration = prost_wkt_types::Timestamp {
             seconds: total_time_duration.as_secs() as i64,
             nanos: total_time_duration.as_nanos() as i32,
         };
@@ -631,7 +662,7 @@ impl DatastoreService for DatastoreEmulator {
         };
 
         // Get current time for read_time
-        let read_time = prost_types::Timestamp {
+        let read_time = prost_wkt_types::Timestamp {
             seconds: 0,
             nanos: 0,
         };
@@ -812,11 +843,11 @@ impl DatastoreService for DatastoreEmulator {
         let batch = AggregationResultBatch {
             aggregation_results: vec![final_aggregation_result],
             more_results: 3, // NO_MORE_RESULTS
-            read_time: Some(read_time.clone()),
+            read_time: Some(read_time),
         };
         let total_results = batch.aggregation_results.len() as i64;
         // Create execution metrics
-        let mut fields = BTreeMap::new();
+        let mut fields = HashMap::new();
         fields.insert(
             "query_type".to_string(),
             ValueProps {

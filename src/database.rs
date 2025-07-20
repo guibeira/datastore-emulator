@@ -2,6 +2,7 @@ use crate::google::datastore::import_export::datastore_v3::{
     EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
 };
 use crate::google::datastore::v1::key::PathElement;
+use prost_wkt_types;
 use tracing;
 
 use crate::google::datastore::import_export::dsbackups::ExportMetadata;
@@ -11,7 +12,8 @@ use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::query_result_batch::MoreResultsType;
 use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::{
-    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value, property_order,
+    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value, entity_result,
+    property_order,
 };
 use chrono::DateTime;
 use prost::Message;
@@ -278,7 +280,7 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
             EntityWithMetadata {
                 entity: v1_entity,
                 version: 1,
-                create_time: timestamp_now.clone(),
+                create_time: timestamp_now,
                 update_time: timestamp_now,
             }
         })
@@ -734,13 +736,18 @@ impl DatastoreStorage {
         let entity_metadata = EntityWithMetadata {
             entity: db_entity.clone(),
             version: 1, // Initial version
-            create_time: timestamp_now.clone(),
-            update_time: timestamp_now.clone(),
+            create_time: timestamp_now,
+            update_time: timestamp_now,
         };
 
         // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
         self.entities
             .insert(final_key_struct.clone(), entity_metadata.clone());
+        tracing::info!(
+            "Inserted entity with key: {:?} and kind: {}",
+            final_key_struct,
+            entity_kind_for_id_gen
+        );
         self.update_indexes(&final_key_struct, &db_entity);
 
         Ok((key_with_new_id, entity_metadata))
@@ -804,7 +811,11 @@ impl DatastoreStorage {
                                     ..Default::default()
                                 })
                             } else {
-                                entity_metadata.entity.properties.get(&property.name).cloned()
+                                entity_metadata
+                                    .entity
+                                    .properties
+                                    .get(&property.name)
+                                    .cloned()
                             };
 
                             if let Some(entity_value) = entity_value_opt {
@@ -1098,6 +1109,11 @@ impl DatastoreStorage {
         let metadata_holder: Vec<EntityWithMetadata>;
         let mut filtered_entities: Vec<&EntityWithMetadata> =
             if METADATA_KINDS.contains(&kind_name.as_str()) {
+                tracing::debug!(
+                    "Querying metadata kind: {} for project_id: {}",
+                    kind_name,
+                    project_id_filter
+                );
                 // If the kind is a metadata kind, we return an empty result set
                 metadata_holder = self.get_metadata(&kind_name, &project_id_filter);
                 metadata_holder
@@ -1250,8 +1266,14 @@ impl DatastoreStorage {
 
             results.push(EntityResult {
                 entity: Some(result_entity),
-                create_time: Some(entity_metadata.create_time.clone()),
-                update_time: Some(entity_metadata.update_time.clone()),
+                create_time: Some(prost_wkt_types::Timestamp {
+                    seconds: entity_metadata.create_time.seconds,
+                    nanos: entity_metadata.create_time.nanos,
+                }),
+                update_time: Some(prost_wkt_types::Timestamp {
+                    seconds: entity_metadata.update_time.seconds,
+                    nanos: entity_metadata.update_time.nanos,
+                }),
                 cursor: vec![],
                 version: entity_metadata.version as i64,
             });
@@ -1275,13 +1297,16 @@ impl DatastoreStorage {
         }
 
         let entity_result_type = if is_keys_only || !projection.is_empty() {
-            2 // PROJECTION
+            // 2 // PROJECTION
+            //entity_result::ResultType::Projection as i32
+            entity_result::ResultType::Projection
         } else {
-            1 // FULL
+            //1 // FULL
+            entity_result::ResultType::Full
         };
 
         crate::google::datastore::v1::QueryResultBatch {
-            entity_result_type,
+            entity_result_type: entity_result_type.into(),
             skipped_results: start as i32,
             read_time: None,
             skipped_cursor: vec![],

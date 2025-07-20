@@ -1,6 +1,5 @@
 import os
 import uuid
-from time import sleep
 
 import pytest
 from google.cloud import datastore

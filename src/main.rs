@@ -85,7 +85,7 @@ impl DatastoreEmulator {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,h2=off"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,h2=off"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let storage_for_shutdown = emulator.storage.clone(); // Clone for the shutdown handler
 
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<DatastoreServer<DatastoreEmulator>>()
         .await;
@@ -158,14 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ = signal::ctrl_c() => {
             if store_on_disk {
                 tracing::info!("
-Shutdown signal received. Saving data to disk...");
+    Shutdown signal received. Saving data to disk...");
                 let storage = storage_for_shutdown.lock().unwrap();
                 if let Err(e) = storage.save_to_disk("datastore.bin") {
                     tracing::error!("Failed to save data to disk: {}", e);
                 }
             } else {
                 tracing::info!("
-Shutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
+    Shutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
             }
         },
     }
