@@ -18,6 +18,7 @@ use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::sync::atomic::AtomicI64;
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
@@ -562,9 +563,9 @@ pub struct DatastoreStorage {
     // Active transactions
     pub transactions: HashMap<String, TransactionState>,
     // Per-(project, namespace, kind) counters for auto ID allocation
-    pub entity_id_counters: HashMap<(String, String, String), i64>,
+    pub entity_id_counters: HashMap<(String, String, String), AtomicI64>,
     // Counter used for transaction IDs
-    pub transaction_counter: i64,
+    pub transaction_counter: AtomicI64,
 }
 
 impl DatastoreStorage {
@@ -746,11 +747,12 @@ impl DatastoreStorage {
             self.entity_id_counters
                 .entry((project, namespace, kind))
                 .and_modify(|counter| {
-                    if *counter < id {
-                        *counter = id;
+                    let current = counter.load(std::sync::atomic::Ordering::SeqCst);
+                    if current < id {
+                        counter.store(id, std::sync::atomic::Ordering::SeqCst);
                     }
                 })
-                .or_insert(id);
+                .or_insert_with(|| AtomicI64::new(id));
         }
     }
 
@@ -760,9 +762,12 @@ impl DatastoreStorage {
                 "The entity key has no path elements to determine the 'kind' for ID generation.",
             )
         })?;
-        let counter = self.entity_id_counters.entry(scope).or_insert(0);
-        *counter += 1;
-        Ok(*counter)
+        let counter = self
+            .entity_id_counters
+            .entry(scope)
+            .or_insert_with(|| AtomicI64::new(0));
+        let next = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(next)
     }
 
     fn rebuild_entity_id_counters(&mut self) {

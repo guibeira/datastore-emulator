@@ -430,8 +430,9 @@ impl DatastoreService for DatastoreEmulator {
             let mut storage = self.storage.write().await;
 
             // Generate transaction ID using timestamp and current counter
-            let counter = storage.transaction_counter;
-            storage.transaction_counter += 1;
+            let counter = storage
+                .transaction_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
 
             // Check if the transaction is read-only
