@@ -568,6 +568,166 @@ pub struct DatastoreStorage {
 }
 
 impl DatastoreStorage {
+    fn index_lookup_for_filter(
+        &self,
+        project_id: &str,
+        kind_name: &str,
+        filter_type: &FilterType,
+    ) -> Option<BTreeSet<KeyStruct>> {
+        match filter_type {
+            FilterType::PropertyFilter(property_filter) => {
+                let property = property_filter.property.as_ref()?;
+                let filter_value = property_filter.value.as_ref()?;
+
+                if property.name == "__key__" {
+                    match property_filter.op {
+                        5 => {
+                            if let Some(ValueType::KeyValue(key)) = &filter_value.value_type {
+                                let key_struct = KeyStruct::from_datastore_key(key);
+                                if key_struct.project_id == project_id
+                                    && key_struct
+                                        .path_elements
+                                        .last()
+                                        .is_some_and(|(k, _)| k == kind_name)
+                                {
+                                    let mut set = BTreeSet::new();
+                                    set.insert(key_struct);
+                                    return Some(set);
+                                }
+                                return Some(BTreeSet::new());
+                            }
+                            None
+                        }
+                        6 => {
+                            if let Some(ValueType::ArrayValue(array)) = &filter_value.value_type {
+                                let mut result = BTreeSet::new();
+                                for value in &array.values {
+                                    if let Some(ValueType::KeyValue(key)) = &value.value_type {
+                                        let key_struct = KeyStruct::from_datastore_key(key);
+                                        if key_struct.project_id == project_id
+                                            && key_struct
+                                                .path_elements
+                                                .last()
+                                                .is_some_and(|(k, _)| k == kind_name)
+                                        {
+                                            result.insert(key_struct);
+                                        }
+                                    }
+                                }
+                                return Some(result);
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                } else {
+                    let indexed_values = get_indexable_strings_for_value(filter_value);
+                    if indexed_values.is_empty() {
+                        return None;
+                    }
+
+                    let kind_key = kind_name.to_string();
+                    let property_key = property.name.clone();
+
+                    match property_filter.op {
+                        5 => {
+                            let mut result: Option<BTreeSet<KeyStruct>> = None;
+                            for value_str in indexed_values.iter() {
+                                if let Some(keys) = self.indexes.get(&(
+                                    kind_key.clone(),
+                                    property_key.clone(),
+                                    value_str.clone(),
+                                )) {
+                                    let filtered: BTreeSet<KeyStruct> = keys
+                                        .iter()
+                                        .filter(|key_struct| key_struct.project_id == project_id)
+                                        .cloned()
+                                        .collect();
+                                    result = Some(match result {
+                                        Some(mut acc) => {
+                                            acc.extend(filtered);
+                                            acc
+                                        }
+                                        None => filtered,
+                                    });
+                                }
+                            }
+                            result.or(Some(BTreeSet::new()))
+                        }
+                        6 => {
+                            let mut acc = BTreeSet::new();
+                            for value_str in indexed_values.iter() {
+                                if let Some(keys) = self.indexes.get(&(
+                                    kind_key.clone(),
+                                    property_key.clone(),
+                                    value_str.clone(),
+                                )) {
+                                    acc.extend(
+                                        keys.iter()
+                                            .filter(|key_struct| {
+                                                key_struct.project_id == project_id
+                                            })
+                                            .cloned(),
+                                    );
+                                }
+                            }
+                            Some(acc)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            FilterType::CompositeFilter(composite) => {
+                let mut child_sets = Vec::new();
+                for filter in &composite.filters {
+                    if let Some(filter_type) = filter.filter_type.as_ref() {
+                        if let Some(child) =
+                            self.index_lookup_for_filter(project_id, kind_name, filter_type)
+                        {
+                            child_sets.push(child);
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+
+                if child_sets.is_empty() {
+                    return Some(BTreeSet::new());
+                }
+
+                match composite.op {
+                    1 => {
+                        // AND
+                        child_sets.sort_by_key(|set| set.len());
+                        let mut iter = child_sets.into_iter();
+                        let mut acc = iter.next().unwrap();
+                        for set in iter {
+                            acc = acc
+                                .intersection(&set)
+                                .cloned()
+                                .collect::<BTreeSet<KeyStruct>>();
+                            if acc.is_empty() {
+                                break;
+                            }
+                        }
+                        Some(acc)
+                    }
+                    2 => {
+                        // OR
+                        let mut acc = BTreeSet::new();
+                        for set in child_sets {
+                            acc.extend(set);
+                        }
+                        Some(acc)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
     fn counter_scope_from_key(key: &Key) -> Option<(String, String, String)> {
         let partition = key.partition_id.as_ref();
         let project = partition.map(|p| p.project_id.clone()).unwrap_or_default();
@@ -1135,43 +1295,62 @@ impl DatastoreStorage {
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
         let metadata_holder: Vec<EntityWithMetadata>;
+        let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
+        let matches_filter = |entity_metadata: &EntityWithMetadata| -> bool {
+            if let Some(ref filter_type) = filter_type {
+                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+            } else {
+                true
+            }
+        };
+
         let mut filtered_entities: Vec<&EntityWithMetadata> =
             if METADATA_KINDS.contains(&kind_name.as_str()) {
-                // If the kind is a metadata kind, we return an empty result set
                 metadata_holder = self.get_metadata(&kind_name, &project_id_filter);
                 metadata_holder
                     .iter()
-                    .filter(|entity_metadata| {
-                        if let Some(ref filter_obj) = filter {
-                            if let Some(ref filter_type) = filter_obj.filter_type {
-                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        }
-                    })
+                    .filter(|entity_metadata| matches_filter(entity_metadata))
                     .collect()
+            } else if let Some(ref filter_type) = filter_type {
+                if let Some(candidate_keys) =
+                    self.index_lookup_for_filter(&project_id_filter, &kind_name, filter_type)
+                {
+                    candidate_keys
+                        .into_iter()
+                        .filter(|key_struct| {
+                            key_struct.project_id == project_id_filter
+                                && key_struct
+                                    .path_elements
+                                    .last()
+                                    .is_some_and(|(k, _)| k == &kind_name)
+                        })
+                        .filter_map(|key_struct| self.entities.get(&key_struct))
+                        .filter(|entity_metadata| matches_filter(entity_metadata))
+                        .collect()
+                } else {
+                    self.entities
+                        .iter()
+                        .filter(|(k, _)| {
+                            k.project_id == project_id_filter
+                                && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
+                        })
+                        .filter_map(|(_, entity_metadata)| {
+                            if matches_filter(entity_metadata) {
+                                Some(entity_metadata)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                }
             } else {
                 self.entities
                     .iter()
-                    .filter(|(k, _e)| {
+                    .filter(|(k, _)| {
                         k.project_id == project_id_filter
                             && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
                     })
-                    .filter(|(_, entity_metadata)| {
-                        if let Some(ref filter_obj) = filter {
-                            if let Some(ref filter_type) = filter_obj.filter_type {
-                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|(_key_struct, entity_metadata)| entity_metadata)
+                    .map(|(_, entity_metadata)| entity_metadata)
                     .collect()
             };
 
