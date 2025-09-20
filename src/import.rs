@@ -1,6 +1,7 @@
 use crate::database::DatastoreStorage;
 use crate::operation::{OperationStatus, Operations};
 use chrono::Utc;
+use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
@@ -25,8 +26,8 @@ async fn download_gcs_file(
     let client = Client::new(config);
 
     // Get the object
-    let file_bytes = client
-        .download_object(
+    let mut stream = client
+        .download_streamed_object(
             &GetObjectRequest {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
@@ -34,7 +35,8 @@ async fn download_gcs_file(
             },
             &Range::default(),
         )
-        .await?;
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     // Create a temporary file to store the download
     let file_name = object
@@ -49,7 +51,11 @@ async fn download_gcs_file(
     let mut dest = tokio::fs::File::create(&temp_path).await?;
 
     // Write the content to the file
-    dest.write_all(&file_bytes).await?;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        dest.write_all(&chunk).await?;
+    }
     dest.flush().await?;
 
     tracing::info!("Downloaded to {}", &local_path_str);
