@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Serialize, Clone)]
 pub enum OperationStatus {
@@ -18,4 +19,4 @@ pub struct OperationState {
     pub error: Option<String>,
 }
 
-pub type Operations = Arc<Mutex<HashMap<String, OperationState>>>;
+pub type Operations = Arc<RwLock<HashMap<String, OperationState>>>;

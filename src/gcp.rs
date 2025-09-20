@@ -8,15 +8,31 @@ use crate::google::datastore::v1::{
     ExplainMetrics, Filter, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary,
     PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
-    commit_request::TransactionSelector, key::PathElement, key::path_element::IdType,
-    mutation::Operation,
+    commit_request::TransactionSelector, key::path_element::IdType, mutation::Operation,
 };
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tonic::{Request, Response, Status};
 use tracing;
+
+fn system_time_to_timestamp(time: SystemTime) -> prost_types::Timestamp {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => prost_types::Timestamp {
+            seconds: duration.as_secs() as i64,
+            nanos: duration.subsec_nanos() as i32,
+        },
+        Err(_) => prost_types::Timestamp::default(),
+    }
+}
+
+fn to_prost_duration(std_duration: std::time::Duration) -> Duration {
+    Duration {
+        seconds: std_duration.as_secs() as i64,
+        nanos: std_duration.subsec_nanos() as i32,
+    }
+}
 
 #[tonic::async_trait]
 impl DatastoreService for DatastoreEmulator {
@@ -39,9 +55,8 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
-        let start_time = SystemTime::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
         let mut found = Vec::new();
 
         // process each key in the request
@@ -57,14 +72,7 @@ impl DatastoreService for DatastoreEmulator {
                 });
             }
         }
-        // Get current time for read_time
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-
-        let read_time = prost_types::Timestamp {
-            seconds: total_time_duration.as_secs() as i64,
-            nanos: total_time_duration.as_nanos() as i32,
-        };
+        let read_time = system_time_to_timestamp(SystemTime::now());
 
         Ok(Response::new(LookupResponse {
             found,
@@ -79,9 +87,9 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
-        let start_time = SystemTime::now();
+        let start = Instant::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
         // Extract the query from the request
         let query_obj = match req.query_type {
             Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
@@ -118,10 +126,7 @@ impl DatastoreService for DatastoreEmulator {
             fields: fields.clone(),
         };
 
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time
-            .duration_since(start_time)
-            .expect("Clock may have gone backwards");
+        let execution_duration = start.elapsed();
 
         Ok(Response::new(RunQueryResponse {
             transaction: vec![],
@@ -136,10 +141,7 @@ impl DatastoreService for DatastoreEmulator {
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: amount_results,
-                    execution_duration: Some(Duration {
-                        seconds: total_time_duration.as_secs() as i64,
-                        nanos: total_time_duration.as_nanos() as i32,
-                    }),
+                    execution_duration: Some(to_prost_duration(execution_duration)),
                     read_operations: 10,
                     debug_stats: Some(debug_stats),
                 }),
@@ -151,9 +153,8 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        let start_time = SystemTime::now();
         let req = request.into_inner();
-        let mut storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
         let mut mutation_results = Vec::new();
 
         // Handle transaction if present
@@ -397,17 +398,12 @@ impl DatastoreService for DatastoreEmulator {
         }
 
         // Get current time for the commit timestamp
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-        let total_duration = prost_types::Timestamp {
-            seconds: total_time_duration.as_secs() as i64,
-            nanos: total_time_duration.as_nanos() as i32,
-        };
+        let commit_time = system_time_to_timestamp(SystemTime::now());
 
         let response = Response::new(CommitResponse {
             mutation_results,
             index_updates,
-            commit_time: Some(total_duration),
+            commit_time: Some(commit_time),
         });
 
         Ok(response)
@@ -431,15 +427,12 @@ impl DatastoreService for DatastoreEmulator {
         // Generate a unique transaction ID and create transaction state
         let transaction_id;
         {
-            let mut storage = self.storage.lock().unwrap();
+            let mut storage = self.storage.write().await;
 
             // Generate transaction ID using timestamp and current counter
-            let counter = {
-                let mut counter_guard = storage.id_counter.lock().unwrap();
-                let current = *counter_guard;
-                *counter_guard += 1;
-                current
-            };
+            let counter = storage
+                .transaction_counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
 
             // Check if the transaction is read-only
@@ -490,7 +483,7 @@ impl DatastoreService for DatastoreEmulator {
 
         // Remove the transaction and any pending changes from storage
         {
-            let mut storage = self.storage.lock().unwrap();
+            let mut storage = self.storage.write().await;
 
             // Check if the transaction exists
             if storage.transactions.contains_key(&transaction_id) {
@@ -515,7 +508,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
         let mut allocated_keys = Vec::new();
 
         // Process each incomplete key in the request
@@ -527,35 +520,20 @@ impl DatastoreService for DatastoreEmulator {
 
             // Create a new key with the same structure but with allocated IDs
             let mut new_key = incomplete_key.clone();
-            let mut path_elements = Vec::new();
+            let mut allocated_id: Option<i64> = None;
 
-            for path_element in incomplete_key.path {
-                // Check if this path element needs an ID
+            for path_element in new_key.path.iter_mut() {
                 if path_element.id_type.is_none() {
-                    // Allocate a new ID
-                    let new_id = {
-                        let mut counter = storage.id_counter.lock().unwrap();
-                        *counter += 1;
-                        *counter
-                    };
-
-                    // Create a new path element with the allocated ID
-                    let new_path_element = PathElement {
-                        kind: path_element.kind,
-                        id_type: Some(IdType::Id(new_id)),
-                    };
-
-                    path_elements.push(new_path_element);
-                } else {
-                    // This path element already has an ID or name, keep it as is
-                    path_elements.push(path_element);
+                    if allocated_id.is_none() {
+                        allocated_id = Some(storage.next_auto_id(&incomplete_key)?);
+                    }
+                    path_element.id_type = allocated_id.map(IdType::Id);
                 }
             }
 
-            // Update the key with the new path elements
-            new_key.path = path_elements;
-
             // Add the allocated key to the result
+            storage.observe_key_id(&new_key);
+
             allocated_keys.push(new_key);
         }
 
@@ -569,7 +547,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
 
         // Process each key in the request
         for key in &req.keys {
@@ -579,15 +557,7 @@ impl DatastoreService for DatastoreEmulator {
             }
 
             // For each path element with an ID, reserve that ID
-            for path_element in &key.path {
-                if let Some(IdType::Id(id)) = path_element.id_type {
-                    // Reserve this ID by ensuring our ID counter is greater than it
-                    let mut counter = storage.id_counter.lock().unwrap();
-                    if *counter <= id {
-                        *counter = id + 1;
-                    }
-                }
-            }
+            storage.observe_key_id(key);
 
             // We could store reserved keys in a separate collection if needed
             // For now, we just ensure the ID counter is updated
@@ -601,9 +571,9 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
-        let start_time = SystemTime::now();
+        let start = Instant::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
 
         // Extract the aggregation query from the request
         let aggregation_query = match req.query_type {
@@ -631,10 +601,7 @@ impl DatastoreService for DatastoreEmulator {
         };
 
         // Get current time for read_time
-        let read_time = prost_types::Timestamp {
-            seconds: 0,
-            nanos: 0,
-        };
+        let read_time = system_time_to_timestamp(SystemTime::now());
 
         // Process each aggregation
         let mut matching_entities = Vec::new();
@@ -828,8 +795,7 @@ impl DatastoreService for DatastoreEmulator {
             fields: fields.clone(),
         };
 
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
+        let execution_duration = start.elapsed();
         let response = Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
             query: Some(aggregation_query),
@@ -840,10 +806,7 @@ impl DatastoreService for DatastoreEmulator {
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: total_results,
-                    execution_duration: Some(Duration {
-                        seconds: total_time_duration.as_secs() as i64,
-                        nanos: total_time_duration.as_nanos() as i32,
-                    }),
+                    execution_duration: Some(to_prost_duration(execution_duration)),
                     read_operations: storage.entities.len() as i64,
                     debug_stats: Some(debug_stats),
                 }),

@@ -1,15 +1,18 @@
 use crate::database::DatastoreStorage;
 use crate::operation::{OperationStatus, Operations};
 use chrono::Utc;
+use futures::StreamExt;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::RwLock, task};
 use tracing;
 
-async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn download_gcs_file(
+    gcs_url: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let (bucket, object) = gcs_url
         .strip_prefix("gs://")
         .and_then(|s| s.split_once('/'))
@@ -23,8 +26,8 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
     let client = Client::new(config);
 
     // Get the object
-    let file_bytes = client
-        .download_object(
+    let mut stream = client
+        .download_streamed_object(
             &GetObjectRequest {
                 bucket: bucket.to_string(),
                 object: object.to_string(),
@@ -32,7 +35,8 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
             },
             &Range::default(),
         )
-        .await?;
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     // Create a temporary file to store the download
     let file_name = object
@@ -47,7 +51,11 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
     let mut dest = tokio::fs::File::create(&temp_path).await?;
 
     // Write the content to the file
-    dest.write_all(&file_bytes).await?;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        dest.write_all(&chunk).await?;
+    }
     dest.flush().await?;
 
     tracing::info!("Downloaded to {}", &local_path_str);
@@ -56,19 +64,20 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
 }
 
 pub async fn bg_import_data(
-    storage: Arc<Mutex<DatastoreStorage>>,
+    storage: Arc<RwLock<DatastoreStorage>>,
     operations: Operations,
     operation_id: String,
     input_url: String,
 ) {
     tracing::info!("Importing data from {:?} in the background...", input_url);
 
-    let local_file_path = if input_url.starts_with("gs://") {
+    let downloaded_from_gcs = input_url.starts_with("gs://");
+    let local_file_path = if downloaded_from_gcs {
         match download_gcs_file(&input_url).await {
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Failed to download file from GCS: {}", e);
-                let mut operations = operations.lock().unwrap();
+                let mut operations = operations.write().await;
                 if let Some(state) = operations.get_mut(&operation_id) {
                     state.status = OperationStatus::Failed;
                     state.end_time = Some(Utc::now());
@@ -83,7 +92,7 @@ pub async fn bg_import_data(
         let path = std::path::Path::new(&input_url);
         if !path.exists() {
             tracing::warn!("File {:?} does not exist.", input_url);
-            let mut operations = operations.lock().unwrap();
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
@@ -95,71 +104,123 @@ pub async fn bg_import_data(
     };
 
     let folder_name = "dump";
-    // unzip the file into the dump directory at dump path as this lib create folder
-    if let Ok(_) = extract_file(local_file_path.clone()) {
-        tracing::info!("File {:?} extracted successfully.", local_file_path);
+    let extraction_result = task::spawn_blocking({
+        let path = local_file_path.clone();
+        move || extract_file(path)
+    })
+    .await;
 
-        let start = Instant::now();
-        let mut storage = storage.lock().unwrap();
-        if let Ok(_) = storage.import_dump(folder_name) {
+    match extraction_result {
+        Ok(Ok(())) => {
+            tracing::info!("File {:?} extracted successfully.", local_file_path);
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Failed to extract file {:?}: {}", local_file_path, e);
+            let mut operations = operations.write().await;
+            if let Some(state) = operations.get_mut(&operation_id) {
+                state.status = OperationStatus::Failed;
+                state.end_time = Some(Utc::now());
+                state.error = Some(format!("Failed to extract file {}", local_file_path));
+            }
+            return;
+        }
+        Err(join_err) => {
+            tracing::error!(
+                "Extraction task panicked for {:?}: {}",
+                local_file_path,
+                join_err
+            );
+            let mut operations = operations.write().await;
+            if let Some(state) = operations.get_mut(&operation_id) {
+                state.status = OperationStatus::Failed;
+                state.end_time = Some(Utc::now());
+                state.error = Some("Background extraction task failed".to_string());
+            }
+            return;
+        }
+    }
+
+    let start = Instant::now();
+    let import_result = {
+        let mut storage_guard = storage.write().await;
+        storage_guard.import_dump(folder_name)
+    };
+
+    let duration = start.elapsed();
+    let humanized_duration = duration.as_secs_f64();
+    let minutes = humanized_duration / 60.0;
+    let seconds = humanized_duration % 60.0;
+
+    match import_result {
+        Ok(_) => {
             tracing::info!("Entities imported successfully from dump directory.");
-            let mut operations = operations.lock().unwrap();
+            tracing::info!(
+                "Import completed in {:02}:{:02} minutes",
+                minutes as u64,
+                seconds as u64
+            );
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Successful;
                 state.end_time = Some(Utc::now());
             }
-        } else {
-            tracing::error!("Failed to import entities from dump directory.");
-            let mut operations = operations.lock().unwrap();
+        }
+        Err(status) => {
+            tracing::error!("Failed to import entities from dump directory: {}", status);
+            tracing::info!(
+                "Import attempt finished in {:02}:{:02} minutes",
+                minutes as u64,
+                seconds as u64
+            );
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
                 state.error = Some("Failed to import entities".to_string());
             }
         }
-        let duration = start.elapsed();
-        let humanized_duration = duration.as_secs_f64();
-        let minutes = humanized_duration / 60.0;
-        let seconds = humanized_duration % 60.0;
-        tracing::info!(
-            "Imported entities in {:02}:{:02} minutes",
-            minutes as u64,
-            seconds as u64
-        );
-        // Clean up the dump directory
-        if let Err(e) = std::fs::remove_dir_all(folder_name) {
-            tracing::error!("Failed to clean up dump directory: {}", e);
-        } else {
-            tracing::info!("Dump directory cleaned up successfully.");
-        }
-    } else {
-        tracing::error!("Failed to extract file {:?}", local_file_path);
-        let mut operations = operations.lock().unwrap();
-        if let Some(state) = operations.get_mut(&operation_id) {
-            state.status = OperationStatus::Failed;
-            state.end_time = Some(Utc::now());
-            state.error = Some(format!("Failed to extract file {}", local_file_path));
-        }
-        return;
     }
 
-    // Clean up downloaded file if it was from GCS
-    if input_url.starts_with("gs://") {
-        if let Err(e) = std::fs::remove_file(&local_file_path) {
-            tracing::warn!(
-                "Failed to remove temporary downloaded file {}: {}",
-                local_file_path,
-                e
-            );
-        } else {
-            tracing::info!("Temporary downloaded file {} removed.", local_file_path);
+    let folder = folder_name.to_string();
+    match task::spawn_blocking(move || std::fs::remove_dir_all(&folder)).await {
+        Ok(Ok(())) => {
+            tracing::info!("Dump directory cleaned up successfully.");
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Failed to clean up dump directory: {}", e);
+        }
+        Err(join_err) => {
+            tracing::error!("Cleanup task for dump directory failed: {}", join_err);
+        }
+    }
+
+    if downloaded_from_gcs {
+        let cleanup_path = local_file_path.clone();
+        match task::spawn_blocking(move || std::fs::remove_file(&cleanup_path)).await {
+            Ok(Ok(())) => {
+                tracing::info!("Temporary downloaded file {} removed.", local_file_path);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "Failed to remove temporary downloaded file {}: {}",
+                    local_file_path,
+                    e
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    "Cleanup task for temporary file {} failed: {}",
+                    local_file_path,
+                    join_err
+                );
+            }
         }
     }
 
     tracing::info!("Background import completed.");
 }
 
-fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dump_path = std::path::Path::new("dump");
     if !dump_path.exists() {
         std::fs::create_dir_all(dump_path).expect("Failed to create dump directory");

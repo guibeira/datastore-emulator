@@ -5,8 +5,8 @@ use clap::Parser;
 use database::DatastoreStorage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::signal; // Import the tokio signal module
+use std::sync::Arc;
+use tokio::{signal, sync::RwLock}; // Import the tokio signal module
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
@@ -61,7 +61,7 @@ pub mod google {
 
 #[derive(Debug)]
 pub struct DatastoreEmulator {
-    pub storage: Arc<Mutex<DatastoreStorage>>,
+    pub storage: Arc<RwLock<DatastoreStorage>>,
 }
 
 impl DatastoreEmulator {
@@ -77,7 +77,7 @@ impl DatastoreEmulator {
             tracing::info!("Running in-memory only. No data will be read from or saved to disk.");
         }
         Self {
-            storage: Arc::new(Mutex::new(storage)),
+            storage: Arc::new(RwLock::new(storage)),
         }
     }
 }
@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let emulator = DatastoreEmulator::new(store_on_disk);
     let app_state = AppState {
         storage: emulator.storage.clone(),
-        operations: Arc::new(Mutex::new(HashMap::new())),
+        operations: Arc::new(RwLock::new(HashMap::new())),
     };
     let storage_for_shutdown = emulator.storage.clone(); // Clone for the shutdown handler
 
@@ -158,14 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ = signal::ctrl_c() => {
             if store_on_disk {
                 tracing::info!("
-Shutdown signal received. Saving data to disk...");
-                let storage = storage_for_shutdown.lock().unwrap();
+    Shutdown signal received. Saving data to disk...");
+                let storage = storage_for_shutdown.read().await;
                 if let Err(e) = storage.save_to_disk("datastore.bin") {
                     tracing::error!("Failed to save data to disk: {}", e);
                 }
             } else {
                 tracing::info!("
-Shutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
+    Shutdown signal received. Not saving data to disk as --no-store-on-disk is enabled.");
             }
         },
     }
