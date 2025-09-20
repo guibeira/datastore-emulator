@@ -4,12 +4,14 @@ use chrono::Utc;
 use google_cloud_storage::client::{Client, ClientConfig};
 use google_cloud_storage::http::objects::download::Range;
 use google_cloud_storage::http::objects::get::GetObjectRequest;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 use tracing;
 
-async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn download_gcs_file(
+    gcs_url: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let (bucket, object) = gcs_url
         .strip_prefix("gs://")
         .and_then(|s| s.split_once('/'))
@@ -56,7 +58,7 @@ async fn download_gcs_file(gcs_url: &str) -> Result<String, Box<dyn std::error::
 }
 
 pub async fn bg_import_data(
-    storage: Arc<Mutex<DatastoreStorage>>,
+    storage: Arc<RwLock<DatastoreStorage>>,
     operations: Operations,
     operation_id: String,
     input_url: String,
@@ -68,7 +70,7 @@ pub async fn bg_import_data(
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Failed to download file from GCS: {}", e);
-                let mut operations = operations.lock().unwrap();
+                let mut operations = operations.write().await;
                 if let Some(state) = operations.get_mut(&operation_id) {
                     state.status = OperationStatus::Failed;
                     state.end_time = Some(Utc::now());
@@ -83,7 +85,7 @@ pub async fn bg_import_data(
         let path = std::path::Path::new(&input_url);
         if !path.exists() {
             tracing::warn!("File {:?} does not exist.", input_url);
-            let mut operations = operations.lock().unwrap();
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
@@ -100,17 +102,17 @@ pub async fn bg_import_data(
         tracing::info!("File {:?} extracted successfully.", local_file_path);
 
         let start = Instant::now();
-        let mut storage = storage.lock().unwrap();
+        let mut storage = storage.write().await;
         if let Ok(_) = storage.import_dump(folder_name) {
             tracing::info!("Entities imported successfully from dump directory.");
-            let mut operations = operations.lock().unwrap();
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Successful;
                 state.end_time = Some(Utc::now());
             }
         } else {
             tracing::error!("Failed to import entities from dump directory.");
-            let mut operations = operations.lock().unwrap();
+            let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
@@ -134,7 +136,7 @@ pub async fn bg_import_data(
         }
     } else {
         tracing::error!("Failed to extract file {:?}", local_file_path);
-        let mut operations = operations.lock().unwrap();
+        let mut operations = operations.write().await;
         if let Some(state) = operations.get_mut(&operation_id) {
             state.status = OperationStatus::Failed;
             state.end_time = Some(Utc::now());
@@ -159,7 +161,7 @@ pub async fn bg_import_data(
     tracing::info!("Background import completed.");
 }
 
-fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dump_path = std::path::Path::new("dump");
     if !dump_path.exists() {
         std::fs::create_dir_all(dump_path).expect("Failed to create dump directory");

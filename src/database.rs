@@ -18,7 +18,6 @@ use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::sync::{Arc, Mutex};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
@@ -562,11 +561,62 @@ pub struct DatastoreStorage {
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
     pub transactions: HashMap<String, TransactionState>,
-    // This is a simple counter for generating unique IDs
-    pub id_counter: Arc<Mutex<i64>>,
+    // Per-(project, namespace, kind) counters for auto ID allocation
+    pub entity_id_counters: HashMap<(String, String, String), i64>,
+    // Counter used for transaction IDs
+    pub transaction_counter: i64,
 }
 
 impl DatastoreStorage {
+    fn counter_scope_from_key(key: &Key) -> Option<(String, String, String)> {
+        let partition = key.partition_id.as_ref();
+        let project = partition.map(|p| p.project_id.clone()).unwrap_or_default();
+        let namespace = partition
+            .map(|p| p.namespace_id.clone())
+            .unwrap_or_default();
+        let kind = key.path.last()?.kind.clone();
+        Some((project, namespace, kind))
+    }
+
+    pub(crate) fn observe_key_id(&mut self, key: &Key) {
+        if let Some((project, namespace, kind)) = Self::counter_scope_from_key(key)
+            && let Some(path_element) = key.path.last()
+            && let Some(IdType::Id(id)) = path_element.id_type
+        {
+            self.entity_id_counters
+                .entry((project, namespace, kind))
+                .and_modify(|counter| {
+                    if *counter < id {
+                        *counter = id;
+                    }
+                })
+                .or_insert(id);
+        }
+    }
+
+    pub fn next_auto_id(&mut self, key: &Key) -> Result<i64, tonic::Status> {
+        let scope = Self::counter_scope_from_key(key).ok_or_else(|| {
+            tonic::Status::invalid_argument(
+                "The entity key has no path elements to determine the 'kind' for ID generation.",
+            )
+        })?;
+        let counter = self.entity_id_counters.entry(scope).or_insert(0);
+        *counter += 1;
+        Ok(*counter)
+    }
+
+    fn rebuild_entity_id_counters(&mut self) {
+        self.entity_id_counters.clear();
+        let keys: Vec<Key> = self
+            .entities
+            .values()
+            .filter_map(|metadata| metadata.entity.key.clone())
+            .collect();
+        for key in keys {
+            self.observe_key_id(&key);
+        }
+    }
+
     // Add this new method to load data from disk
     pub fn load_from_disk(&mut self, path: &str) -> std::io::Result<()> {
         // Try to open the file. If it doesn't exist, just return Ok without doing anything.
@@ -608,20 +658,21 @@ impl DatastoreStorage {
             HashMap::new();
         for (key_struct, metadata) in &self.entities {
             for (prop_name, prop_value) in &metadata.entity.properties {
-                if !prop_value.exclude_from_indexes {
-                    if let Some((kind, _)) = key_struct.path_elements.last() {
-                        for value_str in get_indexable_strings_for_value(prop_value) {
-                            let index_key = (kind.clone(), prop_name.clone(), value_str);
-                            new_indexes
-                                .entry(index_key)
-                                .or_default()
-                                .insert(key_struct.clone());
-                        }
+                if !prop_value.exclude_from_indexes
+                    && let Some((kind, _)) = key_struct.path_elements.last()
+                {
+                    for value_str in get_indexable_strings_for_value(prop_value) {
+                        let index_key = (kind.clone(), prop_name.clone(), value_str);
+                        new_indexes
+                            .entry(index_key)
+                            .or_default()
+                            .insert(key_struct.clone());
                     }
                 }
             }
         }
         self.indexes = new_indexes;
+        self.rebuild_entity_id_counters();
 
         let end_time = SystemTime::now();
         let diff = end_time.duration_since(start_time).unwrap_or_default();
@@ -680,36 +731,21 @@ impl DatastoreStorage {
 
         let mut key_with_new_id = original_key.clone();
 
-        // Determine the "kind" of the entity for ID generation.
-        // This is based on the last PathElement of the original entity key.
-        let entity_kind_for_id_gen = match original_key.path.last() {
-            Some(pe) => &pe.kind,
-            None => {
-                // This case would occur if the entity key had no PathElements.
-                return Err(tonic::Status::invalid_argument(
-                    "The entity key has no path elements to determine the 'kind' for ID generation.",
-                ));
-            }
-        };
+        let needs_auto_id = original_key
+            .path
+            .iter()
+            .any(|path_element| path_element.id_type.is_none());
+        let mut new_id_value = None;
+        if needs_auto_id {
+            new_id_value = Some(self.next_auto_id(&original_key)?);
+        }
 
-        // Calculate the new ID based on the count of entities of the same "kind".
-        // This count is done once before the loop, replicating the old logic.
-        let count_for_entity_kind = self
-            .entities
-            .keys()
-            .filter(|stored_key_struct| {
-                stored_key_struct
-                    .path_elements
-                    .last()
-                    .map_or_else(|| false, |(k, _)| k == entity_kind_for_id_gen)
-            })
-            .count();
-        let new_id_value = count_for_entity_kind as i64 + 1;
-
-        // Apply the new_id_value to any PathElement in the key that is without an ID.
+        // Apply the new ID to any PathElement in the key that is without an ID.
         for path_element in key_with_new_id.path.iter_mut() {
-            if path_element.id_type.is_none() {
-                path_element.id_type = Some(IdType::Id(new_id_value));
+            if path_element.id_type.is_none()
+                && let Some(id_value) = new_id_value
+            {
+                path_element.id_type = Some(IdType::Id(id_value));
             }
         }
 
@@ -742,6 +778,9 @@ impl DatastoreStorage {
         self.entities
             .insert(final_key_struct.clone(), entity_metadata.clone());
         self.update_indexes(&final_key_struct, &db_entity);
+        if let Some(ref key) = db_entity.key {
+            self.observe_key_id(key);
+        }
 
         Ok((key_with_new_id, entity_metadata))
     }
@@ -756,16 +795,14 @@ impl DatastoreStorage {
                             // HAS_ANCESTOR = 11
                             if let Some(ValueType::KeyValue(ancestor_key_value)) =
                                 &filter_value.value_type
+                                && let Some(entity_key) = &entity_metadata.entity.key
                             {
-                                if let Some(entity_key) = &entity_metadata.entity.key {
-                                    let entity_partition_id_obj = entity_key.partition_id.as_ref();
-                                    let ancestor_partition_id_obj =
-                                        ancestor_key_value.partition_id.as_ref();
+                                let entity_partition_id_obj = entity_key.partition_id.as_ref();
+                                let ancestor_partition_id_obj =
+                                    ancestor_key_value.partition_id.as_ref();
 
-                                    let partitions_match = match (
-                                        entity_partition_id_obj,
-                                        ancestor_partition_id_obj,
-                                    ) {
+                                let partitions_match =
+                                    match (entity_partition_id_obj, ancestor_partition_id_obj) {
                                         (Some(ep), Some(ap)) => {
                                             ep.project_id == ap.project_id
                                                 && ep.namespace_id == ap.namespace_id
@@ -773,25 +810,23 @@ impl DatastoreStorage {
                                         (None, None) => true,
                                         _ => false,
                                     };
-                                    if !partitions_match {
-                                        return false;
-                                    }
+                                if !partitions_match {
+                                    return false;
+                                }
 
-                                    if entity_key.path.len() > ancestor_key_value.path.len() {
-                                        for (i, ancestor_path_element) in
-                                            ancestor_key_value.path.iter().enumerate()
+                                if entity_key.path.len() > ancestor_key_value.path.len() {
+                                    for (i, ancestor_path_element) in
+                                        ancestor_key_value.path.iter().enumerate()
+                                    {
+                                        let entity_path_element = &entity_key.path[i];
+                                        if entity_path_element.kind != ancestor_path_element.kind
+                                            || entity_path_element.id_type
+                                                != ancestor_path_element.id_type
                                         {
-                                            let entity_path_element = &entity_key.path[i];
-                                            if entity_path_element.kind
-                                                != ancestor_path_element.kind
-                                                || entity_path_element.id_type
-                                                    != ancestor_path_element.id_type
-                                            {
-                                                return false;
-                                            }
+                                            return false;
                                         }
-                                        return true;
                                     }
+                                    return true;
                                 }
                             }
                             false
@@ -804,7 +839,11 @@ impl DatastoreStorage {
                                     ..Default::default()
                                 })
                             } else {
-                                entity_metadata.entity.properties.get(&property.name).cloned()
+                                entity_metadata
+                                    .entity
+                                    .properties
+                                    .get(&property.name)
+                                    .cloned()
                             };
 
                             if let Some(entity_value) = entity_value_opt {
@@ -928,14 +967,14 @@ impl DatastoreStorage {
                 let mut unique_kinds = HashSet::new();
                 for key_struct in self.entities.keys() {
                     // TODO: This should also filter by namespace from the query
-                    if key_struct.project_id == project_id {
-                        if let Some((kind, _)) = key_struct.path_elements.last() {
-                            unique_kinds.insert((
-                                kind.clone(),
-                                key_struct.project_id.clone(),
-                                key_struct.namespace.clone(),
-                            ));
-                        }
+                    if key_struct.project_id == project_id
+                        && let Some((kind, _)) = key_struct.path_elements.last()
+                    {
+                        unique_kinds.insert((
+                            kind.clone(),
+                            key_struct.project_id.clone(),
+                            key_struct.namespace.clone(),
+                        ));
                     }
                 }
 
@@ -1217,12 +1256,12 @@ impl DatastoreStorage {
                 break;
             }
 
-            if let Some(limit_value) = limit {
-                if results.len() >= limit_value as usize {
-                    new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
-                    items_processed_from_start -= 1;
-                    break;
-                }
+            if let Some(limit_value) = limit
+                && results.len() >= limit_value as usize
+            {
+                new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
+                items_processed_from_start -= 1;
+                break;
             }
 
             // Apply projection
@@ -1234,10 +1273,10 @@ impl DatastoreStorage {
             } else if !projection.is_empty() {
                 let mut projected_properties = HashMap::new();
                 for p in &projection {
-                    if let Some(prop_ref) = &p.property {
-                        if let Some(value) = entity_metadata.entity.properties.get(&prop_ref.name) {
-                            projected_properties.insert(prop_ref.name.clone(), value.clone());
-                        }
+                    if let Some(prop_ref) = &p.property
+                        && let Some(value) = entity_metadata.entity.properties.get(&prop_ref.name)
+                    {
+                        projected_properties.insert(prop_ref.name.clone(), value.clone());
                     }
                 }
                 Entity {
@@ -1295,15 +1334,15 @@ impl DatastoreStorage {
     pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // For each property of an entity, creates an index
         for (prop_name, prop_value) in &entity.properties {
-            if !prop_value.exclude_from_indexes {
-                if let Some((kind, _)) = key_struct.path_elements.last() {
-                    for value_str in get_indexable_strings_for_value(prop_value) {
-                        let index_key = (kind.clone(), prop_name.clone(), value_str);
-                        self.indexes
-                            .entry(index_key)
-                            .or_default()
-                            .insert(key_struct.clone());
-                    }
+            if !prop_value.exclude_from_indexes
+                && let Some((kind, _)) = key_struct.path_elements.last()
+            {
+                for value_str in get_indexable_strings_for_value(prop_value) {
+                    let index_key = (kind.clone(), prop_name.clone(), value_str);
+                    self.indexes
+                        .entry(index_key)
+                        .or_default()
+                        .insert(key_struct.clone());
                 }
             }
         }
@@ -1312,18 +1351,18 @@ impl DatastoreStorage {
     pub fn remove_from_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         // For each property of an entity, remove its KeyStruct from the index
         for (prop_name, prop_value) in &entity.properties {
-            if !prop_value.exclude_from_indexes {
-                if let Some((kind, _)) = key_struct.path_elements.last() {
-                    for value_str in get_indexable_strings_for_value(prop_value) {
-                        let index_key = (kind.clone(), prop_name.clone(), value_str);
-                        if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                            indexed_keys_set.remove(key_struct);
-                            // Optional: if indexed_keys_set is empty after removal,
-                            // we could remove the index_key itself from self.indexes.
-                            // if indexed_keys_set.is_empty() {
-                            //     self.indexes.remove(&index_key);
-                            // }
-                        }
+            if !prop_value.exclude_from_indexes
+                && let Some((kind, _)) = key_struct.path_elements.last()
+            {
+                for value_str in get_indexable_strings_for_value(prop_value) {
+                    let index_key = (kind.clone(), prop_name.clone(), value_str);
+                    if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                        indexed_keys_set.remove(key_struct);
+                        // Optional: if indexed_keys_set is empty after removal,
+                        // we could remove the index_key itself from self.indexes.
+                        // if indexed_keys_set.is_empty() {
+                        //     self.indexes.remove(&index_key);
+                        // }
                     }
                 }
             }

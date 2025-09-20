@@ -8,8 +8,7 @@ use crate::google::datastore::v1::{
     ExplainMetrics, Filter, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary,
     PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
-    commit_request::TransactionSelector, key::PathElement, key::path_element::IdType,
-    mutation::Operation,
+    commit_request::TransactionSelector, key::path_element::IdType, mutation::Operation,
 };
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
@@ -41,7 +40,7 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<LookupResponse>, Status> {
         let start_time = SystemTime::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
         let mut found = Vec::new();
 
         // process each key in the request
@@ -81,7 +80,7 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<RunQueryResponse>, Status> {
         let start_time = SystemTime::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
         // Extract the query from the request
         let query_obj = match req.query_type {
             Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
@@ -153,7 +152,7 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<CommitResponse>, Status> {
         let start_time = SystemTime::now();
         let req = request.into_inner();
-        let mut storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
         let mut mutation_results = Vec::new();
 
         // Handle transaction if present
@@ -431,15 +430,11 @@ impl DatastoreService for DatastoreEmulator {
         // Generate a unique transaction ID and create transaction state
         let transaction_id;
         {
-            let mut storage = self.storage.lock().unwrap();
+            let mut storage = self.storage.write().await;
 
             // Generate transaction ID using timestamp and current counter
-            let counter = {
-                let mut counter_guard = storage.id_counter.lock().unwrap();
-                let current = *counter_guard;
-                *counter_guard += 1;
-                current
-            };
+            let counter = storage.transaction_counter;
+            storage.transaction_counter += 1;
             transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
 
             // Check if the transaction is read-only
@@ -490,7 +485,7 @@ impl DatastoreService for DatastoreEmulator {
 
         // Remove the transaction and any pending changes from storage
         {
-            let mut storage = self.storage.lock().unwrap();
+            let mut storage = self.storage.write().await;
 
             // Check if the transaction exists
             if storage.transactions.contains_key(&transaction_id) {
@@ -515,7 +510,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
         let mut allocated_keys = Vec::new();
 
         // Process each incomplete key in the request
@@ -527,35 +522,20 @@ impl DatastoreService for DatastoreEmulator {
 
             // Create a new key with the same structure but with allocated IDs
             let mut new_key = incomplete_key.clone();
-            let mut path_elements = Vec::new();
+            let mut allocated_id: Option<i64> = None;
 
-            for path_element in incomplete_key.path {
-                // Check if this path element needs an ID
+            for path_element in new_key.path.iter_mut() {
                 if path_element.id_type.is_none() {
-                    // Allocate a new ID
-                    let new_id = {
-                        let mut counter = storage.id_counter.lock().unwrap();
-                        *counter += 1;
-                        *counter
-                    };
-
-                    // Create a new path element with the allocated ID
-                    let new_path_element = PathElement {
-                        kind: path_element.kind,
-                        id_type: Some(IdType::Id(new_id)),
-                    };
-
-                    path_elements.push(new_path_element);
-                } else {
-                    // This path element already has an ID or name, keep it as is
-                    path_elements.push(path_element);
+                    if allocated_id.is_none() {
+                        allocated_id = Some(storage.next_auto_id(&incomplete_key)?);
+                    }
+                    path_element.id_type = allocated_id.map(IdType::Id);
                 }
             }
 
-            // Update the key with the new path elements
-            new_key.path = path_elements;
-
             // Add the allocated key to the result
+            storage.observe_key_id(&new_key);
+
             allocated_keys.push(new_key);
         }
 
@@ -569,7 +549,7 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let mut storage = self.storage.write().await;
 
         // Process each key in the request
         for key in &req.keys {
@@ -579,15 +559,7 @@ impl DatastoreService for DatastoreEmulator {
             }
 
             // For each path element with an ID, reserve that ID
-            for path_element in &key.path {
-                if let Some(IdType::Id(id)) = path_element.id_type {
-                    // Reserve this ID by ensuring our ID counter is greater than it
-                    let mut counter = storage.id_counter.lock().unwrap();
-                    if *counter <= id {
-                        *counter = id + 1;
-                    }
-                }
-            }
+            storage.observe_key_id(key);
 
             // We could store reserved keys in a separate collection if needed
             // For now, we just ensure the ID counter is updated
@@ -603,7 +575,7 @@ impl DatastoreService for DatastoreEmulator {
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
         let start_time = SystemTime::now();
         let req = request.into_inner();
-        let storage = self.storage.lock().unwrap();
+        let storage = self.storage.read().await;
 
         // Extract the aggregation query from the request
         let aggregation_query = match req.query_type {

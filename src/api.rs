@@ -2,11 +2,11 @@ use crate::import::bg_import_data;
 use crate::operation::{OperationState, OperationStatus};
 use crate::state::AppState;
 use axum::{
+    Json, Router,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
-    extract::{Path, State},
     routing::post,
 };
 use chrono::Utc;
@@ -75,8 +75,8 @@ pub async fn import_handler(
     };
     state
         .operations
-        .lock()
-        .unwrap()
+        .write()
+        .await
         .insert(operation_id.clone(), operation_state);
     tokio::spawn(bg_import_data(
         state.storage.clone(),
@@ -105,7 +105,7 @@ pub async fn get_operation_status(
     State(state): State<AppState>,
     Path((_project_id, operation_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let operations = state.operations.lock().unwrap();
+    let operations = state.operations.read().await;
     if let Some(state) = operations.get(&operation_id) {
         (StatusCode::OK, Json(state.clone())).into_response()
     } else {
