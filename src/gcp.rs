@@ -13,9 +13,26 @@ use crate::google::datastore::v1::{
 use prost_types::value::Kind;
 use prost_types::{Duration, Struct, Value as ValueProps};
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tonic::{Request, Response, Status};
 use tracing;
+
+fn system_time_to_timestamp(time: SystemTime) -> prost_types::Timestamp {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => prost_types::Timestamp {
+            seconds: duration.as_secs() as i64,
+            nanos: duration.subsec_nanos() as i32,
+        },
+        Err(_) => prost_types::Timestamp::default(),
+    }
+}
+
+fn to_prost_duration(std_duration: std::time::Duration) -> Duration {
+    Duration {
+        seconds: std_duration.as_secs() as i64,
+        nanos: std_duration.subsec_nanos() as i32,
+    }
+}
 
 #[tonic::async_trait]
 impl DatastoreService for DatastoreEmulator {
@@ -38,7 +55,6 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
-        let start_time = SystemTime::now();
         let req = request.into_inner();
         let storage = self.storage.read().await;
         let mut found = Vec::new();
@@ -56,14 +72,7 @@ impl DatastoreService for DatastoreEmulator {
                 });
             }
         }
-        // Get current time for read_time
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-
-        let read_time = prost_types::Timestamp {
-            seconds: total_time_duration.as_secs() as i64,
-            nanos: total_time_duration.as_nanos() as i32,
-        };
+        let read_time = system_time_to_timestamp(SystemTime::now());
 
         Ok(Response::new(LookupResponse {
             found,
@@ -78,7 +87,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
-        let start_time = SystemTime::now();
+        let start = Instant::now();
         let req = request.into_inner();
         let storage = self.storage.read().await;
         // Extract the query from the request
@@ -117,10 +126,7 @@ impl DatastoreService for DatastoreEmulator {
             fields: fields.clone(),
         };
 
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time
-            .duration_since(start_time)
-            .expect("Clock may have gone backwards");
+        let execution_duration = start.elapsed();
 
         Ok(Response::new(RunQueryResponse {
             transaction: vec![],
@@ -135,10 +141,7 @@ impl DatastoreService for DatastoreEmulator {
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: amount_results,
-                    execution_duration: Some(Duration {
-                        seconds: total_time_duration.as_secs() as i64,
-                        nanos: total_time_duration.as_nanos() as i32,
-                    }),
+                    execution_duration: Some(to_prost_duration(execution_duration)),
                     read_operations: 10,
                     debug_stats: Some(debug_stats),
                 }),
@@ -150,7 +153,6 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        let start_time = SystemTime::now();
         let req = request.into_inner();
         let mut storage = self.storage.write().await;
         let mut mutation_results = Vec::new();
@@ -396,17 +398,12 @@ impl DatastoreService for DatastoreEmulator {
         }
 
         // Get current time for the commit timestamp
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
-        let total_duration = prost_types::Timestamp {
-            seconds: total_time_duration.as_secs() as i64,
-            nanos: total_time_duration.as_nanos() as i32,
-        };
+        let commit_time = system_time_to_timestamp(SystemTime::now());
 
         let response = Response::new(CommitResponse {
             mutation_results,
             index_updates,
-            commit_time: Some(total_duration),
+            commit_time: Some(commit_time),
         });
 
         Ok(response)
@@ -573,7 +570,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<RunAggregationQueryResponse>, Status> {
-        let start_time = SystemTime::now();
+        let start = Instant::now();
         let req = request.into_inner();
         let storage = self.storage.read().await;
 
@@ -603,10 +600,7 @@ impl DatastoreService for DatastoreEmulator {
         };
 
         // Get current time for read_time
-        let read_time = prost_types::Timestamp {
-            seconds: 0,
-            nanos: 0,
-        };
+        let read_time = system_time_to_timestamp(SystemTime::now());
 
         // Process each aggregation
         let mut matching_entities = Vec::new();
@@ -800,8 +794,7 @@ impl DatastoreService for DatastoreEmulator {
             fields: fields.clone(),
         };
 
-        let end_time = SystemTime::now();
-        let total_time_duration = end_time.duration_since(start_time).unwrap_or_default();
+        let execution_duration = start.elapsed();
         let response = Response::new(RunAggregationQueryResponse {
             batch: Some(batch),
             query: Some(aggregation_query),
@@ -812,10 +805,7 @@ impl DatastoreService for DatastoreEmulator {
                 }),
                 execution_stats: Some(ExecutionStats {
                     results_returned: total_results,
-                    execution_duration: Some(Duration {
-                        seconds: total_time_duration.as_secs() as i64,
-                        nanos: total_time_duration.as_nanos() as i32,
-                    }),
+                    execution_duration: Some(to_prost_duration(execution_duration)),
                     read_operations: storage.entities.len() as i64,
                     debug_stats: Some(debug_stats),
                 }),
