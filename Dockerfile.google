@@ -1,0 +1,7 @@
+FROM --platform=linux/amd64 eclipse-temurin:21-jre AS jre
+
+FROM --platform=linux/amd64 gcr.io/google.com/cloudsdktool/cloud-sdk:541.0.0
+
+COPY --from=jre /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH=${JAVA_HOME}/bin:${PATH}

@@ -19,7 +19,9 @@ services:
   # Service for the official Google Datastore emulator
   datastore-emulator-google:
     container_name: datastore_emulator_google
-    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.google
     environment:
       - JAVA_TOOL_OPTIONS=-Xmx8G
     command: >
@@ -29,4 +31,3 @@ services:
       --no-store-on-disk"
     ports:
       - "8044:8044" # gRPC port for the official Google emulator
-
