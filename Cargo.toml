@@ -2,6 +2,13 @@
 name = "datastore-emulator"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/guibeira/datastore-emulator"
+homepage = "https://github.com/guibeira/datastore-emulator"
+description = "A Google Cloud Datastore emulator written in Rust."
+keywords = ["datastore", "emulator", "google-cloud", "gcp"]
+categories = ["command-line-utilities", "network-programming", "database"]
 
 [dependencies]
 tonic = { version = "0.9", features=["gzip"] }
