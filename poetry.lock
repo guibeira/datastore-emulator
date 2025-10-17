@@ -241,26 +241,6 @@ protobuf = ">=3.20.2,<4.21.0 || >4.21.0,<4.21.1 || >4.21.1,<4.21.2 || >4.21.2,<4
 libcst = ["libcst (>=0.2.5)"]
 
 [[package]]
-name = "google-cloud-ndb"
-version = "2.3.4"
-description = "NDB library for Google Cloud Datastore"
-optional = false
-python-versions = ">=3.7"
-groups = ["main"]
-files = [
-    {file = "google_cloud_ndb-2.3.4-py3-none-any.whl", hash = "sha256:6bf46c7331a58229408251652521f14355cf74ba58f5aa049c0664562d468a29"},
-    {file = "google_cloud_ndb-2.3.4.tar.gz", hash = "sha256:c2cdc38b22fa2d3f6984db6368b9be11902235ef46e2252a17f8083fe3176160"},
-]
-
-[package.dependencies]
-google-api-core = {version = ">=1.34.0,<2.0.dev0 || >=2.11.dev0,<3.0.0", extras = ["grpc"]}
-google-cloud-datastore = ">=2.16.0,<2.20.2 || >2.20.2,<3.0.0"
-protobuf = ">=3.20.2,<4.21.0 || >4.21.0,<4.21.1 || >4.21.1,<4.21.2 || >4.21.2,<4.21.3 || >4.21.3,<4.21.4 || >4.21.4,<4.21.5 || >4.21.5,<7.0.0"
-pymemcache = ">=2.1.0,<5.0.0"
-pytz = ">=2018.3"
-redis = ">=3.0.0,<7.0.0"
-
-[[package]]
 name = "googleapis-common-protos"
 version = "1.70.0"
 description = "Common protobufs used in Google APIs"
@@ -496,18 +476,6 @@ files = [
 windows-terminal = ["colorama (>=0.4.6)"]
 
 [[package]]
-name = "pymemcache"
-version = "4.0.0"
-description = "A comprehensive, fast, pure Python memcached client"
-optional = false
-python-versions = ">=3.7"
-groups = ["main"]
-files = [
-    {file = "pymemcache-4.0.0-py2.py3-none-any.whl", hash = "sha256:f507bc20e0dc8d562f8df9d872107a278df049fa496805c1431b926f3ddd0eab"},
-    {file = "pymemcache-4.0.0.tar.gz", hash = "sha256:27bf9bd1bbc1e20f83633208620d56de50f14185055e49504f4f5e94e94aff94"},
-]
-
-[[package]]
 name = "pytest"
 version = "8.4.1"
 description = "pytest: simple powerful testing with Python"
@@ -528,35 +496,6 @@ pygments = ">=2.7.2"
 
 [package.extras]
 dev = ["argcomplete", "attrs (>=19.2)", "hypothesis (>=3.56)", "mock", "requests", "setuptools", "xmlschema"]
-
-[[package]]
-name = "pytz"
-version = "2025.2"
-description = "World timezone definitions, modern and historical"
-optional = false
-python-versions = "*"
-groups = ["main"]
-files = [
-    {file = "pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00"},
-    {file = "pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3"},
-]
-
-[[package]]
-name = "redis"
-version = "6.4.0"
-description = "Python client for Redis database and key-value store"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "redis-6.4.0-py3-none-any.whl", hash = "sha256:f0544fa9604264e9464cdf4814e7d4830f74b165d52f2a330a760a88dd248b7f"},
-    {file = "redis-6.4.0.tar.gz", hash = "sha256:b01bc7282b8444e28ec36b261df5375183bb47a07eb9c603f284e89cbc5ef010"},
-]
-
-[package.extras]
-hiredis = ["hiredis (>=3.2.0)"]
-jwt = ["pyjwt (>=2.9.0)"]
-ocsp = ["cryptography (>=36.0.1)", "pyopenssl (>=20.0.1)", "requests (>=2.31.0)"]
 
 [[package]]
 name = "requests"
@@ -615,4 +554,4 @@ zstd = ["zstandard (>=0.18.0)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12"
-content-hash = "22e57322316cede8b80904560cb329e18cadcc532d098d6a7da985f2ea7a090b"
+content-hash = "7f3ba48e836c2de959c1e67a0105b877923a50bef8bb7b711d065808cf8b333a"
