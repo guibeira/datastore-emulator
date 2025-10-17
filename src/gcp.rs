@@ -56,8 +56,14 @@ impl DatastoreService for DatastoreEmulator {
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
         let req = request.into_inner();
+        tracing::debug!(
+            "Lookup request received: keys={:?} read_options={:?}",
+            req.keys,
+            req.read_options
+        );
         let storage = self.storage.read().await;
         let mut found = Vec::new();
+        let mut missing = Vec::new();
 
         // process each key in the request
         for key in &req.keys {
@@ -70,13 +76,27 @@ impl DatastoreService for DatastoreEmulator {
                     cursor: vec![],
                     version: entity.version as i64,
                 });
+            } else {
+                // Return a placeholder entity result with only the key populated so clients
+                // such as google-cloud-ndb can mark this lookup as a miss.
+                let entity = Entity {
+                    key: Some(key.clone()),
+                    properties: HashMap::new(),
+                };
+                missing.push(EntityResult {
+                    entity: Some(entity),
+                    create_time: None,
+                    update_time: None,
+                    cursor: vec![],
+                    version: 0,
+                });
             }
         }
         let read_time = system_time_to_timestamp(SystemTime::now());
 
         Ok(Response::new(LookupResponse {
             found,
-            missing: vec![], // do we really need to check for missing keys?
+            missing,
             deferred: vec![],
             transaction: Vec::new(),
             read_time: Some(read_time),
@@ -87,6 +107,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<RunQueryResponse>, Status> {
+        tracing::debug!("Received RunQueryRequest: {:?}", request);
         let start = Instant::now();
         let req = request.into_inner();
         let storage = self.storage.read().await;
@@ -110,6 +131,7 @@ impl DatastoreService for DatastoreEmulator {
             query_obj.limit,
             query_obj.start_cursor.clone(),
             query_obj.projection.clone(),
+            query_obj.distinct_on.clone(),
             query_obj.order.clone(),
         );
         let mut fields = BTreeMap::new();
@@ -153,6 +175,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
+        tracing::debug!("Received CommitRequest: {:?}", request);
         let req = request.into_inner();
         let mut storage = self.storage.write().await;
         let mut mutation_results = Vec::new();
@@ -284,7 +307,6 @@ impl DatastoreService for DatastoreEmulator {
                     } // Closes Operation::Update(entity) arm
                     // Removed duplicate Operation::Update block
                     Operation::Upsert(entity) => {
-                        //dbg!("Upserting entity", &entity);
                         let key = match entity.key {
                             Some(ref key) => key.clone(),
                             None => {
@@ -293,58 +315,77 @@ impl DatastoreService for DatastoreEmulator {
                                 ));
                             }
                         };
-                        // Note: Upsert might generate an ID if the key is incomplete.
-                        // This logic assumes the key provided to upsert is complete or will be treated as such.
-                        // If ID generation is needed for upsert like in Insert, it should be added here.
-                        // For now, we assume `key` is complete for `KeyStruct` creation.
-                        let key_struct = KeyStruct::from_datastore_key(&key);
 
-                        let timestamp_now = prost_types::Timestamp {
-                            // Placeholder
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        let key_is_incomplete = key
+                            .path
+                            .iter()
+                            .any(|path_element| path_element.id_type.is_none());
 
-                        let entry = storage.entities.entry(key_struct.clone());
-                        let version;
-                        let create_time;
-                        let update_time = timestamp_now.clone();
+                        if key_is_incomplete {
+                            let (final_key, metadata) = storage.insert_entity(&entity)?;
+                            mutation_results.push(crate::google::datastore::v1::MutationResult {
+                                key: Some(final_key),
+                                version: metadata.version as i64,
+                                create_time: Some(metadata.create_time.clone()),
+                                update_time: Some(metadata.update_time.clone()),
+                                conflict_detected: false,
+                                transform_results: vec![],
+                            });
+                        } else {
+                            let key_struct = KeyStruct::from_datastore_key(&key);
 
-                        match entry {
-                            std::collections::btree_map::Entry::Occupied(mut occupied_entry) => {
-                                //dbg!("Upserting (update path) entity", &key.path);
-                                let metadata = occupied_entry.get_mut();
-                                metadata.entity = entity.clone();
-                                metadata.version += 1;
-                                metadata.update_time = update_time.clone();
-                                version = metadata.version;
-                                create_time = metadata.create_time.clone();
+                            let timestamp_now = prost_types::Timestamp {
+                                // Placeholder
+                                seconds: 0,
+                                nanos: 0,
+                            };
+
+                            let mut observe_key_counters = false;
+                            let entry = storage.entities.entry(key_struct.clone());
+                            let version;
+                            let create_time;
+                            let update_time = timestamp_now.clone();
+
+                            match entry {
+                                std::collections::btree_map::Entry::Occupied(
+                                    mut occupied_entry,
+                                ) => {
+                                    let metadata = occupied_entry.get_mut();
+                                    metadata.entity = entity.clone();
+                                    metadata.version += 1;
+                                    metadata.update_time = update_time.clone();
+                                    version = metadata.version;
+                                    create_time = metadata.create_time.clone();
+                                }
+                                std::collections::btree_map::Entry::Vacant(vacant_entry) => {
+                                    let new_metadata = EntityWithMetadata {
+                                        entity: entity.clone(),
+                                        version: 1,
+                                        create_time: timestamp_now.clone(),
+                                        update_time: update_time.clone(),
+                                    };
+                                    version = new_metadata.version;
+                                    create_time = new_metadata.create_time.clone();
+                                    observe_key_counters = true;
+                                    vacant_entry.insert(new_metadata);
+                                }
                             }
-                            std::collections::btree_map::Entry::Vacant(vacant_entry) => {
-                                //dbg!("Upserting (insert path) entity", &key.path);
-                                let new_metadata = EntityWithMetadata {
-                                    entity: entity.clone(),
-                                    version: 1,
-                                    create_time: timestamp_now.clone(),
-                                    update_time: update_time.clone(),
-                                };
-                                version = new_metadata.version;
-                                create_time = new_metadata.create_time.clone();
-                                vacant_entry.insert(new_metadata);
+
+                            if observe_key_counters {
+                                storage.observe_key_id(&key);
                             }
+
+                            storage.update_indexes(&key_struct, &entity);
+
+                            mutation_results.push(crate::google::datastore::v1::MutationResult {
+                                key: Some(key),
+                                version: version as i64,
+                                create_time: Some(create_time.clone()),
+                                update_time: Some(update_time.clone()),
+                                conflict_detected: false,
+                                transform_results: vec![],
+                            });
                         }
-
-                        storage.update_indexes(&key_struct, entity);
-
-                        // Use the determined version, create_time, and update_time for the result
-                        mutation_results.push(crate::google::datastore::v1::MutationResult {
-                            key: Some(key),
-                            version: version as i64,
-                            create_time: Some(create_time.clone()),
-                            update_time: Some(update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
                     }
                     Operation::Delete(key_to_delete) => {
                         if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
@@ -405,7 +446,6 @@ impl DatastoreService for DatastoreEmulator {
             index_updates,
             commit_time: Some(commit_time),
         });
-
         Ok(response)
     }
 
@@ -413,6 +453,7 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
+        tracing::debug!("Received BeginTransactionRequest: {:?}", request);
         let start = SystemTime::now();
         let req = request.into_inner();
         let duration_since_epoch = start
@@ -466,6 +507,10 @@ impl DatastoreService for DatastoreEmulator {
         let transaction_response = BeginTransactionResponse {
             transaction: transaction_bytes,
         };
+        tracing::debug!(
+            "Began transaction with ID: {:?}",
+            String::from_utf8_lossy(&transaction_response.transaction)
+        );
         Ok(Response::new(transaction_response))
     }
 

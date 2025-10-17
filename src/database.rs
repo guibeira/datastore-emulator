@@ -11,7 +11,8 @@ use crate::google::datastore::v1::key::path_element::IdType;
 use crate::google::datastore::v1::query_result_batch::MoreResultsType;
 use crate::google::datastore::v1::value::ValueType;
 use crate::google::datastore::v1::{
-    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, Value, property_order,
+    ArrayValue, Filter, LatLng, PartitionId, Projection, PropertyOrder, PropertyReference, Value,
+    property_order,
 };
 use chrono::DateTime;
 use prost::Message;
@@ -1012,52 +1013,61 @@ impl DatastoreStorage {
                             };
 
                             if let Some(entity_value) = entity_value_opt {
+                                let entity_values: Vec<&Value> = match &entity_value.value_type {
+                                    Some(ValueType::ArrayValue(array)) => {
+                                        array.values.iter().collect()
+                                    }
+                                    _ => vec![&entity_value],
+                                };
+
                                 match property_filter.op {
                                     0 => true, // OPERATOR_UNSPECIFIED
-                                    1 => {
-                                        // LESS_THAN
-                                        compare_values(&entity_value, filter_value).is_lt()
-                                    }
-                                    2 => {
-                                        // LESS_THAN_OR_EQUAL
-                                        compare_values(&entity_value, filter_value).is_le()
-                                    }
-                                    3 => {
-                                        // GREATER_THAN
-                                        compare_values(&entity_value, filter_value).is_gt()
-                                    }
-                                    4 => {
-                                        // GREATER_THAN_OR_EQUAL
-                                        compare_values(&entity_value, filter_value).is_ge()
-                                    }
-                                    5 => entity_value.value_type == filter_value.value_type, // EQUAL
+                                    1 => entity_values
+                                        .iter()
+                                        .any(|v| compare_values(v, filter_value).is_lt()),
+                                    2 => entity_values
+                                        .iter()
+                                        .any(|v| compare_values(v, filter_value).is_le()),
+                                    3 => entity_values
+                                        .iter()
+                                        .any(|v| compare_values(v, filter_value).is_gt()),
+                                    4 => entity_values
+                                        .iter()
+                                        .any(|v| compare_values(v, filter_value).is_ge()),
+                                    5 => entity_values
+                                        .iter()
+                                        .any(|v| v.value_type == filter_value.value_type),
                                     6 => {
-                                        // IN
                                         if let Some(ValueType::ArrayValue(array_value)) =
                                             &filter_value.value_type
                                         {
-                                            return array_value
-                                                .values
-                                                .iter()
-                                                .any(|v| v.value_type == entity_value.value_type);
+                                            entity_values.iter().any(|v| {
+                                                array_value.values.iter().any(|candidate| {
+                                                    candidate.value_type == v.value_type
+                                                })
+                                            })
+                                        } else {
+                                            false
                                         }
-                                        false
                                     }
-                                    9 => entity_value.value_type != filter_value.value_type, // NOT_EQUAL
-                                    // Case 11 (HAS_ANCESTOR) is handled above
+                                    9 => entity_values
+                                        .iter()
+                                        .all(|v| v.value_type != filter_value.value_type),
+                                    // HAS_ANCESTOR handled above
                                     13 => {
-                                        // NOT_IN
                                         if let Some(ValueType::ArrayValue(array_value)) =
                                             &filter_value.value_type
                                         {
-                                            return !array_value
-                                                .values
-                                                .iter()
-                                                .any(|v| v.value_type == entity_value.value_type);
+                                            entity_values.iter().all(|v| {
+                                                array_value.values.iter().all(|candidate| {
+                                                    candidate.value_type != v.value_type
+                                                })
+                                            })
+                                        } else {
+                                            true
                                         }
-                                        true
                                     }
-                                    _ => false, // Unsupported operator for property or op combination
+                                    _ => false,
                                 }
                             } else {
                                 // Property not found in entity for regular filters (and not HAS_ANCESTOR)
@@ -1297,6 +1307,7 @@ impl DatastoreStorage {
         limit: Option<i32>,
         start_cursor: Vec<u8>,
         projection: Vec<Projection>,
+        distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
         let metadata_holder: Vec<EntityWithMetadata>;
@@ -1309,7 +1320,9 @@ impl DatastoreStorage {
             }
         };
 
-        let mut filtered_entities: Vec<&EntityWithMetadata> =
+        let limit = limit.filter(|value| *value > 0);
+
+        let filtered_entities: Vec<&EntityWithMetadata> =
             if METADATA_KINDS.contains(&kind_name.as_str()) {
                 metadata_holder = self.get_metadata(&kind_name, &project_id_filter);
                 metadata_holder
@@ -1359,9 +1372,23 @@ impl DatastoreStorage {
                     .collect()
             };
 
+        let filtered_with_keys: Vec<(Option<KeyStruct>, &EntityWithMetadata)> = filtered_entities
+            .into_iter()
+            .map(|entity| {
+                let key_struct = entity
+                    .entity
+                    .key
+                    .as_ref()
+                    .map(|key| KeyStruct::from_datastore_key(key));
+                (key_struct, entity)
+            })
+            .collect();
+
+        let mut filtered_entities = filtered_with_keys;
+
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_by(|a_meta, b_meta| {
+            filtered_entities.sort_by(|(_a_key, a_meta), (_b_key, b_meta)| {
                 let mut final_ordering = Ordering::Equal;
                 for order_by in &order {
                     if final_ordering != Ordering::Equal {
@@ -1405,38 +1432,93 @@ impl DatastoreStorage {
             });
         }
 
+        if !distinct_on.is_empty() {
+            let mut seen_signatures = HashSet::new();
+            let mut distinct_entities = Vec::new();
+
+            for (key_struct_opt, entity_metadata) in filtered_entities.into_iter() {
+                let mut signature_parts = Vec::with_capacity(distinct_on.len());
+
+                for prop in &distinct_on {
+                    if prop.name == "__key__" {
+                        if let Some(key_struct) = key_struct_opt.as_ref() {
+                            signature_parts.push(format!("KEY:{:?}", key_struct));
+                        } else {
+                            signature_parts.push("KEY:<missing>".to_string());
+                        }
+                    } else if let Some(value) = entity_metadata.entity.properties.get(&prop.name) {
+                        signature_parts.push(format!("{:?}", value));
+                    } else {
+                        signature_parts.push(format!("{}:<missing>", prop.name));
+                    }
+                }
+
+                let signature = signature_parts.join("|");
+                if seen_signatures.insert(signature) {
+                    distinct_entities.push((key_struct_opt, entity_metadata));
+                }
+            }
+
+            filtered_entities = distinct_entities;
+        }
+
         // 3. Paginate and apply projections
         let mut results = Vec::new();
-        let mut start = 0;
+        let mut start_index = 0usize;
         if !start_cursor.is_empty() {
-            start = u32::from_be_bytes(
-                start_cursor
-                    .get(0..4)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .unwrap_or([0, 0, 0, 0]),
-            ) as usize;
+            let decode_result = bincode::serde::decode_from_slice::<KeyStruct, _>(
+                &start_cursor,
+                bincode::config::standard(),
+            );
+            if let Ok((cursor_key, _)) = decode_result {
+                let mut matched = false;
+                for (idx, (key_struct_opt, _)) in filtered_entities.iter().enumerate() {
+                    if let Some(key_struct) = key_struct_opt {
+                        if key_struct == &cursor_key {
+                            start_index = idx + 1;
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if !matched {
+                    let mut index = 0usize;
+                    for (key_struct_opt, _) in &filtered_entities {
+                        match key_struct_opt {
+                            Some(key_struct) if key_struct <= &cursor_key => index += 1,
+                            _ => break,
+                        }
+                    }
+                    start_index = index;
+                }
+            } else if start_cursor.len() >= 4 {
+                start_index = u32::from_be_bytes(
+                    start_cursor
+                        .get(0..4)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .unwrap_or([0, 0, 0, 0]),
+                ) as usize;
+            }
         }
 
         let db_entities_count = filtered_entities.len();
         let mut current_entities_payload_size: usize = 0;
         let mut new_more_results_state = MoreResultsType::NoMoreResults;
-        let mut items_processed_from_start = 0;
+        let mut next_offset = start_index;
+        let mut last_cursor_bytes: Option<Vec<u8>> = None;
 
         let is_keys_only = !projection.is_empty()
             && projection
                 .iter()
                 .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
 
-        for entity_metadata in filtered_entities.iter().skip(start) {
-            items_processed_from_start += 1;
-
+        for (key_struct_opt, entity_metadata) in filtered_entities.iter().skip(start_index) {
             // Apply limit and payload size checks
             let entity_size_bytes = entity_metadata.entity.encoded_len(); // This might need adjustment for projections
             if !results.is_empty()
                 && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
             {
                 new_more_results_state = MoreResultsType::NotFinished;
-                items_processed_from_start -= 1;
                 break;
             }
 
@@ -1444,7 +1526,6 @@ impl DatastoreStorage {
                 && results.len() >= limit_value as usize
             {
                 new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
-                items_processed_from_start -= 1;
                 break;
             }
 
@@ -1471,20 +1552,33 @@ impl DatastoreStorage {
                 entity_metadata.entity.clone()
             };
 
+            let cursor_value = if let Some(key_struct) = key_struct_opt {
+                bincode::serde::encode_to_vec(key_struct, bincode::config::standard())
+                    .unwrap_or_else(|_| (next_offset as u32 + 1).to_be_bytes().to_vec())
+            } else {
+                (next_offset as u32 + 1).to_be_bytes().to_vec()
+            };
+
+            let cursor_clone = cursor_value.clone();
+
             results.push(EntityResult {
                 entity: Some(result_entity),
                 create_time: Some(entity_metadata.create_time.clone()),
                 update_time: Some(entity_metadata.update_time.clone()),
-                cursor: vec![],
+                cursor: cursor_value,
                 version: entity_metadata.version as i64,
             });
             current_entities_payload_size += entity_metadata.entity.encoded_len(); // Use original size for payload calculation
+            next_offset += 1;
+            last_cursor_bytes = Some(cursor_clone);
         }
 
-        let final_cursor_offset = start + items_processed_from_start;
+        let final_cursor_offset = next_offset;
 
         let end_cursor = {
-            if final_cursor_offset >= db_entities_count {
+            if let Some(cursor_bytes) = last_cursor_bytes {
+                cursor_bytes
+            } else if final_cursor_offset >= db_entities_count {
                 vec![]
             } else {
                 (final_cursor_offset as u32).to_be_bytes().to_vec()
@@ -1497,7 +1591,19 @@ impl DatastoreStorage {
             new_more_results_state = MoreResultsType::NotFinished;
         }
 
-        let entity_result_type = if is_keys_only || !projection.is_empty() {
+        tracing::debug!(
+            "QueryResultBatch: start={} returned={} more_results={:?} final_offset={} total={} end_cursor_len={}",
+            start_index,
+            results.len(),
+            new_more_results_state,
+            final_cursor_offset,
+            db_entities_count,
+            end_cursor.len()
+        );
+
+        let entity_result_type = if is_keys_only {
+            3 // KEY_ONLY
+        } else if !projection.is_empty() {
             2 // PROJECTION
         } else {
             1 // FULL
@@ -1505,7 +1611,7 @@ impl DatastoreStorage {
 
         crate::google::datastore::v1::QueryResultBatch {
             entity_result_type,
-            skipped_results: start as i32,
+            skipped_results: start_index as i32,
             read_time: None,
             skipped_cursor: vec![],
             snapshot_version: 0,
