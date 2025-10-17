@@ -7,15 +7,11 @@ authors = [
 ]
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "google-cloud-datastore (==2.20.2)",
-    "pytest (>=8.4.1,<9.0.0)"
-]
 
 
 [tool.poetry.dependencies]
 python = ">=3.12"
-google-cloud-datastore = "2.20.2"
+google-cloud-datastore = "^2.20.2"
 pytest = {version = ">=8.4.1,<9.0.0"}
 
 [build-system]
