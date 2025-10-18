@@ -1,4 +1,5 @@
 # Datastore Emulator in Rust
+![Crates.io Version](https://img.shields.io/crates/v/datastore-emulator)
 <p align="center">
   <img src="https://github.com/guibeira/datastore-emulator/blob/main/logo.png?raw=true" alt="Project's logo"/>
 </p>
@@ -20,11 +21,52 @@ The repository includes a comprehensive test suite that runs against both this c
 
 ## How to use
 
+### Using Cargo (recommended)
+Make sure you have Rust and Cargo installed on your system. You can install the Rust toolchain by following the instructions at [rustup.rs](https://rustup.rs/). Then, you can install the Rust Datastore emulator using Cargo:
+
+```bash
+cargo install datastore-emulator
+```
+
+### Using Docker compose
+You can use the following `docker-compose.yml` file to run the Rust Datastore emulator: 
+
+```bash
+services:
+  datastore-emulator:
+    image: guibeira/datastore-emulator:latest
+    command: [
+      "--grpc-host", "0.0.0.0",
+      "--grpc-port", "8042",
+      "--http-host","0.0.0.0",
+      "--http-port","8043",
+      "--no-store-on-disk",
+    ]
+    ports:
+      - "8042:8042" # gRPC port for the Rust emulator
+      - "8043:8043" # HTTP port for the Rust emulator
+
+```
+### Using the pre-built Docker image
+You can run the Rust Datastore emulator using the pre-built Docker image available on Docker Hub.   
+
+```bash
+docker run -d -p 8042:8042 -p 8043:8043 guibeira/datastore-emulator:latest \
+  --grpc-host 0.0.0.0 \
+  --grpc-port 8042 \
+  --http-host 0.0.0.0 \
+  --http-port 8043 \
+  --no-store-on-disk
+```
+
+
+## Building from source
+
 Make sure you have the following prerequisites installed on your system:
  * Rust toolchain (using `rustup`)
  * protobuf compiler (`protoc`)
 
-### 2. Run the Rust Emulator
+### Run the Rust Emulator
 To build the Rust emulator, navigate to the project root and run:
 
 ```bash
@@ -48,21 +90,5 @@ Here are some results with 30 clients and 10 runs each:
 | Simple Query | 20.5427s | 62.8813s | 0.6848s | 2.0960s | Rust 3.06x faster |
 
 
-If you want to run the benchmarks yourself, run the following commands:
-
-```bash
-    docker compose up --build -d
-
-```
-install python dependencies:
-
-```bash
-
-    poetry install --no-root && poetry env activate
-
-```
-and then run the benchmarks:
-
-```bash
-    python benchmark/test_benchmark.py --num-clients 30 --num-runs 10
+If you want to run the benchmarks yourself, [here](https://github.com/guibeira/datastore-emulator/tree/main/benchmark#readme) are the instructions:
 
