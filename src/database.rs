@@ -88,6 +88,118 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// Resolves a nested property path (e.g., "organizations.key.consistentId") against an entity's properties.
+/// Returns all values found at the path (handles arrays at any level).
+fn resolve_nested_property(properties: &HashMap<String, Value>, property_path: &str) -> Vec<Value> {
+    let parts: Vec<&str> = property_path.split('.').collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    resolve_property_path_recursive(properties, &parts)
+}
+
+/// Recursively resolve a property path through nested entities and arrays.
+fn resolve_property_path_recursive(
+    properties: &HashMap<String, Value>,
+    path_parts: &[&str],
+) -> Vec<Value> {
+    if path_parts.is_empty() {
+        return Vec::new();
+    }
+
+    let current_part = path_parts[0];
+    let remaining_parts = &path_parts[1..];
+
+    // Get the value for the current property name
+    let Some(value) = properties.get(current_part) else {
+        return Vec::new();
+    };
+
+    // If this is the last part of the path, return the value(s)
+    if remaining_parts.is_empty() {
+        return match &value.value_type {
+            Some(ValueType::ArrayValue(array)) => array.values.clone(),
+            _ => vec![value.clone()],
+        };
+    }
+
+    // Otherwise, we need to traverse deeper
+    match &value.value_type {
+        Some(ValueType::EntityValue(entity)) => {
+            // Single embedded entity - recurse into its properties
+            resolve_property_path_recursive(&entity.properties, remaining_parts)
+        }
+        Some(ValueType::ArrayValue(array)) => {
+            // Array of values - for each element that is an entity, recurse and collect results
+            let mut results = Vec::new();
+            for item in &array.values {
+                if let Some(ValueType::EntityValue(entity)) = &item.value_type {
+                    results.extend(resolve_property_path_recursive(
+                        &entity.properties,
+                        remaining_parts,
+                    ));
+                }
+            }
+            results
+        }
+        _ => {
+            // Value is not an entity/array, can't traverse further
+            Vec::new()
+        }
+    }
+}
+
+/// Collects all indexable property paths from an entity, including nested paths.
+/// Returns tuples of (property_path, indexable_values).
+/// For example, for "organizations.key.consistentId", this would return:
+/// [("organizations.key.consistentId", vec!["value1", "value2", ...])]
+fn collect_nested_indexable_paths(
+    properties: &HashMap<String, Value>,
+    prefix: &str,
+) -> Vec<(String, Vec<String>)> {
+    let mut results = Vec::new();
+
+    for (prop_name, prop_value) in properties {
+        if prop_value.exclude_from_indexes {
+            continue;
+        }
+
+        let full_path = if prefix.is_empty() {
+            prop_name.clone()
+        } else {
+            format!("{}.{}", prefix, prop_name)
+        };
+
+        // Get indexable values for this property at its current level
+        let indexable_values = get_indexable_strings_for_value(prop_value);
+        if !indexable_values.is_empty() {
+            results.push((full_path.clone(), indexable_values));
+        }
+
+        // Recurse into nested entities
+        match &prop_value.value_type {
+            Some(ValueType::EntityValue(entity)) => {
+                results.extend(collect_nested_indexable_paths(&entity.properties, &full_path));
+            }
+            Some(ValueType::ArrayValue(array)) => {
+                // For arrays, collect nested properties from each entity element
+                for item in &array.values {
+                    if let Some(ValueType::EntityValue(entity)) = &item.value_type {
+                        results.extend(collect_nested_indexable_paths(
+                            &entity.properties,
+                            &full_path,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    results
+}
+
 fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
     let mut values = Vec::new();
     if let Some(value_type) = &value.value_type {
@@ -999,27 +1111,41 @@ impl DatastoreStorage {
                         }
                         // Regular property filters
                         else {
-                            let entity_value_opt = if property.name == "__key__" {
-                                entity_metadata.entity.key.as_ref().map(|k| Value {
-                                    value_type: Some(ValueType::KeyValue(k.clone())),
-                                    ..Default::default()
-                                })
+                            // Check if this is a nested property path (contains dots)
+                            let entity_values: Vec<Value> = if property.name == "__key__" {
+                                entity_metadata
+                                    .entity
+                                    .key
+                                    .as_ref()
+                                    .map(|k| {
+                                        vec![Value {
+                                            value_type: Some(ValueType::KeyValue(k.clone())),
+                                            ..Default::default()
+                                        }]
+                                    })
+                                    .unwrap_or_default()
+                            } else if property.name.contains('.') {
+                                // Nested property path - use recursive resolution
+                                resolve_nested_property(
+                                    &entity_metadata.entity.properties,
+                                    &property.name,
+                                )
                             } else {
+                                // Simple property lookup
                                 entity_metadata
                                     .entity
                                     .properties
                                     .get(&property.name)
-                                    .cloned()
+                                    .map(|v| match &v.value_type {
+                                        Some(ValueType::ArrayValue(array)) => {
+                                            array.values.clone()
+                                        }
+                                        _ => vec![v.clone()],
+                                    })
+                                    .unwrap_or_default()
                             };
 
-                            if let Some(entity_value) = entity_value_opt {
-                                let entity_values: Vec<&Value> = match &entity_value.value_type {
-                                    Some(ValueType::ArrayValue(array)) => {
-                                        array.values.iter().collect()
-                                    }
-                                    _ => vec![&entity_value],
-                                };
-
+                            if !entity_values.is_empty() {
                                 match property_filter.op {
                                     0 => true, // OPERATOR_UNSPECIFIED
                                     1 => entity_values
@@ -1622,38 +1748,37 @@ impl DatastoreStorage {
     }
 
     pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
-        // For each property of an entity, creates an index
-        for (prop_name, prop_value) in &entity.properties {
-            if !prop_value.exclude_from_indexes
-                && let Some((kind, _)) = key_struct.path_elements.last()
-            {
-                for value_str in get_indexable_strings_for_value(prop_value) {
-                    let index_key = (kind.clone(), prop_name.clone(), value_str);
-                    self.indexes
-                        .entry(index_key)
-                        .or_default()
-                        .insert(key_struct.clone());
-                }
+        let Some((kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+
+        // Collect all indexable property paths including nested ones
+        let nested_paths = collect_nested_indexable_paths(&entity.properties, "");
+
+        for (prop_path, indexable_values) in nested_paths {
+            for value_str in indexable_values {
+                let index_key = (kind.clone(), prop_path.clone(), value_str);
+                self.indexes
+                    .entry(index_key)
+                    .or_default()
+                    .insert(key_struct.clone());
             }
         }
     }
 
     pub fn remove_from_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
-        // For each property of an entity, remove its KeyStruct from the index
-        for (prop_name, prop_value) in &entity.properties {
-            if !prop_value.exclude_from_indexes
-                && let Some((kind, _)) = key_struct.path_elements.last()
-            {
-                for value_str in get_indexable_strings_for_value(prop_value) {
-                    let index_key = (kind.clone(), prop_name.clone(), value_str);
-                    if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                        indexed_keys_set.remove(key_struct);
-                        // Optional: if indexed_keys_set is empty after removal,
-                        // we could remove the index_key itself from self.indexes.
-                        // if indexed_keys_set.is_empty() {
-                        //     self.indexes.remove(&index_key);
-                        // }
-                    }
+        let Some((kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+
+        // Collect all indexable property paths including nested ones
+        let nested_paths = collect_nested_indexable_paths(&entity.properties, "");
+
+        for (prop_path, indexable_values) in nested_paths {
+            for value_str in indexable_values {
+                let index_key = (kind.clone(), prop_path.clone(), value_str);
+                if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                    indexed_keys_set.remove(key_struct);
                 }
             }
         }
@@ -1669,5 +1794,177 @@ impl DatastoreStorage {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a string Value
+    fn string_value(s: &str) -> Value {
+        Value {
+            value_type: Some(ValueType::StringValue(s.to_string())),
+            ..Default::default()
+        }
+    }
+
+    /// Helper to create an entity Value with the given properties
+    fn entity_value(properties: HashMap<String, Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::EntityValue(Entity {
+                key: None,
+                properties,
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Helper to create an array Value
+    fn array_value(values: Vec<Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_simple_property() {
+        let mut properties = HashMap::new();
+        properties.insert("name".to_string(), string_value("Alice"));
+
+        let results = resolve_nested_property(&properties, "name");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].value_type,
+            Some(ValueType::StringValue("Alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_nested_entity_property() {
+        // Create: { key: { consistentId: "test-id" } }
+        let mut inner_props = HashMap::new();
+        inner_props.insert("consistentId".to_string(), string_value("test-id"));
+
+        let mut properties = HashMap::new();
+        properties.insert("key".to_string(), entity_value(inner_props));
+
+        let results = resolve_nested_property(&properties, "key.consistentId");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].value_type,
+            Some(ValueType::StringValue("test-id".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_array_of_entities() {
+        // Create: { organizations: [{ key: { consistentId: "id1" } }, { key: { consistentId: "id2" } }] }
+        let mut key1_props = HashMap::new();
+        key1_props.insert("consistentId".to_string(), string_value("id1"));
+        let mut org1_props = HashMap::new();
+        org1_props.insert("key".to_string(), entity_value(key1_props));
+
+        let mut key2_props = HashMap::new();
+        key2_props.insert("consistentId".to_string(), string_value("id2"));
+        let mut org2_props = HashMap::new();
+        org2_props.insert("key".to_string(), entity_value(key2_props));
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "organizations".to_string(),
+            array_value(vec![entity_value(org1_props), entity_value(org2_props)]),
+        );
+
+        let results = resolve_nested_property(&properties, "organizations.key.consistentId");
+        assert_eq!(results.len(), 2);
+
+        let values: Vec<String> = results
+            .iter()
+            .filter_map(|v| match &v.value_type {
+                Some(ValueType::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(values.contains(&"id1".to_string()));
+        assert!(values.contains(&"id2".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_property() {
+        let mut properties = HashMap::new();
+        properties.insert("name".to_string(), string_value("Alice"));
+
+        let results = resolve_nested_property(&properties, "email");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_nested_nonexistent_path() {
+        let mut properties = HashMap::new();
+        properties.insert("name".to_string(), string_value("Alice"));
+
+        let results = resolve_nested_property(&properties, "address.city");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_collect_nested_indexable_paths() {
+        // Create: { name: "Alice", address: { city: "NYC", zip: "10001" } }
+        let mut address_props = HashMap::new();
+        address_props.insert("city".to_string(), string_value("NYC"));
+        address_props.insert("zip".to_string(), string_value("10001"));
+
+        let mut properties = HashMap::new();
+        properties.insert("name".to_string(), string_value("Alice"));
+        properties.insert("address".to_string(), entity_value(address_props));
+
+        let paths = collect_nested_indexable_paths(&properties, "");
+
+        // Should have: name, address.city, address.zip
+        assert_eq!(paths.len(), 3);
+
+        let path_names: Vec<&str> = paths.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(path_names.contains(&"name"));
+        assert!(path_names.contains(&"address.city"));
+        assert!(path_names.contains(&"address.zip"));
+    }
+
+    #[test]
+    fn test_collect_nested_indexable_paths_with_array() {
+        // Create: { organizations: [{ key: { consistentId: "id1" } }, { key: { consistentId: "id2" } }] }
+        let mut key1_props = HashMap::new();
+        key1_props.insert("consistentId".to_string(), string_value("id1"));
+        let mut org1_props = HashMap::new();
+        org1_props.insert("key".to_string(), entity_value(key1_props));
+
+        let mut key2_props = HashMap::new();
+        key2_props.insert("consistentId".to_string(), string_value("id2"));
+        let mut org2_props = HashMap::new();
+        org2_props.insert("key".to_string(), entity_value(key2_props));
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "organizations".to_string(),
+            array_value(vec![entity_value(org1_props), entity_value(org2_props)]),
+        );
+
+        let paths = collect_nested_indexable_paths(&properties, "");
+
+        // Should have: organizations.key.consistentId with values ["id1", "id2"]
+        let org_paths: Vec<_> = paths
+            .iter()
+            .filter(|(p, _)| p == "organizations.key.consistentId")
+            .collect();
+
+        assert!(!org_paths.is_empty());
+
+        let all_values: Vec<String> = org_paths
+            .iter()
+            .flat_map(|(_, values)| values.clone())
+            .collect();
+        assert!(all_values.contains(&"id1".to_string()));
+        assert!(all_values.contains(&"id2".to_string()));
     }
 }
