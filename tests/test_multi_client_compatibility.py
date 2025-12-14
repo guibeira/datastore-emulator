@@ -867,3 +867,153 @@ def test_ordering_query(google_client, rust_client):
     assert results["rust"]["desc"] == expected_desc
     assert results["google"]["desc"] == expected_desc
     assert results["rust"]["desc"] == results["google"]["desc"]
+
+
+def test_nested_properties_query(rust_client):
+    """
+    Tests that nested property queries work correctly.
+    This covers the new functionality added in PR #18 for nested property support.
+    """
+    test_id = f"test-{uuid.uuid4()}"
+
+    # --- Setup data with nested properties ---
+    entities = []
+
+    # Entity 1: Simple nested property (address.city)
+    key1 = rust_client.key("User", f"user-{test_id}-1")
+    entity1 = datastore.Entity(key=key1)
+    entity1.update(
+        {
+            "test_id": test_id,
+            "name": "Alice",
+        }
+    )
+    # Create nested entity for address (embedded entity without key)
+    address_entity = datastore.Entity()
+    address_entity["city"] = "New York"
+    address_entity["zip"] = "10001"
+    entity1["address"] = address_entity
+    entities.append(entity1)
+
+    # Entity 2: Array of nested entities (organizations.key.consistentId)
+    key2 = rust_client.key("User", f"user-{test_id}-2")
+    entity2 = datastore.Entity(key=key2)
+    entity2.update(
+        {
+            "test_id": test_id,
+            "name": "Bob",
+        }
+    )
+    # Create nested entities for organizations array
+    org1_key_entity = datastore.Entity()
+    org1_key_entity["consistentId"] = "org-id-1"
+    org1_entity = datastore.Entity()
+    org1_entity["key"] = org1_key_entity
+    org1_entity["name"] = "Org 1"
+
+    org2_key_entity = datastore.Entity()
+    org2_key_entity["consistentId"] = "org-id-2"
+    org2_entity = datastore.Entity()
+    org2_entity["key"] = org2_key_entity
+    org2_entity["name"] = "Org 2"
+
+    entity2["organizations"] = [org1_entity, org2_entity]
+    entities.append(entity2)
+
+    # Entity 3: Another entity with same nested value for testing filters
+    key3 = rust_client.key("User", f"user-{test_id}-3")
+    entity3 = datastore.Entity(key=key3)
+    entity3.update(
+        {
+            "test_id": test_id,
+            "name": "Charlie",
+        }
+    )
+    org3_key_entity = datastore.Entity()
+    org3_key_entity["consistentId"] = "org-id-1"
+    org3_entity = datastore.Entity()
+    org3_entity["key"] = org3_key_entity
+    org3_entity["name"] = "Org 1"
+    entity3["organizations"] = [org3_entity]
+    entities.append(entity3)
+
+    # Entity 4: Entity with different nested value
+    key4 = rust_client.key("User", f"user-{test_id}-4")
+    entity4 = datastore.Entity(key=key4)
+    entity4.update(
+        {
+            "test_id": test_id,
+            "name": "David",
+        }
+    )
+    org4_key_entity = datastore.Entity()
+    org4_key_entity["consistentId"] = "org-id-3"
+    org4_entity = datastore.Entity()
+    org4_entity["key"] = org4_key_entity
+    org4_entity["name"] = "Org 3"
+    entity4["organizations"] = [org4_entity]
+    entities.append(entity4)
+
+    rust_client.put_multi(entities)
+
+    # --- Test 1: Query simple nested property (address.city) ---
+    query1 = rust_client.query(kind="User")
+    query1.add_filter("test_id", "=", test_id)
+    query1.add_filter("address.city", "=", "New York")
+
+    results1 = list(query1.fetch())
+    assert len(results1) == 1, f"Expected 1 entity with address.city='New York', got {len(results1)}"
+    assert results1[0]["name"] == "Alice"
+
+    # --- Test 2: Query nested property in array (organizations.key.consistentId) ---
+    # This should match entities 2 and 3 (both have org-id-1)
+    query2 = rust_client.query(kind="User")
+    query2.add_filter("test_id", "=", test_id)
+    query2.add_filter("organizations.key.consistentId", "=", "org-id-1")
+
+    results2 = list(query2.fetch())
+    assert (
+        len(results2) == 2
+    ), f"Expected 2 entities with organizations.key.consistentId='org-id-1', got {len(results2)}"
+    names2 = {entity["name"] for entity in results2}
+    assert names2 == {"Bob", "Charlie"}, f"Expected names {{'Bob', 'Charlie'}}, got {names2}"
+
+    # --- Test 3: Query nested property with different value (org-id-3) ---
+    query3 = rust_client.query(kind="User")
+    query3.add_filter("test_id", "=", test_id)
+    query3.add_filter("organizations.key.consistentId", "=", "org-id-3")
+
+    results3 = list(query3.fetch())
+    assert len(results3) == 1, f"Expected 1 entity with organizations.key.consistentId='org-id-3', got {len(results3)}"
+    assert results3[0]["name"] == "David"
+
+    # --- Test 4: Query nested property that doesn't exist ---
+    query4 = rust_client.query(kind="User")
+    query4.add_filter("test_id", "=", test_id)
+    query4.add_filter("address.city", "=", "Los Angeles")
+
+    results4 = list(query4.fetch())
+    assert len(results4) == 0, f"Expected 0 entities with address.city='Los Angeles', got {len(results4)}"
+
+    # --- Test 5: Query nested property with IN operator ---
+    query5 = rust_client.query(kind="User")
+    query5.add_filter("test_id", "=", test_id)
+    query5.add_filter("organizations.key.consistentId", "IN", ["org-id-1", "org-id-3"])
+
+    results5 = list(query5.fetch())
+    assert (
+        len(results5) == 3
+    ), f"Expected 3 entities with organizations.key.consistentId IN ['org-id-1', 'org-id-3'], got {len(results5)}"
+    names5 = {entity["name"] for entity in results5}
+    assert names5 == {"Bob", "Charlie", "David"}, f"Expected names {{'Bob', 'Charlie', 'David'}}, got {names5}"
+
+    # --- Test 6: Verify indexing works by querying without test_id filter first ---
+    # This tests that nested properties are properly indexed
+    query6 = rust_client.query(kind="User")
+    query6.add_filter("organizations.key.consistentId", "=", "org-id-2")
+
+    results6 = list(query6.fetch())
+    # Should find entity 2 (Bob) even without test_id filter
+    assert len(results6) >= 1, "Expected at least 1 entity with organizations.key.consistentId='org-id-2'"
+    names6 = {entity["name"] for entity in results6}
+    assert "Bob" in names6, f"Expected 'Bob' in results, got {names6}"
