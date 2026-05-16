@@ -3,23 +3,28 @@ import uuid
 from time import sleep
 
 import pytest
-from google.auth.credentials import AnonymousCredentials
 from google.cloud import datastore
 from google.cloud.datastore.query import Or, PropertyFilter
 
 use_real_db = "USE_REAL_DB" in os.environ
-rust_emulator_base_url = os.environ.get(
-    "RUST_DATASTORE_EMULATOR_BASE_URL", "http://localhost:8042"
+rust_emulator_host = os.environ.get(
+    "RUST_DATASTORE_EMULATOR_HOST", "localhost:8042"
 )
-google_emulator_base_url = os.environ.get(
-    "GOOGLE_DATASTORE_EMULATOR_BASE_URL", "http://localhost:8044"
+google_emulator_host = os.environ.get(
+    "GOOGLE_DATASTORE_EMULATOR_HOST", "localhost:8044"
 )
 
 
-def local_datastore_client(project, base_url):
-    db_client = datastore.Client(project=project, credentials=AnonymousCredentials())
-    db_client.base_url = base_url
-    return db_client
+def local_datastore_client(project, emulator_host):
+    previous_emulator_host = os.environ.get("DATASTORE_EMULATOR_HOST")
+    os.environ["DATASTORE_EMULATOR_HOST"] = emulator_host
+    try:
+        return datastore.Client(project=project)
+    finally:
+        if previous_emulator_host is None:
+            os.environ.pop("DATASTORE_EMULATOR_HOST", None)
+        else:
+            os.environ["DATASTORE_EMULATOR_HOST"] = previous_emulator_host
 
 
 @pytest.fixture
@@ -27,7 +32,7 @@ def rust_client():
     """
     Fixture to create a Rust client connected to the emulator.
     """
-    db_client = local_datastore_client("test-project-2", rust_emulator_base_url)
+    db_client = local_datastore_client("test-project-2", rust_emulator_host)
     yield db_client
     # Cleanup after test
     for kind in ["TaskTest", "Family", "User", "TestKind1", "TestKind2"]:
@@ -47,7 +52,7 @@ def google_client():
         project_id = os.environ["DATASTORE_PROJECT_ID"]
         db_client = datastore.Client(project_id, database=database_name)
     else:
-        db_client = local_datastore_client("test-project-1", google_emulator_base_url)
+        db_client = local_datastore_client("test-project-2", google_emulator_host)
     yield db_client
     # Cleanup after test
     for kind in ["TaskTest", "Family", "User", "TestKind1", "TestKind2"]:
