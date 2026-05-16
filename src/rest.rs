@@ -40,6 +40,7 @@ pub async fn datastore_method_handler(
 
     match method {
         "lookup" => json_call(body, |r| core::lookup(&state.storage, r)).await,
+        "runQuery" => json_call(body, |r| core::run_query(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -125,6 +126,33 @@ mod tests {
         assert!(v["found"].is_array());
         assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["kind"], "Task");
         assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["name"], "abc");
+    }
+
+    #[tokio::test]
+    async fn run_query_kind_returns_entities() {
+        let state = seeded_state("p1", "Task", "abc");
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "projectId": "p1",
+            "query": { "kind": [{ "name": "Task" }] }
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:runQuery")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["batch"].is_object());
     }
 
     #[tokio::test]
