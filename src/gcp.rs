@@ -1,5 +1,5 @@
 use crate::DatastoreEmulator;
-use crate::database::{DatastoreStorage, TransactionState};
+use crate::database::DatastoreStorage;
 use crate::google::datastore::v1::aggregation_query::aggregation::Operator as AggregationOperator;
 use crate::google::datastore::v1::datastore_server::Datastore as DatastoreService;
 use crate::google::datastore::v1::{
@@ -79,65 +79,8 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
-        tracing::debug!("Received BeginTransactionRequest: {:?}", request);
-        let start = SystemTime::now();
-        let req = request.into_inner();
-        let duration_since_epoch = start
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-
-        let timestamp = pbjson_types::Timestamp {
-            seconds: duration_since_epoch.as_secs() as i64,
-            nanos: duration_since_epoch.as_nanos() as i32,
-        };
-
-        // Generate a unique transaction ID and create transaction state
-        let transaction_id;
-        {
-            let mut storage = self.storage.write().await;
-
-            // Generate transaction ID using timestamp and current counter
-            let counter = storage
-                .transaction_counter
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
-
-            // Check if the transaction is read-only
-            let transaction_options = req.transaction_options.unwrap_or_default();
-            let read_only = if let Some(mode) = transaction_options.mode {
-                // Set read-only flag
-                match mode {
-                    crate::google::datastore::v1::transaction_options::Mode::ReadOnly(_) => true,
-                    crate::google::datastore::v1::transaction_options::Mode::ReadWrite(_) => false,
-                }
-            } else {
-                // Default to read-write if no mode is specified
-                false
-            };
-            // Create a new transaction state
-            let transaction_state = TransactionState {
-                mutations: Vec::new(),
-                snapshot: HashMap::new(), // Will be populated for read operations
-                timestamp,
-                read_only,
-            };
-
-            // Add the transaction to storage
-            storage
-                .transactions
-                .insert(transaction_id.clone(), transaction_state);
-        }
-
-        // Return the transaction ID as bytes
-        let transaction_bytes = transaction_id.into_bytes();
-        let transaction_response = BeginTransactionResponse {
-            transaction: transaction_bytes,
-        };
-        tracing::debug!(
-            "Began transaction with ID: {:?}",
-            String::from_utf8_lossy(&transaction_response.transaction)
-        );
-        Ok(Response::new(transaction_response))
+        let resp = crate::core::begin_transaction(&self.storage, request.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     async fn rollback(
