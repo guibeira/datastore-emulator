@@ -33,7 +33,7 @@ pub async fn datastore_method_handler(
     Path(project_method): Path<String>,
     body: Bytes,
 ) -> Response {
-    let (_project_id, method) = match project_method.split_once(':') {
+    let (project_id, method) = match project_method.split_once(':') {
         Some(p) => p,
         None => return bad_request("missing :method suffix on /v1/projects/{project}:{method}"),
     };
@@ -47,8 +47,91 @@ pub async fn datastore_method_handler(
         "allocateIds" => json_call(body, |r| core::allocate_ids(&state.storage, r)).await,
         "reserveIds" => json_call(body, |r| core::reserve_ids(&state.storage, r)).await,
         "runAggregationQuery" => json_call(body, |r| core::run_aggregation_query(&state.storage, r)).await,
+        "import" => import_handler(state, project_id.to_string(), body).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
+}
+
+use crate::import::bg_import_data;
+use crate::operation::{OperationState, OperationStatus};
+use chrono::Utc;
+use serde::Deserialize;
+use uuid::Uuid;
+
+#[derive(Deserialize)]
+pub struct ImportRequest {
+    #[serde(rename = "inputUrl", alias = "input_url")]
+    pub input_url: String,
+}
+
+#[derive(Serialize)]
+pub struct ImportResponse {
+    pub name: String,
+    pub metadata: ImportMetadata,
+}
+
+#[derive(Serialize)]
+pub struct ImportMetadata {
+    #[serde(rename = "@type")]
+    pub type_url: String,
+    pub common: CommonMetadata,
+    #[serde(rename = "entityFilter")]
+    pub entity_filter: serde_json::Value,
+    #[serde(rename = "inputUrl")]
+    pub input_url: String,
+}
+
+#[derive(Serialize)]
+pub struct CommonMetadata {
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    #[serde(rename = "operationType")]
+    pub operation_type: String,
+    pub state: String,
+}
+
+pub async fn import_handler(state: AppState, project_id: String, body: Bytes) -> Response {
+    let payload: ImportRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(&format!("invalid JSON: {e}")),
+    };
+
+    let operation_id = Uuid::new_v4().to_string();
+    let operation_state = OperationState {
+        status: OperationStatus::Processing,
+        start_time: Utc::now(),
+        end_time: None,
+        error: None,
+    };
+    state
+        .operations
+        .write()
+        .await
+        .insert(operation_id.clone(), operation_state);
+
+    tokio::spawn(bg_import_data(
+        state.storage.clone(),
+        state.operations.clone(),
+        operation_id.clone(),
+        payload.input_url.clone(),
+    ));
+
+    let response = ImportResponse {
+        name: format!("projects/{}/operations/{}", project_id, operation_id),
+        metadata: ImportMetadata {
+            type_url: "type.googleapis.com/google.datastore.admin.v1.ImportEntitiesMetadata"
+                .to_string(),
+            common: CommonMetadata {
+                start_time: Utc::now().to_rfc3339(),
+                operation_type: "IMPORT_ENTITIES".to_string(),
+                state: "PROCESSING".to_string(),
+            },
+            entity_filter: serde_json::json!({}),
+            input_url: payload.input_url,
+        },
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 #[cfg(test)]
@@ -379,5 +462,57 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["missing"].is_array());
         assert!(!v["missing"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_accepts_camel_case() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state.clone());
+
+        let body = serde_json::json!({ "inputUrl": "/nonexistent/path.zip" });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // operation registered
+        assert_eq!(state.operations.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_accepts_snake_case_alias() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state.clone());
+
+        let body = serde_json::json!({ "input_url": "/nonexistent/path.zip" });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.operations.read().await.len(), 1);
     }
 }
