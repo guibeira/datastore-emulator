@@ -48,8 +48,15 @@ pub async fn datastore_method_handler(
         "reserveIds" => json_call(body, |r| core::reserve_ids(&state.storage, r)).await,
         "runAggregationQuery" => json_call(body, |r| core::run_aggregation_query(&state.storage, r)).await,
         "import" => import_handler(state, project_id.to_string(), body).await,
+        "export" => export_handler().await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
+}
+
+async fn export_handler() -> Response {
+    status_to_response(tonic::Status::unimplemented(
+        "ExportEntities not yet implemented in datastore-emulator",
+    ))
 }
 
 use crate::import::bg_import_data;
@@ -514,5 +521,27 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.operations.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn export_returns_501_unimplemented() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:export")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }
