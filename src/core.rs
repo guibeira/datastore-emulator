@@ -1,7 +1,8 @@
-use crate::database::DatastoreStorage;
+use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct};
 use crate::google::datastore::v1::{
-    Entity, EntityResult, ExecutionStats, ExplainMetrics, LookupRequest, LookupResponse,
-    PlanSummary, RunQueryRequest, RunQueryResponse,
+    CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics,
+    LookupRequest, LookupResponse, MutationResult, PlanSummary, RunQueryRequest, RunQueryResponse,
+    commit_request::TransactionSelector, mutation::Operation,
 };
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::HashMap;
@@ -131,5 +132,238 @@ pub async fn run_query(
                 debug_stats: Some(debug_stats),
             }),
         }),
+    })
+}
+
+pub async fn commit(
+    storage: &Arc<RwLock<DatastoreStorage>>,
+    req: CommitRequest,
+) -> Result<CommitResponse, Status> {
+    let mut storage = storage.write().await;
+    let mut mutation_results = Vec::new();
+
+    // Handle transaction if present
+    let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
+        match transaction_selector {
+            TransactionSelector::Transaction(tx_bytes) => {
+                match String::from_utf8(tx_bytes.clone()) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return Err(Status::invalid_argument("Invalid transaction ID format"));
+                    }
+                }
+            }
+            TransactionSelector::SingleUseTransaction(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(tx_id) = transaction_id.clone() {
+        if storage.transactions.get(&tx_id).is_some() {
+            tracing::info!("Committing transaction: {}", tx_id);
+        } else {
+            return Err(Status::not_found(format!(
+                "Transaction {} not found",
+                tx_id
+            )));
+        }
+    }
+
+    for mutation in req.mutations {
+        if let Some(ref mutation) = mutation.operation {
+            match mutation {
+                Operation::Insert(entity) => match storage.insert_entity(entity) {
+                    Ok((final_key, metadata)) => {
+                        mutation_results.push(MutationResult {
+                            key: Some(final_key),
+                            version: metadata.version as i64,
+                            create_time: Some(metadata.create_time.clone()),
+                            update_time: Some(metadata.update_time.clone()),
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    }
+                    Err(status) => {
+                        return Err(status);
+                    }
+                },
+                Operation::Update(entity) => {
+                    let key = match entity.key {
+                        Some(ref key) => key.clone(),
+                        None => {
+                            return Err(Status::invalid_argument(
+                                "Entity missing key for update",
+                            ));
+                        }
+                    };
+                    let key_struct = KeyStruct::from_datastore_key(&key);
+
+                    let mut opt_updated_data: Option<(
+                        Entity,
+                        u64,
+                        pbjson_types::Timestamp,
+                        pbjson_types::Timestamp,
+                    )> = None;
+
+                    if let Some(existing_entity_metadata) =
+                        storage.entities.get_mut(&key_struct)
+                    {
+                        let timestamp_now = pbjson_types::Timestamp {
+                            seconds: 0,
+                            nanos: 0,
+                        };
+
+                        existing_entity_metadata.entity = entity.clone();
+                        existing_entity_metadata.version += 1;
+                        existing_entity_metadata.update_time = timestamp_now.clone();
+
+                        opt_updated_data = Some((
+                            existing_entity_metadata.entity.clone(),
+                            existing_entity_metadata.version,
+                            existing_entity_metadata.create_time.clone(),
+                            timestamp_now,
+                        ));
+                    }
+
+                    if let Some((entity_for_index, version, create_time, update_time)) =
+                        opt_updated_data
+                    {
+                        storage.update_indexes(&key_struct, &entity_for_index);
+
+                        mutation_results.push(MutationResult {
+                            key: entity.key.clone(),
+                            version: version as i64,
+                            create_time: Some(create_time),
+                            update_time: Some(update_time),
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    }
+                }
+                Operation::Upsert(entity) => {
+                    let key = match entity.key {
+                        Some(ref key) => key.clone(),
+                        None => {
+                            return Err(Status::invalid_argument(
+                                "Entity missing key for upsert",
+                            ));
+                        }
+                    };
+
+                    let key_is_incomplete = key
+                        .path
+                        .iter()
+                        .any(|path_element| path_element.id_type.is_none());
+
+                    if key_is_incomplete {
+                        let (final_key, metadata) = storage.insert_entity(entity)?;
+                        mutation_results.push(MutationResult {
+                            key: Some(final_key),
+                            version: metadata.version as i64,
+                            create_time: Some(metadata.create_time.clone()),
+                            update_time: Some(metadata.update_time.clone()),
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    } else {
+                        let key_struct = KeyStruct::from_datastore_key(&key);
+
+                        let timestamp_now = pbjson_types::Timestamp {
+                            seconds: 0,
+                            nanos: 0,
+                        };
+
+                        let mut observe_key_counters = false;
+                        let entry = storage.entities.entry(key_struct.clone());
+                        let version;
+                        let create_time;
+                        let update_time = timestamp_now.clone();
+
+                        match entry {
+                            std::collections::btree_map::Entry::Occupied(
+                                mut occupied_entry,
+                            ) => {
+                                let metadata = occupied_entry.get_mut();
+                                metadata.entity = entity.clone();
+                                metadata.version += 1;
+                                metadata.update_time = update_time.clone();
+                                version = metadata.version;
+                                create_time = metadata.create_time.clone();
+                            }
+                            std::collections::btree_map::Entry::Vacant(vacant_entry) => {
+                                let new_metadata = EntityWithMetadata {
+                                    entity: entity.clone(),
+                                    version: 1,
+                                    create_time: timestamp_now.clone(),
+                                    update_time: update_time.clone(),
+                                };
+                                version = new_metadata.version;
+                                create_time = new_metadata.create_time.clone();
+                                observe_key_counters = true;
+                                vacant_entry.insert(new_metadata);
+                            }
+                        }
+
+                        if observe_key_counters {
+                            storage.observe_key_id(&key);
+                        }
+
+                        storage.update_indexes(&key_struct, entity);
+
+                        mutation_results.push(MutationResult {
+                            key: Some(key),
+                            version: version as i64,
+                            create_time: Some(create_time.clone()),
+                            update_time: Some(update_time.clone()),
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    }
+                }
+                Operation::Delete(key_to_delete) => {
+                    if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
+                    {
+                        let timestamp_now = pbjson_types::Timestamp {
+                            seconds: 0,
+                            nanos: 0,
+                        };
+                        mutation_results.push(MutationResult {
+                            key: Some(key_to_delete.clone()),
+                            version: removed_entity_metadata.version as i64,
+                            create_time: Some(removed_entity_metadata.create_time.clone()),
+                            update_time: Some(timestamp_now),
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    } else {
+                        tracing::warn!(
+                            "Entity not found for deletion with key: {:?}",
+                            key_to_delete.path
+                        );
+                        mutation_results.push(MutationResult {
+                            key: Some(key_to_delete.clone()),
+                            version: 0,
+                            create_time: None,
+                            update_time: None,
+                            conflict_detected: false,
+                            transform_results: vec![],
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let index_updates = mutation_results.len() as i32;
+    if let Some(tx_id) = transaction_id {
+        storage.clean_transaction(&tx_id);
+    }
+    let commit_time = system_time_to_timestamp(SystemTime::now());
+
+    Ok(CommitResponse {
+        mutation_results,
+        index_updates,
+        commit_time: Some(commit_time),
     })
 }
