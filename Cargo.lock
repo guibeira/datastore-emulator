@@ -514,6 +514,7 @@ dependencies = [
  "crc32c",
  "futures",
  "google-cloud-storage",
+ "hyper 0.14.32",
  "once_cell",
  "pbjson",
  "pbjson-build",
