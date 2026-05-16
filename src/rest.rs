@@ -44,6 +44,8 @@ pub async fn datastore_method_handler(
         "commit" => json_call(body, |r| core::commit(&state.storage, r)).await,
         "beginTransaction" => json_call(body, |r| core::begin_transaction(&state.storage, r)).await,
         "rollback" => json_call(body, |r| core::rollback(&state.storage, r)).await,
+        "allocateIds" => json_call(body, |r| core::allocate_ids(&state.storage, r)).await,
+        "reserveIds" => json_call(body, |r| core::reserve_ids(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -244,6 +246,67 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/projects/p1:rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn allocate_ids_fills_incomplete_keys() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "keys": [{
+                "partitionId": { "projectId": "p1" },
+                "path": [{ "kind": "Task" }]
+            }]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:allocateIds")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["keys"][0]["path"][0]["id"].as_str().unwrap().parse::<i64>().is_ok());
+    }
+
+    #[tokio::test]
+    async fn reserve_ids_accepts_explicit_keys() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "keys": [{
+                "partitionId": { "projectId": "p1" },
+                "path": [{ "kind": "Task", "id": "42" }]
+            }]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:reserveIds")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
