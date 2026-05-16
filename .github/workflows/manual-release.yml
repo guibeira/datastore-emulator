@@ -1,0 +1,129 @@
+name: Manual Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.1.1 or 0.1.1-rc1. Do not include leading v."
+        required: true
+        type: string
+      dry_run:
+        description: "Validate and show changes without committing or tagging."
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Validate version format
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta|pre)[0-9]*)?$ ]]; then
+            echo "::error::Invalid version format: '$VERSION'. Expected X.Y.Z or X.Y.Z-(rc|alpha|beta|pre)N."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag does not already exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.validate.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists locally."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin."
+            exit 1
+          fi
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Update Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.validate.outputs.version }}"
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          path = pathlib.Path("Cargo.toml")
+          text = path.read_text()
+          pattern = re.compile(r'(\[package\][^\[]*?\nversion\s*=\s*)"[^"]*"', re.DOTALL)
+          new_text, count = pattern.subn(rf'\1"{version}"', text, count=1)
+          if count != 1:
+              raise SystemExit("Failed to locate [package] version field in Cargo.toml")
+          path.write_text(new_text)
+          PY
+          git --no-pager diff -- Cargo.toml
+
+      - name: Sync Cargo.lock
+        shell: bash
+        run: cargo update -p datastore-emulator
+
+      - name: Show changes
+        if: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Dry run enabled. Changes that would be committed:"
+          git --no-pager diff -- Cargo.toml Cargo.lock
+          echo "Tag that would be created: ${{ steps.validate.outputs.tag }}"
+
+      - name: Commit and tag release
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.validate.outputs.version }}"
+          TAG="${{ steps.validate.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "::error::No changes staged. Version may already be set to ${VERSION}."
+            exit 1
+          fi
+          git commit -m "chore(release): ${TAG}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "${TAG}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## Manual Release"
+            echo ""
+            echo "- Version: \`${{ steps.validate.outputs.version }}\`"
+            echo "- Tag: \`${{ steps.validate.outputs.tag }}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Dry run: \`${{ inputs.dry_run }}\`"
+            if [[ "${{ inputs.dry_run }}" != "true" ]]; then
+              echo ""
+              echo "The \`Release\` workflow will build and publish the tag."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
