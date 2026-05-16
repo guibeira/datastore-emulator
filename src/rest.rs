@@ -544,4 +544,74 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
+
+    #[tokio::test]
+    async fn unknown_method_returns_404() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:bogus")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], 404);
+        assert!(v["error"]["message"].as_str().unwrap().contains("bogus"));
+    }
+
+    #[tokio::test]
+    async fn missing_method_suffix_returns_400() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_returns_400() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:lookup")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
