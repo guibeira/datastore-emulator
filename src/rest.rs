@@ -43,6 +43,7 @@ pub async fn datastore_method_handler(
         "runQuery" => json_call(body, |r| core::run_query(&state.storage, r)).await,
         "commit" => json_call(body, |r| core::commit(&state.storage, r)).await,
         "beginTransaction" => json_call(body, |r| core::begin_transaction(&state.storage, r)).await,
+        "rollback" => json_call(body, |r| core::rollback(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -223,6 +224,33 @@ mod tests {
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["transaction"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_returns_ok_for_unknown_tx() {
+        use base64::Engine;
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "transaction": base64::engine::general_purpose::STANDARD.encode("tx-0-0")
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
