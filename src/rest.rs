@@ -46,6 +46,7 @@ pub async fn datastore_method_handler(
         "rollback" => json_call(body, |r| core::rollback(&state.storage, r)).await,
         "allocateIds" => json_call(body, |r| core::allocate_ids(&state.storage, r)).await,
         "reserveIds" => json_call(body, |r| core::reserve_ids(&state.storage, r)).await,
+        "runAggregationQuery" => json_call(body, |r| core::run_aggregation_query(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -314,6 +315,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn run_aggregation_query_count_returns_total() {
+        let state = seeded_state("p1", "Task", "abc");
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "projectId": "p1",
+            "aggregationQuery": {
+                "nestedQuery": { "kind": [{ "name": "Task" }] },
+                "aggregations": [{ "count": {}, "alias": "total" }]
+            }
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:runAggregationQuery")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["batch"]["aggregationResults"][0]["aggregateProperties"]["total"]["integerValue"],
+            "1"
+        );
     }
 
     #[tokio::test]
