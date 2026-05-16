@@ -28,21 +28,33 @@ jobs:
     - name: Install dependencies
       run: poetry install --no-interaction --no-root
 
-    - name: Set up Rust toolchain
-      run: |
-        rustup toolchain install stable --profile minimal
-        rustup default stable
-
-    - name: Build release Docker image
-      run: docker build -t datastore-emulator:ci .
-
     - name: Start emulators
       run: docker compose up --build -d
 
     - name: Wait for emulators to be ready
       run: |
-        echo "Waiting for emulators to start..."
-        sleep 15
+        python - <<'PY'
+        import time
+        from urllib.request import urlopen
+
+        urls = ("http://localhost:8042/", "http://localhost:8044/")
+        deadline = time.monotonic() + 60
+
+        for url in urls:
+            last_error = "not ready"
+            while time.monotonic() < deadline:
+                try:
+                    with urlopen(url, timeout=2) as response:
+                        if response.status < 500:
+                            print(f"{url} is ready")
+                            break
+                        last_error = f"HTTP {response.status}"
+                except Exception as exc:
+                    last_error = exc
+                time.sleep(1)
+            else:
+                raise RuntimeError(f"{url} did not become ready: {last_error}")
+        PY
 
     - name: Run tests
       run: poetry run pytest

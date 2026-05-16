@@ -23,6 +23,7 @@ services:
       /bin/sh -c "gcloud beta emulators datastore start 
       --project=test-project-2 
       --host-port=0.0.0.0:8044 
+      --consistency=1.0
       --no-store-on-disk"
     ports:
       - "8044:8044" # gRPC port for the official Google emulator
