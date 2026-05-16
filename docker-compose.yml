@@ -1,20 +1,15 @@
 services:
-  # Service for your Rust emulator implementation
   datastore-emulator-rust:
     container_name: datastore_emulator_rust
     build:
       context: .
       dockerfile: Dockerfile
-    # Arguments passed to the ENTRYPOINT in the Dockerfile: [host, port]
     command: [
-      "--grpc-host", "0.0.0.0",
-      "--grpc-port","8042",
-      "--http-host","0.0.0.0",
-      "--http-port","8043",
+      "--host-port", "0.0.0.0:8042",
+      "--no-store-on-disk",
     ]
     ports:
-      - "8042:8042" # gRPC port for the Rust emulator
-      - "8043:8043" # HTTP port for the Rust emulator
+      - "8042:8042"
 
   # Service for the official Google Datastore emulator
   datastore-emulator-google:

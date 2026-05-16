@@ -1,29 +1,26 @@
-# Stage 1: Build the application
-FROM rust:1.88.0-bullseye as builder
+FROM rust:1.88.0-bookworm AS builder
 
-# Install proto compiler
-RUN apt-get update && apt-get install -y protobuf-compiler
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create working directory
 WORKDIR /usr/src/app
 
-# Copy source code to the container
-COPY . .
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY src ./src
 
-# Build the application in release mode for optimization
-RUN cargo build --release
+RUN cargo build --release --locked
 
-# Stage 2: Create the final and smaller image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
-# Copy the compiled binary from the build stage
-COPY --from=builder /usr/src/app/target/release/datastore-emulator /usr/local/bin/datastore-emulator-rust
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Expose the gRPC and HTTP ports used by the application
+COPY --from=builder /usr/src/app/target/release/datastore-emulator /usr/local/bin/datastore-emulator
+
 EXPOSE 8042
-EXPOSE 8043
 
-# Set the entry point to execute the binary.
-# Arguments (host and port) will be provided by docker-compose.yml.
-ENTRYPOINT ["/usr/local/bin/datastore-emulator-rust"]
-
+ENTRYPOINT ["/usr/local/bin/datastore-emulator"]
+CMD ["--host-port", "0.0.0.0:8042", "--no-store-on-disk"]
