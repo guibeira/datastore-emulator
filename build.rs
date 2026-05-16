@@ -28,8 +28,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+    let descriptor_path = out_dir.join("descriptor.bin");
+
     tonic_build::configure()
         .build_server(true)
+        .compile_well_known_types(true)
+        .extern_path(".google.protobuf", "::pbjson_types")
+        .file_descriptor_set_path(&descriptor_path)
         .compile(&protos, &includes)?;
+
+    let descriptor_set = std::fs::read(&descriptor_path)?;
+    pbjson_build::Builder::new()
+        .register_descriptors(&descriptor_set)?
+        .build(&[".google.datastore.v1"])?;
+
     Ok(())
 }
