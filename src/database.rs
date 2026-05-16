@@ -384,11 +384,11 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64,
-                nanos: SystemTime::now()
+                nanos: (SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_nanos() as i32
-                    % 1_000_000_000,
+                    .as_nanos()
+                    % 1_000_000_000) as i32,
             };
 
             EntityWithMetadata {
@@ -1041,11 +1041,11 @@ impl DatastoreStorage {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
-            nanos: SystemTime::now()
+            nanos: (SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos() as i32
-                % 1_000_000_000,
+                .as_nanos()
+                % 1_000_000_000) as i32,
         };
 
         let entity_metadata = EntityWithMetadata {
