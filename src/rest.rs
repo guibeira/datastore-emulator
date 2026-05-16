@@ -614,4 +614,55 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn cors_preflight_succeeds() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/projects/p1:lookup")
+                    .header("origin", "http://localhost:3000")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_actual_post_has_allow_origin_header() {
+        let state = seeded_state("p1", "Task", "abc");
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:lookup")
+                    .header("origin", "http://localhost:3000")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"keys":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("access-control-allow-origin").is_some());
+    }
 }
