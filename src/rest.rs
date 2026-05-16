@@ -42,6 +42,7 @@ pub async fn datastore_method_handler(
         "lookup" => json_call(body, |r| core::lookup(&state.storage, r)).await,
         "runQuery" => json_call(body, |r| core::run_query(&state.storage, r)).await,
         "commit" => json_call(body, |r| core::commit(&state.storage, r)).await,
+        "beginTransaction" => json_call(body, |r| core::begin_transaction(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -195,6 +196,33 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["mutationResults"].is_array());
         assert_eq!(state.storage.read().await.entities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn begin_transaction_returns_transaction_id() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state);
+
+        let body = serde_json::json!({});
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:beginTransaction")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["transaction"].as_str().unwrap().len() > 0);
     }
 
     #[tokio::test]
