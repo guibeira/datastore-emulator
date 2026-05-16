@@ -8,7 +8,6 @@ use crate::google::datastore::v1::{
     Filter, LookupRequest, LookupResponse, PingRequest, PingResponse, PlanSummary,
     PropertyReference, ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
-    key::path_element::IdType,
 };
 use pbjson_types::value::Kind;
 use pbjson_types::{Duration, Struct, Value as ValueProps};
@@ -87,98 +86,24 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
-        let req = request.into_inner();
-
-        // Convert transaction ID bytes to string
-        let transaction_id = match String::from_utf8(req.transaction.clone()) {
-            Ok(id) => id,
-            Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
-        };
-
-        // Remove the transaction and any pending changes from storage
-        {
-            let mut storage = self.storage.write().await;
-
-            // Check if the transaction exists
-            if storage.transactions.contains_key(&transaction_id) {
-                // Clean up the transaction (removes it from storage)
-                storage.clean_transaction(&transaction_id);
-                tracing::info!("Transaction {} rolled back successfully", transaction_id);
-            } else {
-                tracing::warn!(
-                    "Attempted to rollback non-existent transaction: {}",
-                    transaction_id
-                );
-                // We still return success even if transaction doesn't exist
-                // This matches Datastore behavior which is idempotent for rollbacks
-            }
-        }
-
-        Ok(Response::new(RollbackResponse {}))
+        let resp = crate::core::rollback(&self.storage, request.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     async fn allocate_ids(
         &self,
         request: Request<AllocateIdsRequest>,
     ) -> Result<Response<AllocateIdsResponse>, Status> {
-        let req = request.into_inner();
-        let mut storage = self.storage.write().await;
-        let mut allocated_keys = Vec::new();
-
-        // Process each incomplete key in the request
-        for incomplete_key in req.keys {
-            // Verify the key is incomplete (missing ID or name)
-            if incomplete_key.path.is_empty() {
-                return Err(Status::invalid_argument("Key path cannot be empty"));
-            }
-
-            // Create a new key with the same structure but with allocated IDs
-            let mut new_key = incomplete_key.clone();
-            let mut allocated_id: Option<i64> = None;
-
-            for path_element in new_key.path.iter_mut() {
-                if path_element.id_type.is_none() {
-                    if allocated_id.is_none() {
-                        allocated_id = Some(storage.next_auto_id(&incomplete_key)?);
-                    }
-                    path_element.id_type = allocated_id.map(IdType::Id);
-                }
-            }
-
-            // Add the allocated key to the result
-            storage.observe_key_id(&new_key);
-
-            allocated_keys.push(new_key);
-        }
-
-        Ok(Response::new(AllocateIdsResponse {
-            keys: allocated_keys,
-        }))
+        let resp = crate::core::allocate_ids(&self.storage, request.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     async fn reserve_ids(
         &self,
         request: Request<ReserveIdsRequest>,
     ) -> Result<Response<ReserveIdsResponse>, Status> {
-        let req = request.into_inner();
-        let mut storage = self.storage.write().await;
-
-        // Process each key in the request
-        for key in &req.keys {
-            // Validate the key
-            if key.path.is_empty() {
-                return Err(Status::invalid_argument("Key path cannot be empty"));
-            }
-
-            // For each path element with an ID, reserve that ID
-            storage.observe_key_id(key);
-
-            // We could store reserved keys in a separate collection if needed
-            // For now, we just ensure the ID counter is updated
-        }
-
-        // Return success response
-        Ok(Response::new(ReserveIdsResponse {}))
+        let resp = crate::core::reserve_ids(&self.storage, request.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     async fn run_aggregation_query(

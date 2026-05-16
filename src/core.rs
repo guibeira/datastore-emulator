@@ -1,9 +1,10 @@
 use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
 use crate::google::datastore::v1::{
-    BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
-    EntityResult, ExecutionStats, ExplainMetrics, LookupRequest, LookupResponse, MutationResult,
-    PlanSummary, RunQueryRequest, RunQueryResponse, commit_request::TransactionSelector,
-    mutation::Operation,
+    AllocateIdsRequest, AllocateIdsResponse, BeginTransactionRequest, BeginTransactionResponse,
+    CommitRequest, CommitResponse, Entity, EntityResult, ExecutionStats, ExplainMetrics,
+    LookupRequest, LookupResponse, MutationResult, PlanSummary, ReserveIdsRequest,
+    ReserveIdsResponse, RollbackRequest, RollbackResponse, RunQueryRequest, RunQueryResponse,
+    commit_request::TransactionSelector, key::path_element::IdType, mutation::Operation,
 };
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::HashMap;
@@ -429,4 +430,74 @@ pub async fn begin_transaction(
         String::from_utf8_lossy(&transaction_response.transaction)
     );
     Ok(transaction_response)
+}
+
+pub async fn rollback(
+    storage: &Arc<RwLock<DatastoreStorage>>,
+    req: RollbackRequest,
+) -> Result<RollbackResponse, Status> {
+    let transaction_id = match String::from_utf8(req.transaction.clone()) {
+        Ok(id) => id,
+        Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
+    };
+
+    let mut storage = storage.write().await;
+    if storage.transactions.contains_key(&transaction_id) {
+        storage.clean_transaction(&transaction_id);
+        tracing::info!("Transaction {} rolled back successfully", transaction_id);
+    } else {
+        tracing::warn!(
+            "Attempted to rollback non-existent transaction: {}",
+            transaction_id
+        );
+    }
+
+    Ok(RollbackResponse {})
+}
+
+pub async fn allocate_ids(
+    storage: &Arc<RwLock<DatastoreStorage>>,
+    req: AllocateIdsRequest,
+) -> Result<AllocateIdsResponse, Status> {
+    let mut storage = storage.write().await;
+    let mut allocated_keys = Vec::new();
+
+    for incomplete_key in req.keys {
+        if incomplete_key.path.is_empty() {
+            return Err(Status::invalid_argument("Key path cannot be empty"));
+        }
+
+        let mut new_key = incomplete_key.clone();
+        let mut allocated_id: Option<i64> = None;
+
+        for path_element in new_key.path.iter_mut() {
+            if path_element.id_type.is_none() {
+                if allocated_id.is_none() {
+                    allocated_id = Some(storage.next_auto_id(&incomplete_key)?);
+                }
+                path_element.id_type = allocated_id.map(IdType::Id);
+            }
+        }
+
+        storage.observe_key_id(&new_key);
+        allocated_keys.push(new_key);
+    }
+
+    Ok(AllocateIdsResponse {
+        keys: allocated_keys,
+    })
+}
+
+pub async fn reserve_ids(
+    storage: &Arc<RwLock<DatastoreStorage>>,
+    req: ReserveIdsRequest,
+) -> Result<ReserveIdsResponse, Status> {
+    let mut storage = storage.write().await;
+    for key in &req.keys {
+        if key.path.is_empty() {
+            return Err(Status::invalid_argument("Key path cannot be empty"));
+        }
+        storage.observe_key_id(key);
+    }
+    Ok(ReserveIdsResponse {})
 }
