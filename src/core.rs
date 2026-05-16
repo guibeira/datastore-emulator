@@ -386,7 +386,7 @@ pub async fn begin_transaction(
 
     let timestamp = pbjson_types::Timestamp {
         seconds: duration_since_epoch.as_secs() as i64,
-        nanos: duration_since_epoch.as_nanos() as i32,
+        nanos: (duration_since_epoch.as_nanos() % 1_000_000_000) as i32,
     };
 
     // Generate a unique transaction ID and create transaction state
