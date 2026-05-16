@@ -379,7 +379,7 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
                 properties,
             };
 
-            let timestamp_now = prost_types::Timestamp {
+            let timestamp_now = pbjson_types::Timestamp {
                 seconds: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -614,8 +614,8 @@ impl KeyStruct {
 pub struct EntityWithMetadata {
     pub entity: Entity,
     pub version: u64,
-    pub create_time: prost_types::Timestamp,
-    pub update_time: prost_types::Timestamp,
+    pub create_time: pbjson_types::Timestamp,
+    pub update_time: pbjson_types::Timestamp,
 }
 
 #[derive(Deserialize)]
@@ -648,9 +648,9 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
         let s = SerializableEntityWithMetadata::deserialize(deserializer)?;
         let entity = Entity::decode(&s.entity_bytes[..]).map_err(Error::custom)?;
         let create_time =
-            prost_types::Timestamp::decode(&s.create_time_bytes[..]).map_err(Error::custom)?;
+            pbjson_types::Timestamp::decode(&s.create_time_bytes[..]).map_err(Error::custom)?;
         let update_time =
-            prost_types::Timestamp::decode(&s.update_time_bytes[..]).map_err(Error::custom)?;
+            pbjson_types::Timestamp::decode(&s.update_time_bytes[..]).map_err(Error::custom)?;
 
         Ok(EntityWithMetadata {
             entity,
@@ -666,7 +666,7 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
 pub struct TransactionState {
     pub mutations: Vec<Mutation>,
     pub snapshot: HashMap<KeyStruct, EntityWithMetadata>,
-    pub timestamp: prost_types::Timestamp,
+    pub timestamp: pbjson_types::Timestamp,
     pub read_only: bool,
 }
 
@@ -1035,7 +1035,7 @@ impl DatastoreStorage {
         let mut db_entity = entity.clone();
         db_entity.key = Some(key_with_new_id.clone());
 
-        let timestamp_now = prost_types::Timestamp {
+        let timestamp_now = pbjson_types::Timestamp {
             // Placeholder, consider real time
             seconds: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -1284,8 +1284,8 @@ impl DatastoreStorage {
                     .into_iter()
                     .map(|(kind, project_id, namespace)| EntityWithMetadata {
                         version: 1,
-                        create_time: prost_types::Timestamp::default(),
-                        update_time: prost_types::Timestamp::default(),
+                        create_time: pbjson_types::Timestamp::default(),
+                        update_time: pbjson_types::Timestamp::default(),
                         entity: Entity {
                             properties: HashMap::new(),
                             key: Some(Key {
@@ -1321,8 +1321,8 @@ impl DatastoreStorage {
                         };
                         EntityWithMetadata {
                             version: 1,
-                            create_time: prost_types::Timestamp::default(),
-                            update_time: prost_types::Timestamp::default(),
+                            create_time: pbjson_types::Timestamp::default(),
+                            update_time: pbjson_types::Timestamp::default(),
                             entity: Entity {
                                 properties: HashMap::new(),
                                 key: Some(Key {
@@ -1409,8 +1409,8 @@ impl DatastoreStorage {
 
                         EntityWithMetadata {
                             version: 1,
-                            create_time: prost_types::Timestamp::default(),
-                            update_time: prost_types::Timestamp::default(),
+                            create_time: pbjson_types::Timestamp::default(),
+                            update_time: pbjson_types::Timestamp::default(),
                             entity: Entity {
                                 key: Some(property_key),
                                 properties,

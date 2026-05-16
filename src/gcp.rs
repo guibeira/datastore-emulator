@@ -10,20 +10,20 @@ use crate::google::datastore::v1::{
     RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
     commit_request::TransactionSelector, key::path_element::IdType, mutation::Operation,
 };
-use prost_types::value::Kind;
-use prost_types::{Duration, Struct, Value as ValueProps};
-use std::collections::{BTreeMap, HashMap};
+use pbjson_types::value::Kind;
+use pbjson_types::{Duration, Struct, Value as ValueProps};
+use std::collections::HashMap;
 use std::time::{Instant, SystemTime};
 use tonic::{Request, Response, Status};
 use tracing;
 
-fn system_time_to_timestamp(time: SystemTime) -> prost_types::Timestamp {
+fn system_time_to_timestamp(time: SystemTime) -> pbjson_types::Timestamp {
     match time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => prost_types::Timestamp {
+        Ok(duration) => pbjson_types::Timestamp {
             seconds: duration.as_secs() as i64,
             nanos: duration.subsec_nanos() as i32,
         },
-        Err(_) => prost_types::Timestamp::default(),
+        Err(_) => pbjson_types::Timestamp::default(),
     }
 }
 
@@ -38,7 +38,7 @@ fn to_prost_duration(std_duration: std::time::Duration) -> Duration {
 impl DatastoreService for DatastoreEmulator {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         let req = request.into_inner();
-        let timestamp = prost_types::Timestamp {
+        let timestamp = pbjson_types::Timestamp {
             seconds: 0,
             nanos: 0,
         };
@@ -128,13 +128,13 @@ impl DatastoreService for DatastoreEmulator {
             req.project_id.clone(),
             kind_name,
             query_obj.filter.clone(),
-            query_obj.limit,
+            query_obj.limit.as_ref().map(|v| v.value),
             query_obj.start_cursor.clone(),
             query_obj.projection.clone(),
             query_obj.distinct_on.clone(),
             query_obj.order.clone(),
         );
-        let mut fields = BTreeMap::new();
+        let mut fields = HashMap::new();
 
         let amount_results = batch.entity_results.len() as i64;
 
@@ -259,8 +259,8 @@ impl DatastoreService for DatastoreEmulator {
                         let mut opt_updated_data: Option<(
                             /*entity_for_index_update*/ Entity,
                             /*version_for_result*/ u64,
-                            /*create_time_for_result*/ prost_types::Timestamp,
-                            /*update_time_for_result*/ prost_types::Timestamp,
+                            /*create_time_for_result*/ pbjson_types::Timestamp,
+                            /*update_time_for_result*/ pbjson_types::Timestamp,
                         )> = None;
 
                         if let Some(existing_entity_metadata) =
@@ -270,7 +270,7 @@ impl DatastoreService for DatastoreEmulator {
                                 //dbg!("Updating entity", &k.path);
                             }
 
-                            let timestamp_now = prost_types::Timestamp {
+                            let timestamp_now = pbjson_types::Timestamp {
                                 // Placeholder
                                 seconds: 0,
                                 nanos: 0,
@@ -334,7 +334,7 @@ impl DatastoreService for DatastoreEmulator {
                         } else {
                             let key_struct = KeyStruct::from_datastore_key(&key);
 
-                            let timestamp_now = prost_types::Timestamp {
+                            let timestamp_now = pbjson_types::Timestamp {
                                 // Placeholder
                                 seconds: 0,
                                 nanos: 0,
@@ -394,7 +394,7 @@ impl DatastoreService for DatastoreEmulator {
                                 //dbg!("Deleting entity", &k.path);
                             }
 
-                            let timestamp_now = prost_types::Timestamp {
+                            let timestamp_now = pbjson_types::Timestamp {
                                 // Placeholder
                                 seconds: 0,
                                 nanos: 0,
@@ -460,7 +460,7 @@ impl DatastoreService for DatastoreEmulator {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
 
-        let timestamp = prost_types::Timestamp {
+        let timestamp = pbjson_types::Timestamp {
             seconds: duration_since_epoch.as_secs() as i64,
             nanos: duration_since_epoch.as_nanos() as i32,
         };
@@ -828,7 +828,7 @@ impl DatastoreService for DatastoreEmulator {
         };
         let total_results = batch.aggregation_results.len() as i64;
         // Create execution metrics
-        let mut fields = BTreeMap::new();
+        let mut fields = HashMap::new();
         fields.insert(
             "query_type".to_string(),
             ValueProps {

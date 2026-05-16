@@ -183,8 +183,8 @@ mod tests {
                 EntityWithMetadata {
                     entity: Entity::default(),
                     version: 1,
-                    create_time: prost_types::Timestamp::default(),
-                    update_time: prost_types::Timestamp::default(),
+                    create_time: pbjson_types::Timestamp::default(),
+                    update_time: pbjson_types::Timestamp::default(),
                 },
             );
         }
