@@ -3,17 +3,19 @@ name: Run Tests
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.12'
         cache: 'poetry'
@@ -28,10 +30,12 @@ jobs:
       run: poetry install --no-interaction --no-root
 
     - name: Set up Rust toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        override: true
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+
+    - name: Build release Docker image
+      run: docker build -t datastore-emulator:ci .
 
     - name: Start emulators
       run: docker compose up --build -d
