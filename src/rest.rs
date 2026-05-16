@@ -41,6 +41,7 @@ pub async fn datastore_method_handler(
     match method {
         "lookup" => json_call(body, |r| core::lookup(&state.storage, r)).await,
         "runQuery" => json_call(body, |r| core::run_query(&state.storage, r)).await,
+        "commit" => json_call(body, |r| core::commit(&state.storage, r)).await,
         other => not_found(&format!("unknown Datastore method: {other}")),
     }
 }
@@ -153,6 +154,47 @@ mod tests {
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["batch"].is_object());
+    }
+
+    #[tokio::test]
+    async fn commit_insert_creates_entity() {
+        let state = AppState {
+            storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let app = create_router(state.clone());
+
+        let body = serde_json::json!({
+            "mode": "NON_TRANSACTIONAL",
+            "mutations": [{
+                "insert": {
+                    "key": {
+                        "partitionId": { "projectId": "p1" },
+                        "path": [{ "kind": "Task", "name": "abc" }]
+                    },
+                    "properties": {
+                        "title": { "stringValue": "hello" }
+                    }
+                }
+            }]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["mutationResults"].is_array());
+        assert_eq!(state.storage.read().await.entities.len(), 1);
     }
 
     #[tokio::test]
