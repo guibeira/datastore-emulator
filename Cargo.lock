@@ -519,6 +519,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tonic-health",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "uuid",
