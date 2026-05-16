@@ -20,6 +20,11 @@ include = [
     "/LICENSE",
 ]
 
+[lib]
+name = "datastore_emulator"
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
 tonic = { version = "0.9", features=["gzip"] }
 prost = "0.11"
