@@ -113,8 +113,23 @@ pub async fn get_operation_status(
     }
 }
 
+pub async fn healthcheck_handler() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+pub async fn reset_handler(State(state): State<AppState>) -> impl IntoResponse {
+    {
+        let mut storage = state.storage.write().await;
+        *storage = crate::database::DatastoreStorage::default();
+    }
+    state.operations.write().await.clear();
+    StatusCode::OK
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(healthcheck_handler))
+        .route("/reset", post(reset_handler))
         .route("/v1/projects/:project_id", post(import_handler))
         .route(
             "/v1/projects/:project_id/operations/:operation_id",
