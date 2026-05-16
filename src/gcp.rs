@@ -55,52 +55,8 @@ impl DatastoreService for DatastoreEmulator {
         &self,
         request: Request<LookupRequest>,
     ) -> Result<Response<LookupResponse>, Status> {
-        let req = request.into_inner();
-        tracing::debug!(
-            "Lookup request received: keys={:?} read_options={:?}",
-            req.keys,
-            req.read_options
-        );
-        let storage = self.storage.read().await;
-        let mut found = Vec::new();
-        let mut missing = Vec::new();
-
-        // process each key in the request
-        for key in &req.keys {
-            let result_entity = storage.get_entity(key);
-            if let Some(entity) = result_entity {
-                found.push(EntityResult {
-                    entity: Some(entity.entity.clone()),
-                    create_time: Some(entity.create_time.clone()),
-                    update_time: Some(entity.update_time.clone()),
-                    cursor: vec![],
-                    version: entity.version as i64,
-                });
-            } else {
-                // Return a placeholder entity result with only the key populated so clients
-                // such as google-cloud-ndb can mark this lookup as a miss.
-                let entity = Entity {
-                    key: Some(key.clone()),
-                    properties: HashMap::new(),
-                };
-                missing.push(EntityResult {
-                    entity: Some(entity),
-                    create_time: None,
-                    update_time: None,
-                    cursor: vec![],
-                    version: 0,
-                });
-            }
-        }
-        let read_time = system_time_to_timestamp(SystemTime::now());
-
-        Ok(Response::new(LookupResponse {
-            found,
-            missing,
-            deferred: vec![],
-            transaction: Vec::new(),
-            read_time: Some(read_time),
-        }))
+        let resp = crate::core::lookup(&self.storage, request.into_inner()).await?;
+        Ok(Response::new(resp))
     }
 
     async fn run_query(
