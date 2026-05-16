@@ -1,0 +1,297 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" =~ (rc|alpha|beta|pre) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          MANIFEST_VERSION=$(
+            awk '
+              /^\[package\]/ { in_pkg = 1; next }
+              /^\[/          { in_pkg = 0 }
+              in_pkg && /^version[[:space:]]*=/ {
+                match($0, /"[^"]*"/)
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+              }
+            ' Cargo.toml
+          )
+          if [[ "$TAG_VERSION" != "$MANIFEST_VERSION" ]]; then
+            echo "::error::Tag version '$TAG_VERSION' does not match Cargo.toml version '$MANIFEST_VERSION'."
+            exit 1
+          fi
+
+  build-archives:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
+          else
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binary
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="datastore-emulator-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p release
+          cp "target/${TARGET}/release/datastore-emulator" release/datastore-emulator
+          chmod +x release/datastore-emulator
+          tar -C release -czf "release/${ARCHIVE}" datastore-emulator
+          rm -f release/datastore-emulator
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: release/datastore-emulator-${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  github-release:
+    needs:
+      - validate
+      - build-archives
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+          pattern: release-*
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -- *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ needs.validate.outputs.version }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          draft: false
+          prerelease: ${{ needs.validate.outputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crate:
+    needs:
+      - validate
+      - github-release
+    if: ${{ needs.validate.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Dry-run publish
+        shell: bash
+        run: cargo publish --dry-run --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish crate
+        shell: bash
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-docker:
+    needs:
+      - validate
+      - github-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: guibeira/datastore-emulator
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.validate.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}},enable=${{ needs.validate.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Attest Docker image
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: index.docker.io/guibeira/datastore-emulator
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  publish-homebrew:
+    needs:
+      - validate
+      - github-release
+    if: ${{ needs.validate.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v6
+        with:
+          path: source
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p source/release
+          cd source/release
+          gh release download "${GITHUB_REF_NAME}" -p "SHA256SUMS"
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tap
+
+      - name: Generate formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          bash source/scripts/release/generate_homebrew_formula.sh \
+            "${VERSION}" \
+            source/release/SHA256SUMS \
+            tap/Formula/datastore-emulator.rb \
+            guibeira \
+            datastore-emulator
+
+      - name: Commit and push formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tap
+          git add Formula/datastore-emulator.rb
+          if git diff --cached --quiet -- Formula/datastore-emulator.rb; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "release: datastore-emulator ${{ needs.validate.outputs.version }}"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"

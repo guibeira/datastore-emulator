@@ -1,5 +1,6 @@
 # Datastore Emulator in Rust
 ![Crates.io Version](https://img.shields.io/crates/v/datastore-emulator)
+![Docker Pulls](https://img.shields.io/docker/pulls/guibeira/datastore-emulator)
 <p align="center">
   <img src="https://github.com/guibeira/datastore-emulator/blob/main/logo.png?raw=true" alt="Project's logo"/>
 </p>
@@ -21,41 +22,46 @@ The repository includes a comprehensive test suite that runs against both this c
 
 ## How to use
 
-### Using Cargo (recommended)
+### Using Cargo
 Make sure you have Rust and Cargo installed on your system. You can install the Rust toolchain by following the instructions at [rustup.rs](https://rustup.rs/). Then, you can install the Rust Datastore emulator using Cargo:
 
 ```bash
 cargo install datastore-emulator
 ```
 
-### Using Docker compose
-You can use the following `docker-compose.yml` file to run the Rust Datastore emulator: 
+### Using Homebrew
+
+After a stable release is published:
 
 ```bash
+brew tap guibeira/datastore-emulator https://github.com/guibeira/datastore-emulator
+brew install datastore-emulator
+```
+
+### Using Docker Compose
+You can use the following `docker-compose.yml` file to run the Rust Datastore emulator: 
+
+```yaml
 services:
   datastore-emulator:
     image: guibeira/datastore-emulator:latest
     command: [
-      "--grpc-host", "0.0.0.0",
-      "--grpc-port", "8042",
-      "--http-host","0.0.0.0",
-      "--http-port","8043",
+      "--host-port", "0.0.0.0:8042",
       "--no-store-on-disk",
     ]
     ports:
-      - "8042:8042" # gRPC port for the Rust emulator
-      - "8043:8043" # HTTP port for the Rust emulator
-
+      - "8042:8042"
 ```
+
 ### Using the pre-built Docker image
 You can run the Rust Datastore emulator using the pre-built Docker image available on Docker Hub.   
 
 ```bash
-docker run -d -p 8042:8042 -p 8043:8043 guibeira/datastore-emulator:latest \
-  --grpc-host 0.0.0.0 \
-  --grpc-port 8042 \
-  --http-host 0.0.0.0 \
-  --http-port 8043 \
+docker run -d \
+  --name datastore-emulator \
+  -p 8042:8042 \
+  guibeira/datastore-emulator:latest \
+  --host-port 0.0.0.0:8042 \
   --no-store-on-disk
 ```
 
@@ -78,6 +84,18 @@ cargo run --release
 
 See the [test](https://github.com/guibeira/datastore-emulator/blob/main/tests/README.md) instructions
 
+## Releasing
+
+1. Open GitHub Actions.
+2. Run `Manual Release`.
+3. Use a version without leading `v`, for example `0.1.1`.
+4. Run first with `dry_run=true`.
+5. If the diff is correct, run again with `dry_run=false`.
+6. The pushed tag `vX.Y.Z` triggers the release pipeline.
+
+Stable releases publish GitHub Release assets, crates.io, Homebrew and Docker Hub.
+Prereleases publish GitHub Release assets and Docker prerelease tags, but skip crates.io and Homebrew.
+
 
 ## Benchmarks
 
@@ -91,4 +109,3 @@ Here are some results with 30 clients and 10 runs each:
 
 
 If you want to run the benchmarks yourself, [here](https://github.com/guibeira/datastore-emulator/tree/main/benchmark#readme) are the instructions:
-
