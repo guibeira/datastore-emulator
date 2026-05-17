@@ -1155,15 +1155,29 @@ impl DatastoreStorage {
                                     &entity_metadata.entity.properties,
                                     &property.name,
                                 )
+                                .into_iter()
+                                .filter(|v| !v.exclude_from_indexes)
+                                .collect()
                             } else {
                                 // Simple property lookup
                                 entity_metadata
                                     .entity
                                     .properties
                                     .get(&property.name)
-                                    .map(|v| match &v.value_type {
-                                        Some(ValueType::ArrayValue(array)) => array.values.clone(),
-                                        _ => vec![v.clone()],
+                                    .map(|v| {
+                                        if v.exclude_from_indexes {
+                                            Vec::new()
+                                        } else {
+                                            match &v.value_type {
+                                                Some(ValueType::ArrayValue(array)) => array
+                                                    .values
+                                                    .iter()
+                                                    .filter(|inner| !inner.exclude_from_indexes)
+                                                    .cloned()
+                                                    .collect(),
+                                                _ => vec![v.clone()],
+                                            }
+                                        }
                                     })
                                     .unwrap_or_default()
                             };
@@ -1553,7 +1567,12 @@ impl DatastoreStorage {
                             ..Default::default()
                         })
                     } else {
-                        a_meta.entity.properties.get(prop_name).cloned()
+                        a_meta
+                            .entity
+                            .properties
+                            .get(prop_name)
+                            .filter(|v| !v.exclude_from_indexes)
+                            .cloned()
                     };
                     let b_val = if prop_name == "__key__" {
                         b_meta.entity.key.as_ref().map(|k| Value {
@@ -1561,7 +1580,12 @@ impl DatastoreStorage {
                             ..Default::default()
                         })
                     } else {
-                        b_meta.entity.properties.get(prop_name).cloned()
+                        b_meta
+                            .entity
+                            .properties
+                            .get(prop_name)
+                            .filter(|v| !v.exclude_from_indexes)
+                            .cloned()
                     };
 
                     let ordering = match (a_val.as_ref(), b_val.as_ref()) {
