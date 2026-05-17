@@ -10,6 +10,8 @@ on:
         description: "Number of concurrent clients"
         required: false
         default: "10"
+      # num_runs default (20) is intentionally below the script default (100) to keep
+      # CI runtime bounded on GitHub-hosted runners. Override via workflow_dispatch.
       num_runs:
         description: "Runs per client"
         required: false
@@ -17,7 +19,6 @@ on:
 
 permissions:
   contents: write
-  deployments: write
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -61,8 +62,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install Poetry
-        shell: bash
-        run: pipx install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
 
       - name: Install Python dependencies
         shell: bash
