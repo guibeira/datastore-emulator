@@ -28,6 +28,24 @@ where
     }
 }
 
+/// Inject `projectId` from the URL path into the JSON body if absent.
+/// Google's Datastore REST API treats the URL `project` as authoritative; clients
+/// (including dsadmin) commonly omit it from the body. Our core handlers read
+/// `req.project_id`, so we copy the URL segment in when the client didn't supply one.
+/// Empty body is treated as `{}`.
+fn inject_project_id(body: &Bytes, project_id: &str) -> Result<Bytes, String> {
+    let mut v: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?
+    };
+    if let serde_json::Value::Object(map) = &mut v {
+        map.entry("projectId")
+            .or_insert_with(|| serde_json::Value::String(project_id.to_string()));
+    }
+    Ok(Bytes::from(serde_json::to_vec(&v).unwrap()))
+}
+
 pub async fn datastore_method_handler(
     State(state): State<AppState>,
     Path(project_method): Path<String>,
@@ -36,6 +54,16 @@ pub async fn datastore_method_handler(
     let (project_id, method) = match project_method.split_once(':') {
         Some(p) => p,
         None => return bad_request("missing :method suffix on /v1/projects/{project}:{method}"),
+    };
+
+    // Methods carrying a top-level projectId in their proto. Inject from URL when missing.
+    let body = match method {
+        "lookup" | "runQuery" | "runAggregationQuery" | "commit" | "beginTransaction"
+        | "rollback" | "allocateIds" | "reserveIds" => match inject_project_id(&body, project_id) {
+            Ok(b) => b,
+            Err(e) => return bad_request(&e),
+        },
+        _ => body,
     };
 
     match method {
