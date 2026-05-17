@@ -58,21 +58,85 @@ fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
 }
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
+    fn cmp_int_double(i: i64, d: f64) -> Ordering {
+        if d.is_nan() {
+            return Ordering::Equal;
+        }
+        if d == f64::INFINITY {
+            return Ordering::Less;
+        }
+        if d == f64::NEG_INFINITY {
+            return Ordering::Greater;
+        }
+
+        const I64_MIN_AS_F64: f64 = i64::MIN as f64;
+        const I64_MAX_PLUS_ONE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
+        if d < I64_MIN_AS_F64 {
+            return Ordering::Greater;
+        }
+        if d >= I64_MAX_PLUS_ONE_AS_F64 {
+            return Ordering::Less;
+        }
+        if d.fract() == 0.0 {
+            return i.cmp(&(d as i64));
+        }
+
+        let floor = d.floor() as i64;
+        let ceil = d.ceil() as i64;
+        if i <= floor {
+            Ordering::Less
+        } else if i >= ceil {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+
+    // Datastore canonical cross-type ordering:
+    // null < number (int/double) < timestamp < boolean < string < blob <
+    // geopoint < key < entity < array.
+    fn type_rank(v: &Value) -> u8 {
+        match &v.value_type {
+            None => 0,
+            Some(ValueType::NullValue(_)) => 1,
+            Some(ValueType::IntegerValue(_)) | Some(ValueType::DoubleValue(_)) => 2,
+            Some(ValueType::TimestampValue(_)) => 3,
+            Some(ValueType::BooleanValue(_)) => 4,
+            Some(ValueType::StringValue(_)) => 5,
+            Some(ValueType::BlobValue(_)) => 6,
+            Some(ValueType::GeoPointValue(_)) => 7,
+            Some(ValueType::KeyValue(_)) => 8,
+            Some(ValueType::EntityValue(_)) => 9,
+            Some(ValueType::ArrayValue(_)) => 10,
+        }
+    }
+
+    let rank_ord = type_rank(a).cmp(&type_rank(b));
+    if rank_ord != Ordering::Equal {
+        return rank_ord;
+    }
+
     match (&a.value_type, &b.value_type) {
         (Some(ValueType::NullValue(_)), Some(ValueType::NullValue(_))) => Ordering::Equal,
+        // Integers and doubles share rank 2 and must compare as numbers.
         (Some(ValueType::IntegerValue(av)), Some(ValueType::IntegerValue(bv))) => av.cmp(bv),
         (Some(ValueType::DoubleValue(av)), Some(ValueType::DoubleValue(bv))) => {
             av.partial_cmp(bv).unwrap_or(Ordering::Equal)
         }
-        (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
-        (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
+        (Some(ValueType::IntegerValue(av)), Some(ValueType::DoubleValue(bv))) => {
+            cmp_int_double(*av, *bv)
+        }
+        (Some(ValueType::DoubleValue(av)), Some(ValueType::IntegerValue(bv))) => {
+            cmp_int_double(*bv, *av).reverse()
+        }
         (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => av
             .seconds
             .cmp(&bv.seconds)
             .then_with(|| av.nanos.cmp(&bv.nanos)),
-        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
-            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
-        }
+        (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
+        (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
+        (Some(ValueType::BlobValue(av)), Some(ValueType::BlobValue(bv))) => av.cmp(bv),
         (Some(ValueType::GeoPointValue(av)), Some(ValueType::GeoPointValue(bv))) => av
             .latitude
             .partial_cmp(&bv.latitude)
@@ -82,9 +146,29 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
                     .partial_cmp(&bv.longitude)
                     .unwrap_or(Ordering::Equal)
             }),
-        // Add other types if necessary, and handle type mismatches
-        // For now, unequal types are considered equal for sorting purposes, which is a simplification.
+        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
+            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
+        }
+        // Same-rank but unsupported deeper compare (e.g. entity/array): treat as equal.
         _ => Ordering::Equal,
+    }
+}
+
+fn sort_value(value: &Value, descending: bool) -> Option<Value> {
+    if value.exclude_from_indexes {
+        return None;
+    }
+
+    match &value.value_type {
+        Some(ValueType::ArrayValue(array)) => {
+            let indexed_values = array.values.iter().filter(|v| !v.exclude_from_indexes);
+            if descending {
+                indexed_values.max_by(|a, b| compare_values(a, b)).cloned()
+            } else {
+                indexed_values.min_by(|a, b| compare_values(a, b)).cloned()
+            }
+        }
+        _ => Some(value.clone()),
     }
 }
 
@@ -1124,15 +1208,29 @@ impl DatastoreStorage {
                                     &entity_metadata.entity.properties,
                                     &property.name,
                                 )
+                                .into_iter()
+                                .filter(|v| !v.exclude_from_indexes)
+                                .collect()
                             } else {
                                 // Simple property lookup
                                 entity_metadata
                                     .entity
                                     .properties
                                     .get(&property.name)
-                                    .map(|v| match &v.value_type {
-                                        Some(ValueType::ArrayValue(array)) => array.values.clone(),
-                                        _ => vec![v.clone()],
+                                    .map(|v| {
+                                        if v.exclude_from_indexes {
+                                            Vec::new()
+                                        } else {
+                                            match &v.value_type {
+                                                Some(ValueType::ArrayValue(array)) => array
+                                                    .values
+                                                    .iter()
+                                                    .filter(|inner| !inner.exclude_from_indexes)
+                                                    .cloned()
+                                                    .collect(),
+                                                _ => vec![v.clone()],
+                                            }
+                                        }
                                     })
                                     .unwrap_or_default()
                             };
@@ -1423,6 +1521,7 @@ impl DatastoreStorage {
         kind_name: String,
         filter: Option<Filter>,
         limit: Option<i32>,
+        offset: i32,
         start_cursor: Vec<u8>,
         projection: Vec<Projection>,
         distinct_on: Vec<PropertyReference>,
@@ -1514,6 +1613,8 @@ impl DatastoreStorage {
                     }
 
                     let prop_name = &order_by.property.as_ref().unwrap().name;
+                    let descending =
+                        order_by.direction == property_order::Direction::Descending as i32;
 
                     let a_val = if prop_name == "__key__" {
                         a_meta.entity.key.as_ref().map(|k| Value {
@@ -1521,7 +1622,11 @@ impl DatastoreStorage {
                             ..Default::default()
                         })
                     } else {
-                        a_meta.entity.properties.get(prop_name).cloned()
+                        a_meta
+                            .entity
+                            .properties
+                            .get(prop_name)
+                            .and_then(|v| sort_value(v, descending))
                     };
                     let b_val = if prop_name == "__key__" {
                         b_meta.entity.key.as_ref().map(|k| Value {
@@ -1529,7 +1634,11 @@ impl DatastoreStorage {
                             ..Default::default()
                         })
                     } else {
-                        b_meta.entity.properties.get(prop_name).cloned()
+                        b_meta
+                            .entity
+                            .properties
+                            .get(prop_name)
+                            .and_then(|v| sort_value(v, descending))
                     };
 
                     let ordering = match (a_val.as_ref(), b_val.as_ref()) {
@@ -1539,12 +1648,11 @@ impl DatastoreStorage {
                         (None, None) => Ordering::Equal,
                     };
 
-                    final_ordering =
-                        if order_by.direction == property_order::Direction::Descending as i32 {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
+                    final_ordering = if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
                 }
                 final_ordering
             });
@@ -1616,6 +1724,14 @@ impl DatastoreStorage {
                         .and_then(|bytes| bytes.try_into().ok())
                         .unwrap_or([0, 0, 0, 0]),
                 ) as usize;
+            }
+        }
+
+        // Apply Query.offset on top of any cursor-derived start_index.
+        if offset > 0 {
+            start_index = start_index.saturating_add(offset as usize);
+            if start_index > filtered_entities.len() {
+                start_index = filtered_entities.len();
             }
         }
 
