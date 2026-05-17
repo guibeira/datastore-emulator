@@ -63,7 +63,29 @@ Operation: Simple Query
     - Avg time per client: 0.9780 seconds
 ```
 
+### Emitting JSON for the continuous dashboard
 
+Pass `--json-out PATH` to write results in the `github-action-benchmark`
+`customSmallerIsBetter` format. The human-readable summary is still printed:
 
+```bash
+poetry run python benchmark/test_benchmark.py \
+  --num-clients 10 --num-runs 20 \
+  --json-out benchmark-output/results.json
+```
 
+### Continuous benchmark dashboard
+
+On every `v*` tag push, `.github/workflows/benchmark.yml` runs this script
+against both emulators (`docker compose up`) and publishes the results to
+GitHub Pages via [`benchmark-action/github-action-benchmark`][gab]. The
+dashboard lives at:
+
+<https://guibeira.github.io/datastore-emulator/dev/bench/>
+
+To smoke-test without cutting a tag, run the workflow manually from the
+**Actions** tab (`Benchmark` → **Run workflow**); the manual trigger
+accepts `num_clients` and `num_runs` overrides.
+
+[gab]: https://github.com/benchmark-action/github-action-benchmark
 
