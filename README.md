@@ -67,6 +67,47 @@ docker run -d \
 ```
 
 
+## Browser Admin UI
+
+Once the HTTP REST API is running, you can manage the emulator with a Google Cloud Datastore browser admin UI. [DSAdmin](https://github.com/remko/dsadmin) is the recommended option: it talks to the emulator over the same REST API used in production and supports browsing, editing, creating, deleting, and running GQL queries from the browser.
+
+To run the emulator alongside DSAdmin with Docker Compose, save the following as `docker-compose.yml` and run `docker compose up`:
+
+```yaml
+services:
+  # DSAdmin (browser UI). Runs via npx in a node image so the same compose works
+  # on amd64 and arm64; the official ghcr.io/remko/dsadmin image is amd64-only
+  # and currently crashes on Apple Silicon under qemu.
+  dsadmin:
+    image: node:20-alpine
+    depends_on:
+      - datastore
+    ports:
+      - "8080:8080"
+    environment:
+      DATASTORE_PROJECT_ID: my-datastore-project
+      DATASTORE_EMULATOR_HOST: "datastore:8042"
+    command: >
+      sh -c "npx -y dsadmin@latest --project=my-datastore-project
+             --datastore-emulator-host=datastore:8042"
+
+  # Rust Datastore Emulator
+  datastore:
+    image: guibeira/datastore-emulator:latest
+    working_dir: /data
+    volumes:
+      - datastore_data:/data
+    ports:
+      - "8042:8042"
+    command: ["--host-port", "0.0.0.0:8042"]
+
+volumes:
+  datastore_data:
+```
+
+Open `http://localhost:8080` once both containers report ready. The emulator persists data under the named volume `datastore_data` and serves the same REST endpoints documented above.
+
+
 ## Building from source
 
 Make sure you have the following prerequisites installed on your system:
