@@ -262,6 +262,7 @@ pub async fn commit(
 
                     let mut opt_updated_data: Option<(
                         Entity,
+                        Entity,
                         u64,
                         pbjson_types::Timestamp,
                         pbjson_types::Timestamp,
@@ -272,11 +273,13 @@ pub async fn commit(
                     {
                         let timestamp_now = system_time_to_timestamp(SystemTime::now());
 
+                        let previous_entity = existing_entity_metadata.entity.clone();
                         existing_entity_metadata.entity = entity.clone();
                         existing_entity_metadata.version += 1;
                         existing_entity_metadata.update_time = timestamp_now.clone();
 
                         opt_updated_data = Some((
+                            previous_entity,
                             existing_entity_metadata.entity.clone(),
                             existing_entity_metadata.version,
                             existing_entity_metadata.create_time.clone(),
@@ -284,9 +287,15 @@ pub async fn commit(
                         ));
                     }
 
-                    if let Some((entity_for_index, version, create_time, update_time)) =
-                        opt_updated_data
+                    if let Some((
+                        previous_entity,
+                        entity_for_index,
+                        version,
+                        create_time,
+                        update_time,
+                    )) = opt_updated_data
                     {
+                        storage.remove_from_indexes(&key_struct, &previous_entity);
                         storage.update_indexes(&key_struct, &entity_for_index);
 
                         mutation_results.push(MutationResult {
@@ -334,12 +343,14 @@ pub async fn commit(
                         let version;
                         let create_time;
                         let update_time = timestamp_now.clone();
+                        let mut previous_entity: Option<Entity> = None;
 
                         match entry {
                             std::collections::btree_map::Entry::Occupied(
                                 mut occupied_entry,
                             ) => {
                                 let metadata = occupied_entry.get_mut();
+                                previous_entity = Some(metadata.entity.clone());
                                 metadata.entity = entity.clone();
                                 metadata.version += 1;
                                 metadata.update_time = update_time.clone();
@@ -364,6 +375,9 @@ pub async fn commit(
                             storage.observe_key_id(&key);
                         }
 
+                        if let Some(prev) = previous_entity {
+                            storage.remove_from_indexes(&key_struct, &prev);
+                        }
                         storage.update_indexes(&key_struct, entity);
 
                         mutation_results.push(MutationResult {
