@@ -1,26 +1,19 @@
-use crate::api::create_router;
-use crate::google::datastore::v1::datastore_server::DatastoreServer;
-use crate::state::AppState;
+use datastore_emulator::{
+    api::create_router,
+    google::datastore::v1::datastore_server::DatastoreServer,
+    AppState, DatastoreEmulator,
+};
 use axum::{
     body::{Body, boxed},
     http::Request,
 };
 use clap::Parser;
-use database::DatastoreStorage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::{signal, sync::RwLock}; // Import the tokio signal module
+use tokio::{signal, sync::RwLock};
 use tonic::server::NamedService;
 use tracing_subscriber::EnvFilter;
-
-pub mod api;
-pub mod database;
-pub mod gcp;
-pub mod import;
-pub mod leveldb;
-pub mod operation;
-pub mod state;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,46 +25,6 @@ struct Cli {
     /// Do not store data on disk
     #[arg(long)]
     no_store_on_disk: bool,
-}
-
-// This is the single, canonical definition of the `google` module for the entire crate.
-pub mod google {
-    pub mod datastore {
-        pub mod import_export {
-            pub mod dsbackups {
-                tonic::include_proto!("dsbackups");
-            }
-            pub mod datastore_v3 {
-                tonic::include_proto!("appengine");
-            }
-        }
-        pub mod v1 {
-            tonic::include_proto!("google.datastore.v1");
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct DatastoreEmulator {
-    pub storage: Arc<RwLock<DatastoreStorage>>,
-}
-
-impl DatastoreEmulator {
-    fn new(store_on_disk: bool) -> Self {
-        tracing::info!("Initializing Datastore Emulator...");
-        let mut storage = DatastoreStorage::default();
-        if store_on_disk {
-            // Attempt to load data from disk on startup
-            if let Err(e) = storage.load_from_disk("datastore.bin") {
-                tracing::warn!("Could not load data from disk: {}", e);
-            }
-        } else {
-            tracing::info!("Running in-memory only. No data will be read from or saved to disk.");
-        }
-        Self {
-            storage: Arc::new(RwLock::new(storage)),
-        }
-    }
 }
 
 #[tokio::main]

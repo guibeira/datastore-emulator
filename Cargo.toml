@@ -20,6 +20,11 @@ include = [
     "/LICENSE",
 ]
 
+[lib]
+name = "datastore_emulator"
+path = "src/lib.rs"
+doctest = false
+
 [dependencies]
 tonic = { version = "0.9", features=["gzip"] }
 prost = "0.11"
@@ -44,10 +49,15 @@ bincode = { version = "2.0.1", features = ["serde"] }
 base64 = "0.21"
 google-cloud-storage = "0.24.0"
 clap = { version = "4.5.40", features = ["derive"] }
+pbjson = "0.5"
+pbjson-types = "0.5"
+tower-http = { version = "0.4", features = ["cors"] }
 
 [build-dependencies]
 tonic-build = "0.9"
+pbjson-build = "0.5"
 
 [dev-dependencies]
 once_cell = "1.21.3"
 reqwest = { version = "0.11", features = ["json"] }
+hyper = "0.14"
