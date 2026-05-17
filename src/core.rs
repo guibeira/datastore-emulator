@@ -3,12 +3,12 @@ use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
     EntityResult, ExecutionStats, ExplainMetrics, Filter, LookupRequest, LookupResponse,
-    MutationResult, PlanSummary, ReserveIdsRequest, ReserveIdsResponse,
-    RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse,
-    RunQueryRequest, RunQueryResponse, Value,
+    MutationResult, PlanSummary, PropertyOrder, PropertyReference, ReserveIdsRequest,
+    ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
+    RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse, Value,
     aggregation_query::aggregation::Operator as AggregationOperator,
-    commit_request::TransactionSelector, key::path_element::IdType, mutation::Operation,
-    value::ValueType,
+    commit_request::TransactionSelector, filter::FilterType, key::path_element::IdType,
+    mutation::Operation, property_order, value::ValueType,
 };
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::HashMap;
@@ -32,6 +32,40 @@ pub(crate) fn system_time_to_timestamp(time: SystemTime) -> pbjson_types::Timest
         },
         Err(_) => pbjson_types::Timestamp::default(),
     }
+}
+
+/// Walk a filter and collect property names referenced by any inequality
+/// operator (LESS_THAN=1, LESS_THAN_OR_EQUAL=2, GREATER_THAN=3,
+/// GREATER_THAN_OR_EQUAL=4, NOT_EQUAL=9). Datastore requires that the first
+/// sort order match the inequality property; when no explicit order is
+/// supplied we inject one implicitly.
+fn collect_inequality_properties(filter: &Filter) -> Vec<String> {
+    fn walk(filter_type: &FilterType, out: &mut Vec<String>) {
+        match filter_type {
+            FilterType::PropertyFilter(pf) => {
+                let is_inequality = matches!(pf.op, 1 | 2 | 3 | 4 | 9);
+                if is_inequality
+                    && let Some(prop) = pf.property.as_ref()
+                    && !out.contains(&prop.name)
+                {
+                    out.push(prop.name.clone());
+                }
+            }
+            FilterType::CompositeFilter(cf) => {
+                for sub in &cf.filters {
+                    if let Some(ft) = sub.filter_type.as_ref() {
+                        walk(ft, out);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(ft) = filter.filter_type.as_ref() {
+        walk(ft, &mut out);
+    }
+    out
 }
 
 pub async fn lookup(
@@ -97,6 +131,26 @@ pub async fn run_query(
         .first()
         .map(|k| k.name.clone())
         .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
+
+    // Datastore requires inequality filters to sort by the inequality
+    // property first. If the client did not supply an explicit order,
+    // inject an ascending implicit order for each inequality property.
+    let order: Vec<PropertyOrder> = if query_obj.order.is_empty() {
+        query_obj
+            .filter
+            .as_ref()
+            .map(|f| collect_inequality_properties(f))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| PropertyOrder {
+                property: Some(PropertyReference { name }),
+                direction: property_order::Direction::Ascending as i32,
+            })
+            .collect()
+    } else {
+        query_obj.order.clone()
+    };
+
     let batch = storage.get_entities(
         req.project_id.clone(),
         kind_name,
@@ -106,7 +160,7 @@ pub async fn run_query(
         query_obj.start_cursor.clone(),
         query_obj.projection.clone(),
         query_obj.distinct_on.clone(),
-        query_obj.order.clone(),
+        order,
     );
     let mut fields = HashMap::new();
     let amount_results = batch.entity_results.len() as i64;
