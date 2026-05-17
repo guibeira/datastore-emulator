@@ -6,7 +6,6 @@ import timeit
 import uuid
 from pathlib import Path
 
-from google.auth.credentials import AnonymousCredentials
 from google.cloud import datastore
 from google.cloud.datastore.query import PropertyFilter
 
@@ -137,13 +136,13 @@ def run_benchmarks(num_clients=10, number_of_runs_per_client=100, json_out=None)
     # --- Create clients ---
     rust_clients = []
     for _ in range(num_clients):
-        client = datastore.Client(project="test-project-2", credentials=AnonymousCredentials())
+        client = datastore.Client(project="test-project-2")
         client.base_url = "http://localhost:8042"
         rust_clients.append(client)
 
     java_clients = []
     for _ in range(num_clients):
-        client = datastore.Client(project="test-project-2", credentials=AnonymousCredentials())
+        client = datastore.Client(project="test-project-2")
         client.base_url = "http://localhost:8044"
         java_clients.append(client)
 
