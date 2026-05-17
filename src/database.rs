@@ -1454,6 +1454,7 @@ impl DatastoreStorage {
         kind_name: String,
         filter: Option<Filter>,
         limit: Option<i32>,
+        offset: i32,
         start_cursor: Vec<u8>,
         projection: Vec<Projection>,
         distinct_on: Vec<PropertyReference>,
@@ -1647,6 +1648,14 @@ impl DatastoreStorage {
                         .and_then(|bytes| bytes.try_into().ok())
                         .unwrap_or([0, 0, 0, 0]),
                 ) as usize;
+            }
+        }
+
+        // Apply Query.offset on top of any cursor-derived start_index.
+        if offset > 0 {
+            start_index = start_index.saturating_add(offset as usize);
+            if start_index > filtered_entities.len() {
+                start_index = filtered_entities.len();
             }
         }
 

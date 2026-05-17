@@ -102,6 +102,7 @@ pub async fn run_query(
         kind_name,
         query_obj.filter.clone(),
         query_obj.limit.as_ref().map(|v| v.value),
+        query_obj.offset,
         query_obj.start_cursor.clone(),
         query_obj.projection.clone(),
         query_obj.distinct_on.clone(),
