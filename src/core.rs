@@ -3,7 +3,7 @@ use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
     EntityResult, ExecutionStats, ExplainMetrics, Filter, LookupRequest, LookupResponse,
-    MutationResult, PlanSummary, PropertyReference, ReserveIdsRequest, ReserveIdsResponse,
+    MutationResult, PlanSummary, ReserveIdsRequest, ReserveIdsResponse,
     RollbackRequest, RollbackResponse, RunAggregationQueryRequest, RunAggregationQueryResponse,
     RunQueryRequest, RunQueryResponse, Value,
     aggregation_query::aggregation::Operator as AggregationOperator,
@@ -215,10 +215,7 @@ pub async fn commit(
                     if let Some(existing_entity_metadata) =
                         storage.entities.get_mut(&key_struct)
                     {
-                        let timestamp_now = pbjson_types::Timestamp {
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
 
                         existing_entity_metadata.entity = entity.clone();
                         existing_entity_metadata.version += 1;
@@ -275,10 +272,7 @@ pub async fn commit(
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(&key);
 
-                        let timestamp_now = pbjson_types::Timestamp {
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
 
                         let mut observe_key_counters = false;
                         let entry = storage.entities.entry(key_struct.clone());
@@ -330,10 +324,7 @@ pub async fn commit(
                 Operation::Delete(key_to_delete) => {
                     if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
                     {
-                        let timestamp_now = pbjson_types::Timestamp {
-                            seconds: 0,
-                            nanos: 0,
-                        };
+                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
                         mutation_results.push(MutationResult {
                             key: Some(key_to_delete.clone()),
                             version: removed_entity_metadata.version as i64,
@@ -609,15 +600,18 @@ pub async fn run_aggregation_query(
                     // Implement SUM aggregation
                     let mut sum_value = 0.0;
 
+                    let prop_name = match &sum.property {
+                        Some(p) => &p.name,
+                        None => {
+                            return Err(Status::invalid_argument(
+                                "Sum aggregation requires a property",
+                            ));
+                        }
+                    };
+
                     // Calculate the sum for the specified property
                     for entity_metadata in &matching_entities {
-                        if let Some(property) = entity_metadata.entity.properties.get(
-                            &<std::option::Option<PropertyReference> as Clone>::clone(
-                                &sum.property,
-                            )
-                            .unwrap()
-                            .name,
-                        ) {
+                        if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
                             } else if let Some(ValueType::DoubleValue(value)) =
@@ -641,15 +635,18 @@ pub async fn run_aggregation_query(
                     let mut sum_value = 0.0;
                     let mut count = 0;
 
+                    let prop_name = match &avg.property {
+                        Some(p) => &p.name,
+                        None => {
+                            return Err(Status::invalid_argument(
+                                "Avg aggregation requires a property",
+                            ));
+                        }
+                    };
+
                     // Calculate the sum and count for the average
                     for entity_metadata in &matching_entities {
-                        if let Some(property) = entity_metadata.entity.properties.get(
-                            &<std::option::Option<PropertyReference> as Clone>::clone(
-                                &avg.property,
-                            )
-                            .unwrap()
-                            .name,
-                        ) {
+                        if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
                                 count += 1;

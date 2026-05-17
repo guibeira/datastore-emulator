@@ -40,8 +40,20 @@ fn inject_project_id(body: &Bytes, project_id: &str) -> Result<Bytes, String> {
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?
     };
     if let serde_json::Value::Object(map) = &mut v {
-        map.entry("projectId")
-            .or_insert_with(|| serde_json::Value::String(project_id.to_string()));
+        match map.get("projectId").and_then(|v| v.as_str()) {
+            Some(existing) if existing != project_id => {
+                return Err(format!(
+                    "projectId in body ('{existing}') must match URL project ('{project_id}')"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                map.insert(
+                    "projectId".to_string(),
+                    serde_json::Value::String(project_id.to_string()),
+                );
+            }
+        }
     }
     Ok(Bytes::from(serde_json::to_vec(&v).unwrap()))
 }
@@ -218,6 +230,40 @@ mod tests {
             storage: Arc::new(RwLock::new(storage)),
             operations: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn project_id_mismatch_between_url_and_body_returns_400() {
+        let state = seeded_state("p1", "Task", "abc");
+        let app = create_router(state);
+
+        let body = serde_json::json!({
+            "projectId": "p2",
+            "keys": [{
+                "partitionId": { "projectId": "p2" },
+                "path": [{ "kind": "Task", "name": "abc" }]
+            }]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:lookup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must match URL project"));
     }
 
     #[tokio::test]

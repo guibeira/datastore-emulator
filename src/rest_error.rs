@@ -13,7 +13,25 @@ pub fn status_to_response(s: Status) -> Response {
         Code::Unimplemented => 501,
         _ => 500,
     };
-    let status_str = format!("{:?}", s.code()).to_uppercase();
+    let status_str = match s.code() {
+        Code::Ok => "OK",
+        Code::Cancelled => "CANCELLED",
+        Code::Unknown => "UNKNOWN",
+        Code::InvalidArgument => "INVALID_ARGUMENT",
+        Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        Code::NotFound => "NOT_FOUND",
+        Code::AlreadyExists => "ALREADY_EXISTS",
+        Code::PermissionDenied => "PERMISSION_DENIED",
+        Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        Code::FailedPrecondition => "FAILED_PRECONDITION",
+        Code::Aborted => "ABORTED",
+        Code::OutOfRange => "OUT_OF_RANGE",
+        Code::Unimplemented => "UNIMPLEMENTED",
+        Code::Internal => "INTERNAL",
+        Code::Unavailable => "UNAVAILABLE",
+        Code::DataLoss => "DATA_LOSS",
+        Code::Unauthenticated => "UNAUTHENTICATED",
+    };
     (
         StatusCode::from_u16(http).unwrap(),
         Json(json!({
@@ -50,7 +68,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_to_json(resp).await;
         assert_eq!(v["error"]["code"], 400);
-        assert_eq!(v["error"]["status"], "INVALIDARGUMENT");
+        assert_eq!(v["error"]["status"], "INVALID_ARGUMENT");
         assert_eq!(v["error"]["message"], "bad payload");
     }
 

@@ -379,16 +379,12 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
                 properties,
             };
 
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
             let timestamp_now = pbjson_types::Timestamp {
-                seconds: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                nanos: (SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    % 1_000_000_000) as i32,
+                seconds: now.as_secs() as i64,
+                nanos: (now.as_nanos() % 1_000_000_000) as i32,
             };
 
             EntityWithMetadata {
@@ -1035,17 +1031,12 @@ impl DatastoreStorage {
         let mut db_entity = entity.clone();
         db_entity.key = Some(key_with_new_id.clone());
 
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
         let timestamp_now = pbjson_types::Timestamp {
-            // Placeholder, consider real time
-            seconds: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            nanos: (SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                % 1_000_000_000) as i32,
+            seconds: now.as_secs() as i64,
+            nanos: (now.as_nanos() % 1_000_000_000) as i32,
         };
 
         let entity_metadata = EntityWithMetadata {
