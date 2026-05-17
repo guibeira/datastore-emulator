@@ -58,21 +58,50 @@ fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
 }
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
+    // Datastore canonical cross-type ordering:
+    // null < number (int/double) < timestamp < boolean < string < blob <
+    // geopoint < key < entity < array.
+    fn type_rank(v: &Value) -> u8 {
+        match &v.value_type {
+            None => 0,
+            Some(ValueType::NullValue(_)) => 1,
+            Some(ValueType::IntegerValue(_)) | Some(ValueType::DoubleValue(_)) => 2,
+            Some(ValueType::TimestampValue(_)) => 3,
+            Some(ValueType::BooleanValue(_)) => 4,
+            Some(ValueType::StringValue(_)) => 5,
+            Some(ValueType::BlobValue(_)) => 6,
+            Some(ValueType::GeoPointValue(_)) => 7,
+            Some(ValueType::KeyValue(_)) => 8,
+            Some(ValueType::EntityValue(_)) => 9,
+            Some(ValueType::ArrayValue(_)) => 10,
+        }
+    }
+
+    let rank_ord = type_rank(a).cmp(&type_rank(b));
+    if rank_ord != Ordering::Equal {
+        return rank_ord;
+    }
+
     match (&a.value_type, &b.value_type) {
         (Some(ValueType::NullValue(_)), Some(ValueType::NullValue(_))) => Ordering::Equal,
+        // Integers and doubles share rank 2 and must compare as numbers.
         (Some(ValueType::IntegerValue(av)), Some(ValueType::IntegerValue(bv))) => av.cmp(bv),
         (Some(ValueType::DoubleValue(av)), Some(ValueType::DoubleValue(bv))) => {
             av.partial_cmp(bv).unwrap_or(Ordering::Equal)
         }
-        (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
-        (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
+        (Some(ValueType::IntegerValue(av)), Some(ValueType::DoubleValue(bv))) => {
+            (*av as f64).partial_cmp(bv).unwrap_or(Ordering::Equal)
+        }
+        (Some(ValueType::DoubleValue(av)), Some(ValueType::IntegerValue(bv))) => {
+            av.partial_cmp(&(*bv as f64)).unwrap_or(Ordering::Equal)
+        }
         (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => av
             .seconds
             .cmp(&bv.seconds)
             .then_with(|| av.nanos.cmp(&bv.nanos)),
-        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
-            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
-        }
+        (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
+        (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
+        (Some(ValueType::BlobValue(av)), Some(ValueType::BlobValue(bv))) => av.cmp(bv),
         (Some(ValueType::GeoPointValue(av)), Some(ValueType::GeoPointValue(bv))) => av
             .latitude
             .partial_cmp(&bv.latitude)
@@ -82,8 +111,10 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
                     .partial_cmp(&bv.longitude)
                     .unwrap_or(Ordering::Equal)
             }),
-        // Add other types if necessary, and handle type mismatches
-        // For now, unequal types are considered equal for sorting purposes, which is a simplification.
+        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
+            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
+        }
+        // Same-rank but unsupported deeper compare (e.g. entity/array): treat as equal.
         _ => Ordering::Equal,
     }
 }
