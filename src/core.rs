@@ -139,7 +139,7 @@ pub async fn run_query(
         query_obj
             .filter
             .as_ref()
-            .map(|f| collect_inequality_properties(f))
+            .map(collect_inequality_properties)
             .unwrap_or_default()
             .into_iter()
             .map(|name| PropertyOrder {
