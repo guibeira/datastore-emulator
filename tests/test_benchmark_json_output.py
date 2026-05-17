@@ -59,7 +59,7 @@ def test_creates_parent_directory(tmp_path):
     write_json_output(rust, java, num_clients=2, number_of_runs_per_client=10, output_path=out)
 
     assert out.exists()
-    assert json.loads(out.read_text())
+    assert len(json.loads(out.read_text())) == 6
 
 
 def test_skips_when_either_side_missing(tmp_path, capsys):
@@ -67,6 +67,11 @@ def test_skips_when_either_side_missing(tmp_path, capsys):
 
     write_json_output([], [{"Single Insert": 1.0}], num_clients=1, number_of_runs_per_client=1, output_path=out)
 
+    assert not out.exists()
+    captured = capsys.readouterr()
+    assert "Skipping" in captured.out
+
+    write_json_output([{"Single Insert": 1.0}], [], num_clients=1, number_of_runs_per_client=1, output_path=out)
     assert not out.exists()
     captured = capsys.readouterr()
     assert "Skipping" in captured.out
