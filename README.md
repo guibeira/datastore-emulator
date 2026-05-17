@@ -18,6 +18,7 @@ The repository includes a comprehensive test suite that runs against both this c
 *   **Aggregation Queries**: Supports `COUNT`, `SUM`, and `AVG` aggregations.
 *   **ID Management**: Implements `AllocateIds` and `ReserveIds`.
 *   **Data Import**: An HTTP endpoint to import data from official Datastore exports.
+*   **HTTP REST API**: Implements the public Google Datastore REST API v1 at `POST /v1/projects/{projectId}:{method}` for `lookup`, `runQuery`, `runAggregationQuery`, `commit`, `beginTransaction`, `rollback`, `allocateIds`, `reserveIds`, and `import`. Browser clients are supported via permissive CORS.
 
 
 ## How to use
