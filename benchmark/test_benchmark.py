@@ -1,8 +1,10 @@
 import argparse
+import json
 import statistics
 import threading
 import timeit
 import uuid
+from pathlib import Path
 
 from google.cloud import datastore
 from google.cloud.datastore.query import PropertyFilter
@@ -87,7 +89,50 @@ def run_single_client_benchmark(name, client, number_of_runs, results_list):
     results_list.append(client_results)
 
 
-def run_benchmarks(num_clients=10, number_of_runs_per_client=100):
+def write_json_output(rust_results, java_results, num_clients, number_of_runs_per_client, output_path):
+    """Writes benchmark results in github-action-benchmark customSmallerIsBetter format."""
+    if not rust_results or not java_results:
+        print(
+            f"Skipping JSON output: missing rust ({len(rust_results)}) "
+            f"or java ({len(java_results)}) results."
+        )
+        return
+
+    test_names = list(rust_results[0].keys())
+    entries = []
+    for test_name in test_names:
+        rust_times = [r[test_name] for r in rust_results]
+        java_times = [j[test_name] for j in java_results]
+
+        rust_avg = statistics.mean(rust_times)
+        java_avg = statistics.mean(java_times)
+
+        entries.append({
+            "name": f"{test_name} (Rust) - avg seconds per client",
+            "unit": "s",
+            "value": round(rust_avg, 6),
+            "extra": (
+                f"{num_clients} clients, {number_of_runs_per_client} runs/client, "
+                f"total {sum(rust_times):.4f}s"
+            ),
+        })
+        entries.append({
+            "name": f"{test_name} (Java) - avg seconds per client",
+            "unit": "s",
+            "value": round(java_avg, 6),
+            "extra": (
+                f"{num_clients} clients, {number_of_runs_per_client} runs/client, "
+                f"total {sum(java_times):.4f}s"
+            ),
+        })
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(entries, indent=2))
+    print(f"\nWrote benchmark JSON to {out}")
+
+
+def run_benchmarks(num_clients=10, number_of_runs_per_client=100, json_out=None):
     # --- Create clients ---
     rust_clients = []
     for _ in range(num_clients):
@@ -169,6 +214,15 @@ def run_benchmarks(num_clients=10, number_of_runs_per_client=100):
         else:
             print(f"  - Verdict: Java was {total_rust_time/total_java_time:.2f}x faster overall.")
 
+    if json_out:
+        write_json_output(
+            rust_results,
+            java_results,
+            num_clients,
+            number_of_runs_per_client,
+            json_out,
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run datastore benchmarks.")
@@ -184,6 +238,16 @@ if __name__ == "__main__":
         default=100,
         help="Number of test runs per client (default: 100).",
     )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default=None,
+        help="Optional path to write benchmark results as github-action-benchmark customSmallerIsBetter JSON.",
+    )
     args = parser.parse_args()
 
-    run_benchmarks(num_clients=args.num_clients, number_of_runs_per_client=args.num_runs)
+    run_benchmarks(
+        num_clients=args.num_clients,
+        number_of_runs_per_client=args.num_runs,
+        json_out=args.json_out,
+    )
