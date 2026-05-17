@@ -260,53 +260,32 @@ pub async fn commit(
                     };
                     let key_struct = KeyStruct::from_datastore_key(&key);
 
-                    let mut opt_updated_data: Option<(
-                        Entity,
-                        Entity,
-                        u64,
-                        pbjson_types::Timestamp,
-                        pbjson_types::Timestamp,
-                    )> = None;
+                    let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct) else {
+                        return Err(Status::not_found("Entity not found for update"));
+                    };
 
-                    if let Some(existing_entity_metadata) =
-                        storage.entities.get_mut(&key_struct)
-                    {
-                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
+                    let timestamp_now = system_time_to_timestamp(SystemTime::now());
+                    let previous_entity = existing_entity_metadata.entity.clone();
+                    existing_entity_metadata.entity = entity.clone();
+                    existing_entity_metadata.version += 1;
+                    existing_entity_metadata.update_time = timestamp_now.clone();
 
-                        let previous_entity = existing_entity_metadata.entity.clone();
-                        existing_entity_metadata.entity = entity.clone();
-                        existing_entity_metadata.version += 1;
-                        existing_entity_metadata.update_time = timestamp_now.clone();
+                    let entity_for_index = existing_entity_metadata.entity.clone();
+                    let version = existing_entity_metadata.version;
+                    let create_time = existing_entity_metadata.create_time.clone();
+                    let update_time = timestamp_now;
 
-                        opt_updated_data = Some((
-                            previous_entity,
-                            existing_entity_metadata.entity.clone(),
-                            existing_entity_metadata.version,
-                            existing_entity_metadata.create_time.clone(),
-                            timestamp_now,
-                        ));
-                    }
+                    storage.remove_from_indexes(&key_struct, &previous_entity);
+                    storage.update_indexes(&key_struct, &entity_for_index);
 
-                    if let Some((
-                        previous_entity,
-                        entity_for_index,
-                        version,
-                        create_time,
-                        update_time,
-                    )) = opt_updated_data
-                    {
-                        storage.remove_from_indexes(&key_struct, &previous_entity);
-                        storage.update_indexes(&key_struct, &entity_for_index);
-
-                        mutation_results.push(MutationResult {
-                            key: entity.key.clone(),
-                            version: version as i64,
-                            create_time: Some(create_time),
-                            update_time: Some(update_time),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
-                    }
+                    mutation_results.push(MutationResult {
+                        key: entity.key.clone(),
+                        version: version as i64,
+                        create_time: Some(create_time),
+                        update_time: Some(update_time),
+                        conflict_detected: false,
+                        transform_results: vec![],
+                    });
                 }
                 Operation::Upsert(entity) => {
                     let key = match entity.key {

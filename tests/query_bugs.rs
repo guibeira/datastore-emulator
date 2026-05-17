@@ -16,7 +16,7 @@ use datastore_emulator::{
     core,
     database::{EntityWithMetadata, KeyId, KeyStruct},
     google::datastore::v1::{
-        CommitRequest, Entity, Filter, Key, Mutation, PartitionId, PropertyOrder,
+        ArrayValue, CommitRequest, Entity, Filter, Key, Mutation, PartitionId, PropertyOrder,
         PropertyReference, Query, RunQueryRequest, Value,
         commit_request::Mode,
         filter::FilterType,
@@ -31,6 +31,7 @@ use datastore_emulator::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tonic::Code;
 
 const PROJECT: &str = "p1";
 const KIND: &str = "Item";
@@ -68,6 +69,13 @@ fn val_excluded(value_type: ValueType) -> Value {
     Value {
         value_type: Some(value_type),
         exclude_from_indexes: true,
+        ..Default::default()
+    }
+}
+
+fn val_array(values: Vec<Value>) -> Value {
+    Value {
+        value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
         ..Default::default()
     }
 }
@@ -200,6 +208,66 @@ async fn cross_type_ordering_follows_datastore_spec() {
     );
 }
 
+#[tokio::test]
+async fn int_double_comparison_preserves_large_integer_precision() {
+    let mut storage = DatastoreStorage::default();
+    let threshold = 9_007_199_254_740_992.0;
+    let int_above_threshold = 9_007_199_254_740_993i64;
+
+    insert(
+        &mut storage,
+        "double_threshold",
+        HashMap::from([("score".to_string(), val(ValueType::DoubleValue(threshold)))]),
+    );
+    insert(
+        &mut storage,
+        "int_above",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::IntegerValue(int_above_threshold)),
+        )]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let greater_than_double = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter: Some(prop_filter(
+            "score",
+            property_filter::Operator::GreaterThan,
+            val(ValueType::DoubleValue(threshold)),
+        )),
+        order: vec![order_by_asc("score")],
+        ..Default::default()
+    };
+    let names = run(storage.clone(), greater_than_double).await;
+    assert_eq!(
+        names,
+        vec!["int_above"],
+        "integer 2^53 + 1 must compare greater than double 2^53"
+    );
+
+    let less_than_int = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter: Some(prop_filter(
+            "score",
+            property_filter::Operator::LessThan,
+            val(ValueType::IntegerValue(int_above_threshold)),
+        )),
+        order: vec![order_by_asc("score")],
+        ..Default::default()
+    };
+    let names = run(storage, less_than_int).await;
+    assert_eq!(
+        names,
+        vec!["double_threshold"],
+        "double 2^53 must compare less than integer 2^53 + 1"
+    );
+}
+
 /// Bug 2: an inequality filter with no explicit `order` should implicitly
 /// sort results by the inequality property ascending.
 #[tokio::test]
@@ -278,6 +346,51 @@ async fn exclude_from_indexes_skips_filter_matches() {
         names,
         vec!["indexed"],
         "exclude_from_indexes property must not match filters even via scan path"
+    );
+}
+
+#[tokio::test]
+async fn order_by_skips_excluded_array_values() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "scalar",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(10)))]),
+    );
+    insert(
+        &mut storage,
+        "array_indexed",
+        HashMap::from([(
+            "score".to_string(),
+            val_array(vec![
+                val_excluded(ValueType::IntegerValue(0)),
+                val(ValueType::IntegerValue(5)),
+            ]),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "all_excluded",
+        HashMap::from([(
+            "score".to_string(),
+            val_array(vec![val_excluded(ValueType::IntegerValue(1))]),
+        )]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let query = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        order: vec![order_by_asc("score")],
+        ..Default::default()
+    };
+
+    let names = run(storage, query).await;
+    assert_eq!(
+        names,
+        vec!["all_excluded", "array_indexed", "scalar"],
+        "sort order must ignore excluded array members and treat arrays with no indexed members as missing"
     );
 }
 
@@ -395,4 +508,31 @@ async fn update_purges_stale_index_entries() {
         "query for old value must return nothing after update, got {:?}",
         names
     );
+}
+
+#[tokio::test]
+async fn update_missing_entity_returns_not_found() {
+    let storage = Arc::new(RwLock::new(DatastoreStorage::default()));
+    let updated_entity = Entity {
+        key: Some(key("missing")),
+        properties: HashMap::from([(
+            "tag".to_string(),
+            val(ValueType::StringValue("new".to_string())),
+        )]),
+    };
+    let commit_req = CommitRequest {
+        project_id: PROJECT.to_string(),
+        mode: Mode::NonTransactional as i32,
+        mutations: vec![Mutation {
+            operation: Some(Operation::Update(updated_entity)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let err = core::commit(&storage, commit_req)
+        .await
+        .expect_err("updating a missing entity must fail");
+    assert_eq!(err.code(), Code::NotFound);
+    assert_eq!(err.message(), "Entity not found for update");
 }

@@ -58,6 +58,41 @@ fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
 }
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
+    fn cmp_int_double(i: i64, d: f64) -> Ordering {
+        if d.is_nan() {
+            return Ordering::Equal;
+        }
+        if d == f64::INFINITY {
+            return Ordering::Less;
+        }
+        if d == f64::NEG_INFINITY {
+            return Ordering::Greater;
+        }
+
+        const I64_MIN_AS_F64: f64 = i64::MIN as f64;
+        const I64_MAX_PLUS_ONE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
+        if d < I64_MIN_AS_F64 {
+            return Ordering::Greater;
+        }
+        if d >= I64_MAX_PLUS_ONE_AS_F64 {
+            return Ordering::Less;
+        }
+        if d.fract() == 0.0 {
+            return i.cmp(&(d as i64));
+        }
+
+        let floor = d.floor() as i64;
+        let ceil = d.ceil() as i64;
+        if i <= floor {
+            Ordering::Less
+        } else if i >= ceil {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+
     // Datastore canonical cross-type ordering:
     // null < number (int/double) < timestamp < boolean < string < blob <
     // geopoint < key < entity < array.
@@ -90,10 +125,10 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
             av.partial_cmp(bv).unwrap_or(Ordering::Equal)
         }
         (Some(ValueType::IntegerValue(av)), Some(ValueType::DoubleValue(bv))) => {
-            (*av as f64).partial_cmp(bv).unwrap_or(Ordering::Equal)
+            cmp_int_double(*av, *bv)
         }
         (Some(ValueType::DoubleValue(av)), Some(ValueType::IntegerValue(bv))) => {
-            av.partial_cmp(&(*bv as f64)).unwrap_or(Ordering::Equal)
+            cmp_int_double(*bv, *av).reverse()
         }
         (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => av
             .seconds
@@ -116,6 +151,24 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
         }
         // Same-rank but unsupported deeper compare (e.g. entity/array): treat as equal.
         _ => Ordering::Equal,
+    }
+}
+
+fn sort_value(value: &Value, descending: bool) -> Option<Value> {
+    if value.exclude_from_indexes {
+        return None;
+    }
+
+    match &value.value_type {
+        Some(ValueType::ArrayValue(array)) => {
+            let indexed_values = array.values.iter().filter(|v| !v.exclude_from_indexes);
+            if descending {
+                indexed_values.max_by(|a, b| compare_values(a, b)).cloned()
+            } else {
+                indexed_values.min_by(|a, b| compare_values(a, b)).cloned()
+            }
+        }
+        _ => Some(value.clone()),
     }
 }
 
@@ -1560,6 +1613,8 @@ impl DatastoreStorage {
                     }
 
                     let prop_name = &order_by.property.as_ref().unwrap().name;
+                    let descending =
+                        order_by.direction == property_order::Direction::Descending as i32;
 
                     let a_val = if prop_name == "__key__" {
                         a_meta.entity.key.as_ref().map(|k| Value {
@@ -1571,8 +1626,7 @@ impl DatastoreStorage {
                             .entity
                             .properties
                             .get(prop_name)
-                            .filter(|v| !v.exclude_from_indexes)
-                            .cloned()
+                            .and_then(|v| sort_value(v, descending))
                     };
                     let b_val = if prop_name == "__key__" {
                         b_meta.entity.key.as_ref().map(|k| Value {
@@ -1584,8 +1638,7 @@ impl DatastoreStorage {
                             .entity
                             .properties
                             .get(prop_name)
-                            .filter(|v| !v.exclude_from_indexes)
-                            .cloned()
+                            .and_then(|v| sort_value(v, descending))
                     };
 
                     let ordering = match (a_val.as_ref(), b_val.as_ref()) {
@@ -1595,12 +1648,11 @@ impl DatastoreStorage {
                         (None, None) => Ordering::Equal,
                     };
 
-                    final_ordering =
-                        if order_by.direction == property_order::Direction::Descending as i32 {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
+                    final_ordering = if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
                 }
                 final_ordering
             });
