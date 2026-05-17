@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "datastore-emulator"
-version = "0.1.2-rc2"
+version = "0.1.2-rc3"
 dependencies = [
  "async-trait",
  "axum",
