@@ -132,7 +132,7 @@ def write_json_output(rust_results, java_results, num_clients, number_of_runs_pe
     print(f"\nWrote benchmark JSON to {out}")
 
 
-def run_benchmarks(num_clients=10, number_of_runs_per_client=100):
+def run_benchmarks(num_clients=10, number_of_runs_per_client=100, json_out=None):
     # --- Create clients ---
     rust_clients = []
     for _ in range(num_clients):
@@ -214,6 +214,15 @@ def run_benchmarks(num_clients=10, number_of_runs_per_client=100):
         else:
             print(f"  - Verdict: Java was {total_rust_time/total_java_time:.2f}x faster overall.")
 
+    if json_out:
+        write_json_output(
+            rust_results,
+            java_results,
+            num_clients,
+            number_of_runs_per_client,
+            json_out,
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run datastore benchmarks.")
@@ -229,6 +238,16 @@ if __name__ == "__main__":
         default=100,
         help="Number of test runs per client (default: 100).",
     )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default=None,
+        help="Optional path to write benchmark results as github-action-benchmark customSmallerIsBetter JSON.",
+    )
     args = parser.parse_args()
 
-    run_benchmarks(num_clients=args.num_clients, number_of_runs_per_client=args.num_runs)
+    run_benchmarks(
+        num_clients=args.num_clients,
+        number_of_runs_per_client=args.num_runs,
+        json_out=args.json_out,
+    )
