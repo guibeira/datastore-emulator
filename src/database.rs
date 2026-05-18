@@ -154,7 +154,7 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-fn sort_value(value: &Value, descending: bool) -> Option<Value> {
+fn sort_value(value: &Value, descending: bool) -> Option<&Value> {
     if value.exclude_from_indexes {
         return None;
     }
@@ -163,12 +163,12 @@ fn sort_value(value: &Value, descending: bool) -> Option<Value> {
         Some(ValueType::ArrayValue(array)) => {
             let indexed_values = array.values.iter().filter(|v| !v.exclude_from_indexes);
             if descending {
-                indexed_values.max_by(|a, b| compare_values(a, b)).cloned()
+                indexed_values.max_by(|a, b| compare_values(a, b))
             } else {
-                indexed_values.min_by(|a, b| compare_values(a, b)).cloned()
+                indexed_values.min_by(|a, b| compare_values(a, b))
             }
         }
-        _ => Some(value.clone()),
+        _ => Some(value),
     }
 }
 
@@ -1618,7 +1618,7 @@ impl DatastoreStorage {
 
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_by(|(_a_key, a_meta), (_b_key, b_meta)| {
+            filtered_entities.sort_by(|(a_key, a_meta), (b_key, b_meta)| {
                 let mut final_ordering = Ordering::Equal;
                 for order_by in &order {
                     if final_ordering != Ordering::Equal {
@@ -1629,32 +1629,34 @@ impl DatastoreStorage {
                     let descending =
                         order_by.direction == property_order::Direction::Descending as i32;
 
-                    let a_val = if prop_name == "__key__" {
-                        a_meta.entity.key.as_ref().map(|k| Value {
-                            value_type: Some(ValueType::KeyValue(k.clone())),
-                            ..Default::default()
-                        })
-                    } else {
-                        a_meta
-                            .entity
-                            .properties
-                            .get(prop_name)
-                            .and_then(|v| sort_value(v, descending))
-                    };
-                    let b_val = if prop_name == "__key__" {
-                        b_meta.entity.key.as_ref().map(|k| Value {
-                            value_type: Some(ValueType::KeyValue(k.clone())),
-                            ..Default::default()
-                        })
-                    } else {
-                        b_meta
-                            .entity
-                            .properties
-                            .get(prop_name)
-                            .and_then(|v| sort_value(v, descending))
-                    };
+                    if prop_name == "__key__" {
+                        let ordering = match (a_key.as_ref(), b_key.as_ref()) {
+                            (Some(a), Some(b)) => a.cmp(b),
+                            (Some(_), None) => Ordering::Greater,
+                            (None, Some(_)) => Ordering::Less,
+                            (None, None) => Ordering::Equal,
+                        };
 
-                    let ordering = match (a_val.as_ref(), b_val.as_ref()) {
+                        final_ordering = if descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        };
+                        continue;
+                    }
+
+                    let a_val = a_meta
+                        .entity
+                        .properties
+                        .get(prop_name)
+                        .and_then(|v| sort_value(v, descending));
+                    let b_val = b_meta
+                        .entity
+                        .properties
+                        .get(prop_name)
+                        .and_then(|v| sort_value(v, descending));
+
+                    let ordering = match (a_val, b_val) {
                         (Some(a), Some(b)) => compare_values(a, b),
                         (Some(_), None) => Ordering::Greater,
                         (None, Some(_)) => Ordering::Less,
