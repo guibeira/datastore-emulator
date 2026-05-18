@@ -320,6 +320,64 @@ fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
     values
 }
 
+fn values_match_filter<'a>(
+    entity_values: impl IntoIterator<Item = &'a Value>,
+    filter_value: &Value,
+    op: i32,
+) -> bool {
+    let mut entity_values = entity_values.into_iter();
+
+    match op {
+        0 => entity_values.next().is_some(), // OPERATOR_UNSPECIFIED
+        1 => entity_values.any(|v| compare_values(v, filter_value).is_lt()),
+        2 => entity_values.any(|v| compare_values(v, filter_value).is_le()),
+        3 => entity_values.any(|v| compare_values(v, filter_value).is_gt()),
+        4 => entity_values.any(|v| compare_values(v, filter_value).is_ge()),
+        5 => entity_values.any(|v| v.value_type == filter_value.value_type),
+        6 => {
+            if let Some(ValueType::ArrayValue(array_value)) = &filter_value.value_type {
+                entity_values.any(|v| {
+                    array_value
+                        .values
+                        .iter()
+                        .any(|candidate| candidate.value_type == v.value_type)
+                })
+            } else {
+                false
+            }
+        }
+        9 => {
+            let mut saw_value = false;
+            for value in entity_values {
+                saw_value = true;
+                if value.value_type == filter_value.value_type {
+                    return false;
+                }
+            }
+            saw_value
+        }
+        13 => {
+            if let Some(ValueType::ArrayValue(array_value)) = &filter_value.value_type {
+                let mut saw_value = false;
+                for value in entity_values {
+                    saw_value = true;
+                    if array_value
+                        .values
+                        .iter()
+                        .any(|candidate| candidate.value_type == value.value_type)
+                    {
+                        return false;
+                    }
+                }
+                saw_value
+            } else {
+                entity_values.next().is_some()
+            }
+        }
+        _ => false,
+    }
+}
+
 fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
     if let Some(v) = prop_val.int64_value {
         return Some(ValueType::IntegerValue(v));
@@ -1190,104 +1248,59 @@ impl DatastoreStorage {
                         // Regular property filters
                         else {
                             // Check if this is a nested property path (contains dots)
-                            let entity_values: Vec<Value> = if property.name == "__key__" {
-                                entity_metadata
-                                    .entity
-                                    .key
-                                    .as_ref()
-                                    .map(|k| {
-                                        vec![Value {
-                                            value_type: Some(ValueType::KeyValue(k.clone())),
-                                            ..Default::default()
-                                        }]
-                                    })
-                                    .unwrap_or_default()
+                            if property.name == "__key__" {
+                                if let Some(key) = entity_metadata.entity.key.as_ref() {
+                                    let key_value = Value {
+                                        value_type: Some(ValueType::KeyValue(key.clone())),
+                                        ..Default::default()
+                                    };
+                                    values_match_filter(
+                                        std::iter::once(&key_value),
+                                        filter_value,
+                                        property_filter.op,
+                                    )
+                                } else {
+                                    false
+                                }
                             } else if property.name.contains('.') {
                                 // Nested property path - use recursive resolution
-                                resolve_nested_property(
+                                let entity_values = resolve_nested_property(
                                     &entity_metadata.entity.properties,
                                     &property.name,
+                                );
+                                values_match_filter(
+                                    entity_values.iter().filter(|v| !v.exclude_from_indexes),
+                                    filter_value,
+                                    property_filter.op,
                                 )
-                                .into_iter()
-                                .filter(|v| !v.exclude_from_indexes)
-                                .collect()
                             } else {
                                 // Simple property lookup
-                                entity_metadata
-                                    .entity
-                                    .properties
-                                    .get(&property.name)
-                                    .map(|v| {
-                                        if v.exclude_from_indexes {
-                                            Vec::new()
-                                        } else {
-                                            match &v.value_type {
-                                                Some(ValueType::ArrayValue(array)) => array
-                                                    .values
-                                                    .iter()
-                                                    .filter(|inner| !inner.exclude_from_indexes)
-                                                    .cloned()
-                                                    .collect(),
-                                                _ => vec![v.clone()],
+                                if let Some(value) =
+                                    entity_metadata.entity.properties.get(&property.name)
+                                {
+                                    if value.exclude_from_indexes {
+                                        false
+                                    } else {
+                                        match &value.value_type {
+                                            Some(ValueType::ArrayValue(array)) => {
+                                                values_match_filter(
+                                                    array.values.iter().filter(|inner| {
+                                                        !inner.exclude_from_indexes
+                                                    }),
+                                                    filter_value,
+                                                    property_filter.op,
+                                                )
                                             }
-                                        }
-                                    })
-                                    .unwrap_or_default()
-                            };
-
-                            if !entity_values.is_empty() {
-                                match property_filter.op {
-                                    0 => true, // OPERATOR_UNSPECIFIED
-                                    1 => entity_values
-                                        .iter()
-                                        .any(|v| compare_values(v, filter_value).is_lt()),
-                                    2 => entity_values
-                                        .iter()
-                                        .any(|v| compare_values(v, filter_value).is_le()),
-                                    3 => entity_values
-                                        .iter()
-                                        .any(|v| compare_values(v, filter_value).is_gt()),
-                                    4 => entity_values
-                                        .iter()
-                                        .any(|v| compare_values(v, filter_value).is_ge()),
-                                    5 => entity_values
-                                        .iter()
-                                        .any(|v| v.value_type == filter_value.value_type),
-                                    6 => {
-                                        if let Some(ValueType::ArrayValue(array_value)) =
-                                            &filter_value.value_type
-                                        {
-                                            entity_values.iter().any(|v| {
-                                                array_value.values.iter().any(|candidate| {
-                                                    candidate.value_type == v.value_type
-                                                })
-                                            })
-                                        } else {
-                                            false
+                                            _ => values_match_filter(
+                                                std::iter::once(value),
+                                                filter_value,
+                                                property_filter.op,
+                                            ),
                                         }
                                     }
-                                    9 => entity_values
-                                        .iter()
-                                        .all(|v| v.value_type != filter_value.value_type),
-                                    // HAS_ANCESTOR handled above
-                                    13 => {
-                                        if let Some(ValueType::ArrayValue(array_value)) =
-                                            &filter_value.value_type
-                                        {
-                                            entity_values.iter().all(|v| {
-                                                array_value.values.iter().all(|candidate| {
-                                                    candidate.value_type != v.value_type
-                                                })
-                                            })
-                                        } else {
-                                            true
-                                        }
-                                    }
-                                    _ => false,
+                                } else {
+                                    false
                                 }
-                            } else {
-                                // Property not found in entity for regular filters (and not HAS_ANCESTOR)
-                                false
                             }
                         }
                     } else {
