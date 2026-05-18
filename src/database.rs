@@ -19,7 +19,7 @@ use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, atomic::AtomicI64};
 
 use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
 use crate::leveldb::LogReader; // Added to resolve error E0433
@@ -808,10 +808,37 @@ pub struct TransactionState {
     pub read_only: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct QueryCandidate {
+    key_struct: Option<KeyStruct>,
+    entity_metadata: Arc<EntityWithMetadata>,
+}
+
+impl QueryCandidate {
+    fn from_metadata(entity_metadata: Arc<EntityWithMetadata>) -> Self {
+        let key_struct = entity_metadata
+            .entity
+            .key
+            .as_ref()
+            .map(KeyStruct::from_datastore_key);
+        Self {
+            key_struct,
+            entity_metadata,
+        }
+    }
+
+    fn from_stored_entity(key_struct: KeyStruct, entity_metadata: Arc<EntityWithMetadata>) -> Self {
+        Self {
+            key_struct: Some(key_struct),
+            entity_metadata,
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct DatastoreStorage {
     // Stores using BTreeMap for ordered storage, mapping a full KeyStruct to its EntityWithMetadata
-    pub entities: BTreeMap<KeyStruct, EntityWithMetadata>,
+    pub entities: BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
     // Indexes for efficient queries
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
@@ -1069,7 +1096,10 @@ impl DatastoreStorage {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
-        self.entities = entities;
+        self.entities = entities
+            .into_iter()
+            .map(|(key, metadata)| (key, Arc::new(metadata)))
+            .collect();
 
         // Bulk rebuild indexes
         tracing::info!("Rebuilding indexes for {} entities...", self.entities.len());
@@ -1104,7 +1134,13 @@ impl DatastoreStorage {
         tracing::info!("Saving {} entities to '{}'...", self.entities.len(), path);
 
         // Serialize the whole BTreeMap
-        let buffer = bincode::serde::encode_to_vec(&self.entities, bincode::config::standard())
+        let entities: BTreeMap<KeyStruct, EntityWithMetadata> = self
+            .entities
+            .iter()
+            .map(|(key, metadata)| (key.clone(), metadata.as_ref().clone()))
+            .collect();
+
+        let buffer = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
             .map_err(std::io::Error::other)?;
 
         // Write the serialized buffer to the file
@@ -1190,7 +1226,7 @@ impl DatastoreStorage {
 
         // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
         self.entities
-            .insert(final_key_struct.clone(), entity_metadata.clone());
+            .insert(final_key_struct.clone(), Arc::new(entity_metadata.clone()));
         self.update_indexes(&final_key_struct, &db_entity);
         if let Some(ref key) = db_entity.key {
             self.observe_key_id(key);
@@ -1361,7 +1397,9 @@ impl DatastoreStorage {
         //     );
         // }
 
-        self.entities.get(&key_struct).cloned()
+        self.entities
+            .get(&key_struct)
+            .map(|metadata| metadata.as_ref().clone())
     }
     fn get_metadata(&self, metadata_key: &str, project_id: &str) -> Vec<EntityWithMetadata> {
         let mut results = Vec::new();
@@ -1528,11 +1566,76 @@ impl DatastoreStorage {
         }
         results
     }
-    pub fn get_entities(
+    pub(crate) fn query_candidates(
         &self,
-        project_id_filter: String,
-        kind_name: String,
-        filter: Option<Filter>,
+        project_id_filter: &str,
+        kind_name: &str,
+        filter_type: Option<&FilterType>,
+    ) -> (Vec<QueryCandidate>, bool) {
+        if METADATA_KINDS.contains(&kind_name) {
+            return (
+                self.get_metadata(kind_name, project_id_filter)
+                    .into_iter()
+                    .map(|metadata| QueryCandidate::from_metadata(Arc::new(metadata)))
+                    .collect(),
+                false,
+            );
+        }
+
+        if let Some(filter_type) = filter_type
+            && let Some(candidate_keys) =
+                self.index_lookup_for_filter(project_id_filter, kind_name, filter_type)
+        {
+            return (
+                candidate_keys
+                    .into_iter()
+                    .filter(|key_struct| {
+                        key_struct.project_id == project_id_filter
+                            && key_struct
+                                .path_elements
+                                .last()
+                                .is_some_and(|(k, _)| k == kind_name)
+                    })
+                    .filter_map(|key_struct| {
+                        self.entities.get(&key_struct).map(|entity_metadata| {
+                            QueryCandidate::from_stored_entity(
+                                key_struct,
+                                Arc::clone(entity_metadata),
+                            )
+                        })
+                    })
+                    .collect(),
+                false,
+            );
+        }
+
+        let candidates = self
+            .entities
+            .iter()
+            .filter(|(key_struct, _)| {
+                key_struct.project_id == project_id_filter
+                    && key_struct
+                        .path_elements
+                        .last()
+                        .is_some_and(|(k, _)| k == kind_name)
+            })
+            .filter(|(_, entity_metadata)| {
+                filter_type.is_none_or(|filter_type| {
+                    DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
+                })
+            })
+            .map(|(key_struct, entity_metadata)| {
+                QueryCandidate::from_stored_entity(key_struct.clone(), Arc::clone(entity_metadata))
+            })
+            .collect();
+
+        (candidates, filter_type.is_some())
+    }
+
+    pub(crate) fn get_entities_from_candidates(
+        candidates: Vec<QueryCandidate>,
+        filter_type: Option<FilterType>,
+        candidates_prefiltered: bool,
         limit: Option<i32>,
         offset: i32,
         start_cursor: Vec<u8>,
@@ -1540,10 +1643,10 @@ impl DatastoreStorage {
         distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
-        let metadata_holder: Vec<EntityWithMetadata>;
-        let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
         let matches_filter = |entity_metadata: &EntityWithMetadata| -> bool {
-            if let Some(ref filter_type) = filter_type {
+            if candidates_prefiltered {
+                true
+            } else if let Some(ref filter_type) = filter_type {
                 DatastoreStorage::apply_filter(entity_metadata, filter_type)
             } else {
                 true
@@ -1552,73 +1655,14 @@ impl DatastoreStorage {
 
         let limit = limit.filter(|value| *value > 0);
 
-        let filtered_entities: Vec<&EntityWithMetadata> =
-            if METADATA_KINDS.contains(&kind_name.as_str()) {
-                metadata_holder = self.get_metadata(&kind_name, &project_id_filter);
-                metadata_holder
-                    .iter()
-                    .filter(|entity_metadata| matches_filter(entity_metadata))
-                    .collect()
-            } else if let Some(ref filter_type) = filter_type {
-                if let Some(candidate_keys) =
-                    self.index_lookup_for_filter(&project_id_filter, &kind_name, filter_type)
-                {
-                    candidate_keys
-                        .into_iter()
-                        .filter(|key_struct| {
-                            key_struct.project_id == project_id_filter
-                                && key_struct
-                                    .path_elements
-                                    .last()
-                                    .is_some_and(|(k, _)| k == &kind_name)
-                        })
-                        .filter_map(|key_struct| self.entities.get(&key_struct))
-                        .filter(|entity_metadata| matches_filter(entity_metadata))
-                        .collect()
-                } else {
-                    self.entities
-                        .iter()
-                        .filter(|(k, _)| {
-                            k.project_id == project_id_filter
-                                && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
-                        })
-                        .filter_map(|(_, entity_metadata)| {
-                            if matches_filter(entity_metadata) {
-                                Some(entity_metadata)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                }
-            } else {
-                self.entities
-                    .iter()
-                    .filter(|(k, _)| {
-                        k.project_id == project_id_filter
-                            && k.path_elements.last().is_some_and(|(k, _)| k == &kind_name)
-                    })
-                    .map(|(_, entity_metadata)| entity_metadata)
-                    .collect()
-            };
-
-        let filtered_with_keys: Vec<(Option<KeyStruct>, &EntityWithMetadata)> = filtered_entities
+        let mut filtered_entities: Vec<QueryCandidate> = candidates
             .into_iter()
-            .map(|entity| {
-                let key_struct = entity
-                    .entity
-                    .key
-                    .as_ref()
-                    .map(|key| KeyStruct::from_datastore_key(key));
-                (key_struct, entity)
-            })
+            .filter(|candidate| matches_filter(candidate.entity_metadata.as_ref()))
             .collect();
-
-        let mut filtered_entities = filtered_with_keys;
 
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_by(|(a_key, a_meta), (b_key, b_meta)| {
+            filtered_entities.sort_by(|a, b| {
                 let mut final_ordering = Ordering::Equal;
                 for order_by in &order {
                     if final_ordering != Ordering::Equal {
@@ -1630,7 +1674,7 @@ impl DatastoreStorage {
                         order_by.direction == property_order::Direction::Descending as i32;
 
                     if prop_name == "__key__" {
-                        let ordering = match (a_key.as_ref(), b_key.as_ref()) {
+                        let ordering = match (a.key_struct.as_ref(), b.key_struct.as_ref()) {
                             (Some(a), Some(b)) => a.cmp(b),
                             (Some(_), None) => Ordering::Greater,
                             (None, Some(_)) => Ordering::Less,
@@ -1645,12 +1689,14 @@ impl DatastoreStorage {
                         continue;
                     }
 
-                    let a_val = a_meta
+                    let a_val = a
+                        .entity_metadata
                         .entity
                         .properties
                         .get(prop_name)
                         .and_then(|v| sort_value(v, descending));
-                    let b_val = b_meta
+                    let b_val = b
+                        .entity_metadata
                         .entity
                         .properties
                         .get(prop_name)
@@ -1677,17 +1723,19 @@ impl DatastoreStorage {
             let mut seen_signatures = HashSet::new();
             let mut distinct_entities = Vec::new();
 
-            for (key_struct_opt, entity_metadata) in filtered_entities.into_iter() {
+            for candidate in filtered_entities.into_iter() {
                 let mut signature_parts = Vec::with_capacity(distinct_on.len());
 
                 for prop in &distinct_on {
                     if prop.name == "__key__" {
-                        if let Some(key_struct) = key_struct_opt.as_ref() {
+                        if let Some(key_struct) = candidate.key_struct.as_ref() {
                             signature_parts.push(format!("KEY:{:?}", key_struct));
                         } else {
                             signature_parts.push("KEY:<missing>".to_string());
                         }
-                    } else if let Some(value) = entity_metadata.entity.properties.get(&prop.name) {
+                    } else if let Some(value) =
+                        candidate.entity_metadata.entity.properties.get(&prop.name)
+                    {
                         signature_parts.push(format!("{:?}", value));
                     } else {
                         signature_parts.push(format!("{}:<missing>", prop.name));
@@ -1696,7 +1744,7 @@ impl DatastoreStorage {
 
                 let signature = signature_parts.join("|");
                 if seen_signatures.insert(signature) {
-                    distinct_entities.push((key_struct_opt, entity_metadata));
+                    distinct_entities.push(candidate);
                 }
             }
 
@@ -1713,8 +1761,8 @@ impl DatastoreStorage {
             );
             if let Ok((cursor_key, _)) = decode_result {
                 let mut matched = false;
-                for (idx, (key_struct_opt, _)) in filtered_entities.iter().enumerate() {
-                    if let Some(key_struct) = key_struct_opt {
+                for (idx, candidate) in filtered_entities.iter().enumerate() {
+                    if let Some(key_struct) = candidate.key_struct.as_ref() {
                         if key_struct == &cursor_key {
                             start_index = idx + 1;
                             matched = true;
@@ -1724,8 +1772,8 @@ impl DatastoreStorage {
                 }
                 if !matched {
                     let mut index = 0usize;
-                    for (key_struct_opt, _) in &filtered_entities {
-                        match key_struct_opt {
+                    for candidate in &filtered_entities {
+                        match candidate.key_struct.as_ref() {
                             Some(key_struct) if key_struct <= &cursor_key => index += 1,
                             _ => break,
                         }
@@ -1761,7 +1809,8 @@ impl DatastoreStorage {
                 .iter()
                 .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
 
-        for (key_struct_opt, entity_metadata) in filtered_entities.iter().skip(start_index) {
+        for candidate in filtered_entities.iter().skip(start_index) {
+            let entity_metadata = candidate.entity_metadata.as_ref();
             // Apply limit and payload size checks
             let entity_size_bytes = entity_metadata.entity.encoded_len(); // This might need adjustment for projections
             if !results.is_empty()
@@ -1801,7 +1850,7 @@ impl DatastoreStorage {
                 entity_metadata.entity.clone()
             };
 
-            let cursor_value = if let Some(key_struct) = key_struct_opt {
+            let cursor_value = if let Some(key_struct) = candidate.key_struct.as_ref() {
                 bincode::serde::encode_to_vec(key_struct, bincode::config::standard())
                     .unwrap_or_else(|_| (next_offset as u32 + 1).to_be_bytes().to_vec())
             } else {
@@ -1870,6 +1919,34 @@ impl DatastoreStorage {
         }
     }
 
+    pub fn get_entities(
+        &self,
+        project_id_filter: String,
+        kind_name: String,
+        filter: Option<Filter>,
+        limit: Option<i32>,
+        offset: i32,
+        start_cursor: Vec<u8>,
+        projection: Vec<Projection>,
+        distinct_on: Vec<PropertyReference>,
+        order: Vec<PropertyOrder>,
+    ) -> crate::google::datastore::v1::QueryResultBatch {
+        let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
+        let (candidates, candidates_prefiltered) =
+            self.query_candidates(&project_id_filter, &kind_name, filter_type.as_ref());
+        Self::get_entities_from_candidates(
+            candidates,
+            filter_type,
+            candidates_prefiltered,
+            limit,
+            offset,
+            start_cursor,
+            projection,
+            distinct_on,
+            order,
+        )
+    }
+
     pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
         let Some((kind, _)) = key_struct.path_elements.last() else {
             return;
@@ -1913,7 +1990,7 @@ impl DatastoreStorage {
         if let Some(removed_entity_metadata) = self.entities.remove(&key_struct_to_delete) {
             // If entity was removed, also remove it from indexes
             self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
-            Some(removed_entity_metadata)
+            Some(removed_entity_metadata.as_ref().clone())
         } else {
             None
         }

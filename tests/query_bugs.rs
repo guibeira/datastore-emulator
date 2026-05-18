@@ -94,7 +94,8 @@ fn insert(storage: &mut DatastoreStorage, name: &str, props: HashMap<String, Val
             version: 1,
             create_time: pbjson_types::Timestamp::default(),
             update_time: pbjson_types::Timestamp::default(),
-        },
+        }
+        .into(),
     );
     storage.update_indexes(&key_struct, &entity);
 }

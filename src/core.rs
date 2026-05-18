@@ -121,7 +121,6 @@ pub async fn run_query(
     req: RunQueryRequest,
 ) -> Result<RunQueryResponse, Status> {
     let start = Instant::now();
-    let storage = storage.read().await;
     let query_obj = match req.query_type {
         Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
         _ => return Err(Status::invalid_argument("Missing or invalid query")),
@@ -151,10 +150,19 @@ pub async fn run_query(
         query_obj.order.clone()
     };
 
-    let batch = storage.get_entities(
-        req.project_id.clone(),
-        kind_name,
-        query_obj.filter.clone(),
+    let filter_type = query_obj
+        .filter
+        .as_ref()
+        .and_then(|f| f.filter_type.clone());
+    let (candidates, candidates_prefiltered) = {
+        let storage = storage.read().await;
+        storage.query_candidates(&req.project_id, &kind_name, filter_type.as_ref())
+    };
+
+    let batch = DatastoreStorage::get_entities_from_candidates(
+        candidates,
+        filter_type,
+        candidates_prefiltered,
         query_obj.limit.as_ref().map(|v| v.value),
         query_obj.offset,
         query_obj.start_cursor.clone(),
@@ -265,6 +273,7 @@ pub async fn commit(
                     };
 
                     let timestamp_now = system_time_to_timestamp(SystemTime::now());
+                    let existing_entity_metadata = Arc::make_mut(existing_entity_metadata);
                     let previous_entity = existing_entity_metadata.entity.clone();
                     existing_entity_metadata.entity = entity.clone();
                     existing_entity_metadata.version += 1;
@@ -328,7 +337,7 @@ pub async fn commit(
                             std::collections::btree_map::Entry::Occupied(
                                 mut occupied_entry,
                             ) => {
-                                let metadata = occupied_entry.get_mut();
+                                let metadata = Arc::make_mut(occupied_entry.get_mut());
                                 previous_entity = Some(metadata.entity.clone());
                                 metadata.entity = entity.clone();
                                 metadata.version += 1;
@@ -346,7 +355,7 @@ pub async fn commit(
                                 version = new_metadata.version;
                                 create_time = new_metadata.create_time.clone();
                                 observe_key_counters = true;
-                                vacant_entry.insert(new_metadata);
+                                vacant_entry.insert(Arc::new(new_metadata));
                             }
                         }
 
