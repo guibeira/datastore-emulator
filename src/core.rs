@@ -134,14 +134,12 @@ pub async fn lookup(
             });
         }
     }
-    let read_time = system_time_to_timestamp(SystemTime::now());
-
     Ok(LookupResponse {
         found,
         missing,
         deferred: vec![],
         transaction: Vec::new(),
-        read_time: Some(read_time),
+        read_time: None,
     })
 }
 
