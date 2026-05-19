@@ -2,14 +2,14 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
-        AggregationQuery, ArrayValue, CommitRequest, Entity, Filter, Key, KindExpression,
-        LookupRequest, Mutation, PartitionId, Projection, PropertyFilter, PropertyOrder,
-        PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest, Value,
+        AggregationQuery, ArrayValue, BeginTransactionRequest, CommitRequest, Entity, Filter, Key,
+        KindExpression, LookupRequest, Mutation, PartitionId, Projection, PropertyFilter,
+        PropertyOrder, PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest, Value,
         aggregation_query::{
             Aggregation, QueryType as AggregationQueryType,
             aggregation::{Count, Operator as AggOperator},
         },
-        commit_request::Mode,
+        commit_request::{Mode, TransactionSelector},
         filter::FilterType,
         key::{PathElement, path_element::IdType},
         mutation::Operation,
@@ -203,10 +203,85 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     });
 
+    let batch_insert_templates = batch_insert_entities("batch-insert");
+    group.bench_function("commit_batch_10_inserts", |b| {
+        b.to_async(&runtime).iter_batched(
+            || Arc::new(RwLock::new(DatastoreStorage::default())),
+            |storage| {
+                let req = CommitRequest {
+                    project_id: PROJECT.to_string(),
+                    mode: Mode::NonTransactional as i32,
+                    mutations: insert_mutations(&batch_insert_templates),
+                    ..Default::default()
+                };
+                async move {
+                    black_box(core::commit(&storage, req).await.expect("batch insert commit"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let transactional_batch_insert_templates = batch_insert_entities("transactional-batch-insert");
+    group.bench_function("commit_transactional_batch_10", |b| {
+        b.to_async(&runtime).iter_batched(
+            || Arc::new(RwLock::new(DatastoreStorage::default())),
+            |storage| {
+                let mutations = insert_mutations(&transactional_batch_insert_templates);
+                async move {
+                    let transaction = core::begin_transaction(
+                        &storage,
+                        BeginTransactionRequest {
+                            project_id: PROJECT.to_string(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("begin transaction")
+                    .transaction;
+                    let req = CommitRequest {
+                        project_id: PROJECT.to_string(),
+                        mode: Mode::Transactional as i32,
+                        transaction_selector: Some(TransactionSelector::Transaction(transaction)),
+                        mutations,
+                        ..Default::default()
+                    };
+                    black_box(
+                        core::commit(&storage, req)
+                            .await
+                            .expect("transactional batch insert commit"),
+                    );
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
 fn bench_entity_template() -> Entity {
+    bench_entity_for_name("insert-bench-target")
+}
+
+fn batch_insert_entities(prefix: &str) -> Vec<Entity> {
+    (0..10)
+        .map(|idx| bench_entity_for_name(&format!("{prefix}-{idx}")))
+        .collect()
+}
+
+fn insert_mutations(entities: &[Entity]) -> Vec<Mutation> {
+    entities
+        .iter()
+        .cloned()
+        .map(|entity| Mutation {
+            operation: Some(Operation::Insert(entity)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn bench_entity_for_name(name: &str) -> Entity {
     Entity {
         key: Some(Key {
             partition_id: Some(PartitionId {
@@ -216,7 +291,7 @@ fn bench_entity_template() -> Entity {
             }),
             path: vec![PathElement {
                 kind: KIND.to_string(),
-                id_type: Some(IdType::Name("insert-bench-target".to_string())),
+                id_type: Some(IdType::Name(name.to_string())),
             }],
         }),
         properties: HashMap::from([
