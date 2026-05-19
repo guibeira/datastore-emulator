@@ -11,6 +11,7 @@ description = "A Google Cloud Datastore emulator written in Rust."
 keywords = ["datastore", "emulator", "google-cloud", "gcp"]
 categories = ["command-line-utilities", "network-programming", "database"]
 include = [
+    "/benches/**",
     "/src/*.rs",
     "/proto/**",
     "/build.rs",
@@ -43,6 +44,7 @@ crc32c = "0.6.8"
 rayon = "1.10"
 tonic-health = "0.9"
 axum = "0.6"
+hyper = "0.14"
 tower = { version = "0.4", features = ["util"] }
 zip = "4.0.0"
 bincode = { version = "2.0.1", features = ["serde"] }
@@ -60,4 +62,8 @@ pbjson-build = "0.5"
 [dev-dependencies]
 once_cell = "1.21.3"
 reqwest = { version = "0.11", features = ["json"] }
-hyper = "0.14"
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "query_baseline"
+harness = false

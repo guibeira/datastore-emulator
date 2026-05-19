@@ -224,7 +224,8 @@ mod tests {
                 version: 1,
                 create_time: pbjson_types::Timestamp::default(),
                 update_time: pbjson_types::Timestamp::default(),
-            },
+            }
+            .into(),
         );
         AppState {
             storage: Arc::new(RwLock::new(storage)),

@@ -48,7 +48,8 @@ async fn grpc_and_rest_lookup_return_same_data() {
             version: 7,
             create_time: pbjson_types::Timestamp::default(),
             update_time: pbjson_types::Timestamp::default(),
-        },
+        }
+        .into(),
     );
     let storage = Arc::new(RwLock::new(storage));
 

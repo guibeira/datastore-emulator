@@ -12,8 +12,7 @@
 //!   5. Updating an entity must purge stale index entries for old values.
 
 use datastore_emulator::{
-    DatastoreStorage,
-    core,
+    DatastoreStorage, core,
     database::{EntityWithMetadata, KeyId, KeyStruct},
     google::datastore::v1::{
         ArrayValue, CommitRequest, Entity, Filter, Key, Mutation, PartitionId, PropertyOrder,
@@ -22,8 +21,7 @@ use datastore_emulator::{
         filter::FilterType,
         key::{PathElement, path_element::IdType},
         mutation::Operation,
-        property_filter,
-        property_order,
+        property_filter, property_order,
         run_query_request::QueryType,
         value::ValueType,
     },
@@ -94,7 +92,8 @@ fn insert(storage: &mut DatastoreStorage, name: &str, props: HashMap<String, Val
             version: 1,
             create_time: pbjson_types::Timestamp::default(),
             update_time: pbjson_types::Timestamp::default(),
-        },
+        }
+        .into(),
     );
     storage.update_indexes(&key_struct, &entity);
 }
@@ -429,11 +428,93 @@ async fn query_offset_is_respected() {
         .iter()
         .map(|r| name_of(r.entity.as_ref().unwrap()))
         .collect();
-    assert_eq!(names, vec!["c", "d", "e"], "offset must skip first 2 results");
+    assert_eq!(
+        names,
+        vec!["c", "d", "e"],
+        "offset must skip first 2 results"
+    );
     assert_eq!(
         batch.skipped_results, 2,
         "skipped_results must report the offset"
     );
+}
+
+#[tokio::test]
+async fn full_query_results_include_entity_metadata() {
+    let mut storage = DatastoreStorage::default();
+    let key_struct = key_struct_for("with_metadata");
+    let create_time = pbjson_types::Timestamp {
+        seconds: 11,
+        nanos: 22,
+    };
+    let update_time = pbjson_types::Timestamp {
+        seconds: 33,
+        nanos: 44,
+    };
+    let entity = Entity {
+        key: Some(key("with_metadata")),
+        properties: HashMap::from([("score".to_string(), val(ValueType::IntegerValue(7)))]),
+    };
+    storage.entities.insert(
+        key_struct.clone(),
+        EntityWithMetadata {
+            entity: entity.clone(),
+            version: 42,
+            create_time: create_time.clone(),
+            update_time: update_time.clone(),
+        }
+        .into(),
+    );
+    storage.update_indexes(&key_struct, &entity);
+    let storage = Arc::new(RwLock::new(storage));
+
+    let query = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        ..Default::default()
+    };
+    let req = RunQueryRequest {
+        project_id: PROJECT.to_string(),
+        query_type: Some(QueryType::Query(query)),
+        ..Default::default()
+    };
+    let resp = core::run_query(&storage, req).await.expect("run_query");
+    let batch = resp.batch.expect("batch");
+    assert_eq!(
+        batch.entity_result_type, 1,
+        "query should return FULL results"
+    );
+    assert_eq!(batch.entity_results.len(), 1);
+    let result = &batch.entity_results[0];
+    assert_eq!(result.version, 42);
+    assert_eq!(result.create_time.as_ref(), Some(&create_time));
+    assert_eq!(result.update_time.as_ref(), Some(&update_time));
+}
+
+#[tokio::test]
+async fn malformed_order_without_property_does_not_panic() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "x",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let query = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        order: vec![PropertyOrder {
+            property: None,
+            direction: property_order::Direction::Ascending as i32,
+        }],
+        ..Default::default()
+    };
+
+    let names = run(storage, query).await;
+    assert_eq!(names, vec!["x"]);
 }
 
 /// Bug 5: updating an entity must purge stale index entries for the old
@@ -476,13 +557,11 @@ async fn update_purges_stale_index_entries() {
     // After the update, the indexes map must not contain the stale "old"
     // entry pointing at this entity's key.
     let storage_guard = storage.read().await;
-    let stale = storage_guard.indexes.get(&(
-        KIND.to_string(),
-        "tag".to_string(),
-        "old".to_string(),
-    ));
-    let stale_keys: Vec<&KeyStruct> =
-        stale.map(|set| set.iter().collect()).unwrap_or_default();
+    let stale =
+        storage_guard
+            .indexes
+            .get(&(KIND.to_string(), "tag".to_string(), "old".to_string()));
+    let stale_keys: Vec<&KeyStruct> = stale.map(|set| set.iter().collect()).unwrap_or_default();
     assert!(
         stale_keys.is_empty(),
         "stale index entry for old value not cleaned up: {:?}",
@@ -508,6 +587,48 @@ async fn update_purges_stale_index_entries() {
         "query for old value must return nothing after update, got {:?}",
         names
     );
+}
+
+#[tokio::test]
+async fn commit_mutation_result_returns_persisted_version() {
+    let storage = Arc::new(RwLock::new(DatastoreStorage::default()));
+    let initial_entity = Entity {
+        key: Some(key("versioned")),
+        properties: HashMap::from([(
+            "tag".to_string(),
+            val(ValueType::StringValue("initial".to_string())),
+        )]),
+    };
+    let insert_req = CommitRequest {
+        project_id: PROJECT.to_string(),
+        mode: Mode::NonTransactional as i32,
+        mutations: vec![Mutation {
+            operation: Some(Operation::Insert(initial_entity)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let insert_resp = core::commit(&storage, insert_req).await.expect("insert");
+    assert_eq!(insert_resp.mutation_results[0].version, 1);
+
+    let updated_entity = Entity {
+        key: Some(key("versioned")),
+        properties: HashMap::from([(
+            "tag".to_string(),
+            val(ValueType::StringValue("updated".to_string())),
+        )]),
+    };
+    let update_req = CommitRequest {
+        project_id: PROJECT.to_string(),
+        mode: Mode::NonTransactional as i32,
+        mutations: vec![Mutation {
+            operation: Some(Operation::Update(updated_entity)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let update_resp = core::commit(&storage, update_req).await.expect("update");
+    assert_eq!(update_resp.mutation_results[0].version, 2);
 }
 
 #[tokio::test]

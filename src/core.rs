@@ -2,7 +2,7 @@ use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, Transacti
 use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
-    EntityResult, ExecutionStats, ExplainMetrics, Filter, LookupRequest, LookupResponse,
+    EntityResult, ExecutionStats, ExplainMetrics, Filter, Key, LookupRequest, LookupResponse,
     MutationResult, PlanSummary, PropertyOrder, PropertyReference, ReserveIdsRequest,
     ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
     RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse, Value,
@@ -13,9 +13,15 @@ use crate::google::datastore::v1::{
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime};
 use tokio::sync::RwLock;
 use tonic::Status;
+
+static TRANSACTION_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
+/// Offset cursors are stored as a big-endian u32. Longer cursors are encoded
+/// KeyStruct values and need key retention to resume ordered scans correctly.
+const OFFSET_CURSOR_BYTE_LEN: usize = 4;
 
 fn to_pbjson_duration(std_duration: std::time::Duration) -> Duration {
     Duration {
@@ -31,6 +37,32 @@ pub(crate) fn system_time_to_timestamp(time: SystemTime) -> pbjson_types::Timest
             nanos: duration.subsec_nanos() as i32,
         },
         Err(_) => pbjson_types::Timestamp::default(),
+    }
+}
+
+fn next_transaction_id(prefix: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let counter = TRANSACTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{timestamp}-{counter}")
+}
+
+fn key_is_incomplete(key: &Key) -> bool {
+    key.path
+        .iter()
+        .any(|path_element| path_element.id_type.is_none())
+}
+
+fn commit_mutation_result(key: Option<Key>, version: i64) -> MutationResult {
+    MutationResult {
+        key,
+        version,
+        create_time: None,
+        update_time: None,
+        conflict_detected: false,
+        transform_results: Vec::new(),
     }
 }
 
@@ -105,14 +137,12 @@ pub async fn lookup(
             });
         }
     }
-    let read_time = system_time_to_timestamp(SystemTime::now());
-
     Ok(LookupResponse {
         found,
         missing,
         deferred: vec![],
         transaction: Vec::new(),
-        read_time: Some(read_time),
+        read_time: None,
     })
 }
 
@@ -120,8 +150,8 @@ pub async fn run_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunQueryRequest,
 ) -> Result<RunQueryResponse, Status> {
-    let start = Instant::now();
-    let storage = storage.read().await;
+    let explain_requested = req.explain_options.is_some();
+    let start = explain_requested.then(Instant::now);
     let query_obj = match req.query_type {
         Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
         _ => return Err(Status::invalid_argument("Missing or invalid query")),
@@ -151,10 +181,29 @@ pub async fn run_query(
         query_obj.order.clone()
     };
 
-    let batch = storage.get_entities(
-        req.project_id.clone(),
-        kind_name,
-        query_obj.filter.clone(),
+    let filter_type = query_obj
+        .filter
+        .as_ref()
+        .and_then(|f| f.filter_type.clone());
+    let retain_key_struct = query_obj.start_cursor.len() > OFFSET_CURSOR_BYTE_LEN
+        || query_obj.distinct_on.iter().any(|p| p.name == "__key__")
+        || order
+            .iter()
+            .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
+    let (candidates, candidates_prefiltered) = {
+        let storage = storage.read().await;
+        storage.query_candidates(
+            &req.project_id,
+            &kind_name,
+            filter_type.as_ref(),
+            retain_key_struct,
+        )
+    };
+
+    let batch = DatastoreStorage::get_entities_from_candidates(
+        candidates,
+        filter_type,
+        candidates_prefiltered,
         query_obj.limit.as_ref().map(|v| v.value),
         query_obj.offset,
         query_obj.start_cursor.clone(),
@@ -162,25 +211,23 @@ pub async fn run_query(
         query_obj.distinct_on.clone(),
         order,
     );
-    let mut fields = HashMap::new();
-    let amount_results = batch.entity_results.len() as i64;
+    let explain_metrics = if let Some(start) = start {
+        let mut fields = HashMap::new();
+        let amount_results = batch.entity_results.len() as i64;
 
-    fields.insert(
-        "Some key".to_string(),
-        ValueProps {
-            kind: Some(Kind::StringValue("Some value".to_string())),
-        },
-    );
-    let debug_stats = Struct {
-        fields: fields.clone(),
-    };
-    let execution_duration = start.elapsed();
+        // TODO: Populate emulator explain metrics with real planner/index details.
+        fields.insert(
+            "placeholder_plan".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("not_implemented".to_string())),
+            },
+        );
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
+        let execution_duration = start.elapsed();
 
-    Ok(RunQueryResponse {
-        transaction: vec![],
-        query: Some(query_obj),
-        batch: Some(batch),
-        explain_metrics: Some(ExplainMetrics {
+        Some(ExplainMetrics {
             plan_summary: Some(PlanSummary {
                 indexes_used: vec![Struct {
                     fields: fields.clone(),
@@ -189,10 +236,19 @@ pub async fn run_query(
             execution_stats: Some(ExecutionStats {
                 results_returned: amount_results,
                 execution_duration: Some(to_pbjson_duration(execution_duration)),
-                read_operations: 10,
+                read_operations: amount_results,
                 debug_stats: Some(debug_stats),
             }),
-        }),
+        })
+    } else {
+        None
+    };
+
+    Ok(RunQueryResponse {
+        transaction: vec![],
+        query: None,
+        batch: Some(batch),
+        explain_metrics,
     })
 }
 
@@ -200,28 +256,28 @@ pub async fn commit(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: CommitRequest,
 ) -> Result<CommitResponse, Status> {
+    let mutation_count = req.mutations.len();
     let mut storage = storage.write().await;
-    let mut mutation_results = Vec::new();
+    let mut mutation_results = Vec::with_capacity(mutation_count);
+    let commit_time = system_time_to_timestamp(SystemTime::now());
 
     // Handle transaction if present
     let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
         match transaction_selector {
-            TransactionSelector::Transaction(tx_bytes) => {
-                match String::from_utf8(tx_bytes.clone()) {
-                    Ok(id) => Some(id),
-                    Err(_) => {
-                        return Err(Status::invalid_argument("Invalid transaction ID format"));
-                    }
+            TransactionSelector::Transaction(tx_bytes) => match String::from_utf8(tx_bytes) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    return Err(Status::invalid_argument("Invalid transaction ID format"));
                 }
-            }
+            },
             TransactionSelector::SingleUseTransaction(_) => None,
         }
     } else {
         None
     };
 
-    if let Some(tx_id) = transaction_id.clone() {
-        if storage.transactions.get(&tx_id).is_some() {
+    if let Some(tx_id) = transaction_id.as_ref() {
+        if storage.transactions.get(tx_id).is_some() {
             tracing::info!("Committing transaction: {}", tx_id);
         } else {
             return Err(Status::not_found(format!(
@@ -232,168 +288,121 @@ pub async fn commit(
     }
 
     for mutation in req.mutations {
-        if let Some(ref mutation) = mutation.operation {
+        if let Some(mutation) = mutation.operation {
             match mutation {
-                Operation::Insert(entity) => match storage.insert_entity(entity) {
-                    Ok((final_key, metadata)) => {
-                        mutation_results.push(MutationResult {
-                            key: Some(final_key),
-                            version: metadata.version as i64,
-                            create_time: Some(metadata.create_time.clone()),
-                            update_time: Some(metadata.update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
-                    }
-                    Err(status) => {
-                        return Err(status);
-                    }
-                },
-                Operation::Update(entity) => {
-                    let key = match entity.key {
-                        Some(ref key) => key.clone(),
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Entity missing key for update",
+                Operation::Insert(entity) => {
+                    let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
+                    match storage.insert_owned_entity_at(entity, commit_time.clone()) {
+                        Ok((final_key, metadata)) => {
+                            mutation_results.push(commit_mutation_result(
+                                allocates_key.then_some(final_key),
+                                metadata.version as i64,
                             ));
                         }
+                        Err(status) => {
+                            return Err(status);
+                        }
+                    }
+                }
+                Operation::Update(entity) => {
+                    let Some(key) = entity.key.as_ref() else {
+                        return Err(Status::invalid_argument("Entity missing key for update"));
                     };
-                    let key_struct = KeyStruct::from_datastore_key(&key);
+                    let key_struct = KeyStruct::from_datastore_key(key);
 
-                    let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct) else {
+                    let Some(existing_entity_metadata) = storage.entities.get(&key_struct).cloned()
+                    else {
                         return Err(Status::not_found("Entity not found for update"));
                     };
 
-                    let timestamp_now = system_time_to_timestamp(SystemTime::now());
-                    let previous_entity = existing_entity_metadata.entity.clone();
-                    existing_entity_metadata.entity = entity.clone();
-                    existing_entity_metadata.version += 1;
-                    existing_entity_metadata.update_time = timestamp_now.clone();
-
-                    let entity_for_index = existing_entity_metadata.entity.clone();
-                    let version = existing_entity_metadata.version;
                     let create_time = existing_entity_metadata.create_time.clone();
-                    let update_time = timestamp_now;
-
-                    storage.remove_from_indexes(&key_struct, &previous_entity);
-                    storage.update_indexes(&key_struct, &entity_for_index);
-
-                    mutation_results.push(MutationResult {
-                        key: entity.key.clone(),
-                        version: version as i64,
-                        create_time: Some(create_time),
-                        update_time: Some(update_time),
-                        conflict_detected: false,
-                        transform_results: vec![],
+                    let version = existing_entity_metadata.version + 1;
+                    let updated_metadata = Arc::new(EntityWithMetadata {
+                        entity,
+                        version,
+                        create_time,
+                        update_time: commit_time.clone(),
                     });
+
+                    storage
+                        .entities
+                        .insert(key_struct.clone(), Arc::clone(&updated_metadata));
+                    storage.upsert_scoped_entity(&key_struct, Arc::clone(&updated_metadata));
+
+                    storage.replace_indexes(
+                        &key_struct,
+                        &existing_entity_metadata.entity,
+                        &updated_metadata.entity,
+                    );
+
+                    mutation_results.push(commit_mutation_result(None, version as i64));
                 }
                 Operation::Upsert(entity) => {
-                    let key = match entity.key {
-                        Some(ref key) => key.clone(),
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Entity missing key for upsert",
-                            ));
-                        }
+                    let Some(key) = entity.key.as_ref() else {
+                        return Err(Status::invalid_argument("Entity missing key for upsert"));
                     };
 
-                    let key_is_incomplete = key
-                        .path
-                        .iter()
-                        .any(|path_element| path_element.id_type.is_none());
+                    let allocates_key = key_is_incomplete(key);
 
-                    if key_is_incomplete {
-                        let (final_key, metadata) = storage.insert_entity(entity)?;
-                        mutation_results.push(MutationResult {
-                            key: Some(final_key),
-                            version: metadata.version as i64,
-                            create_time: Some(metadata.create_time.clone()),
-                            update_time: Some(metadata.update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                    if allocates_key {
+                        let (final_key, metadata) =
+                            storage.insert_owned_entity_at(entity, commit_time.clone())?;
+                        mutation_results.push(commit_mutation_result(
+                            Some(final_key),
+                            metadata.version as i64,
+                        ));
                     } else {
-                        let key_struct = KeyStruct::from_datastore_key(&key);
+                        let key_struct = KeyStruct::from_datastore_key(key);
 
-                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
+                        let previous_metadata = storage.entities.get(&key_struct).cloned();
+                        let observe_key_counters = previous_metadata.is_none();
 
-                        let mut observe_key_counters = false;
-                        let entry = storage.entities.entry(key_struct.clone());
-                        let version;
-                        let create_time;
-                        let update_time = timestamp_now.clone();
-                        let mut previous_entity: Option<Entity> = None;
-
-                        match entry {
-                            std::collections::btree_map::Entry::Occupied(
-                                mut occupied_entry,
-                            ) => {
-                                let metadata = occupied_entry.get_mut();
-                                previous_entity = Some(metadata.entity.clone());
-                                metadata.entity = entity.clone();
-                                metadata.version += 1;
-                                metadata.update_time = update_time.clone();
-                                version = metadata.version;
-                                create_time = metadata.create_time.clone();
-                            }
-                            std::collections::btree_map::Entry::Vacant(vacant_entry) => {
-                                let new_metadata = EntityWithMetadata {
-                                    entity: entity.clone(),
-                                    version: 1,
-                                    create_time: timestamp_now.clone(),
-                                    update_time: update_time.clone(),
-                                };
-                                version = new_metadata.version;
-                                create_time = new_metadata.create_time.clone();
-                                observe_key_counters = true;
-                                vacant_entry.insert(new_metadata);
-                            }
-                        }
-
+                        let version = previous_metadata
+                            .as_ref()
+                            .map_or(1, |previous| previous.version + 1);
+                        let create_time = previous_metadata.as_ref().map_or_else(
+                            || commit_time.clone(),
+                            |previous| previous.create_time.clone(),
+                        );
                         if observe_key_counters {
-                            storage.observe_key_id(&key);
+                            storage.observe_key_id(key);
+                            storage.add_ancestor_indexes(&key_struct);
                         }
 
-                        if let Some(prev) = previous_entity {
-                            storage.remove_from_indexes(&key_struct, &prev);
-                        }
-                        storage.update_indexes(&key_struct, entity);
-
-                        mutation_results.push(MutationResult {
-                            key: Some(key),
-                            version: version as i64,
-                            create_time: Some(create_time.clone()),
-                            update_time: Some(update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
+                        let metadata = Arc::new(EntityWithMetadata {
+                            entity,
+                            version,
+                            create_time,
+                            update_time: commit_time.clone(),
                         });
+
+                        storage
+                            .entities
+                            .insert(key_struct.clone(), Arc::clone(&metadata));
+                        storage.upsert_scoped_entity(&key_struct, Arc::clone(&metadata));
+
+                        if let Some(previous_metadata) = previous_metadata {
+                            storage.replace_indexes(
+                                &key_struct,
+                                &previous_metadata.entity,
+                                &metadata.entity,
+                            );
+                        } else {
+                            storage.update_indexes(&key_struct, &metadata.entity);
+                        }
+
+                        mutation_results.push(commit_mutation_result(None, version as i64));
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
-                    {
-                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
-                        mutation_results.push(MutationResult {
-                            key: Some(key_to_delete.clone()),
-                            version: removed_entity_metadata.version as i64,
-                            create_time: Some(removed_entity_metadata.create_time.clone()),
-                            update_time: Some(timestamp_now),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                    if storage.delete_entity(&key_to_delete).is_some() {
+                        mutation_results.push(commit_mutation_result(None, 0));
                     } else {
                         tracing::warn!(
                             "Entity not found for deletion with key: {:?}",
                             key_to_delete.path
                         );
-                        mutation_results.push(MutationResult {
-                            key: Some(key_to_delete.clone()),
-                            version: 0,
-                            create_time: None,
-                            update_time: None,
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                        mutation_results.push(commit_mutation_result(None, 0));
                     }
                 }
             }
@@ -404,7 +413,6 @@ pub async fn commit(
     if let Some(tx_id) = transaction_id {
         storage.clean_transaction(&tx_id);
     }
-    let commit_time = system_time_to_timestamp(SystemTime::now());
 
     Ok(CommitResponse {
         mutation_results,
@@ -418,53 +426,16 @@ pub async fn begin_transaction(
     req: BeginTransactionRequest,
 ) -> Result<BeginTransactionResponse, Status> {
     tracing::debug!("Received BeginTransactionRequest: {:?}", req);
-    let start = SystemTime::now();
-    let duration_since_epoch = start
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+    let transaction_id = next_transaction_id("tx");
 
-    let timestamp = pbjson_types::Timestamp {
-        seconds: duration_since_epoch.as_secs() as i64,
-        nanos: (duration_since_epoch.as_nanos() % 1_000_000_000) as i32,
-    };
-
-    // Generate a unique transaction ID and create transaction state
-    let transaction_id;
+    let transaction_bytes = transaction_id.as_bytes().to_vec();
     {
         let mut storage = storage.write().await;
-
-        // Generate transaction ID using timestamp and current counter
-        let counter = storage
-            .transaction_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
-
-        // Check if the transaction is read-only
-        let transaction_options = req.transaction_options.unwrap_or_default();
-        let read_only = if let Some(mode) = transaction_options.mode {
-            match mode {
-                crate::google::datastore::v1::transaction_options::Mode::ReadOnly(_) => true,
-                crate::google::datastore::v1::transaction_options::Mode::ReadWrite(_) => false,
-            }
-        } else {
-            // Default to read-write if no mode is specified
-            false
-        };
-
-        // Create a new transaction state
-        let transaction_state = TransactionState {
-            mutations: Vec::new(),
-            snapshot: HashMap::new(),
-            timestamp,
-            read_only,
-        };
-
         storage
             .transactions
-            .insert(transaction_id.clone(), transaction_state);
+            .insert(transaction_id, TransactionState);
     }
 
-    let transaction_bytes = transaction_id.into_bytes();
     let transaction_response = BeginTransactionResponse {
         transaction: transaction_bytes,
     };
@@ -479,17 +450,16 @@ pub async fn rollback(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RollbackRequest,
 ) -> Result<RollbackResponse, Status> {
-    let transaction_id = match String::from_utf8(req.transaction.clone()) {
+    let transaction_id = match String::from_utf8(req.transaction) {
         Ok(id) => id,
         Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
     };
 
     let mut storage = storage.write().await;
-    if storage.transactions.contains_key(&transaction_id) {
-        storage.clean_transaction(&transaction_id);
-        tracing::info!("Transaction {} rolled back successfully", transaction_id);
+    if storage.transactions.remove(&transaction_id).is_some() {
+        tracing::debug!("Transaction {} rolled back successfully", transaction_id);
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "Attempted to rollback non-existent transaction: {}",
             transaction_id
         );
@@ -549,7 +519,8 @@ pub async fn run_aggregation_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunAggregationQueryRequest,
 ) -> Result<RunAggregationQueryResponse, Status> {
-    let start = Instant::now();
+    let explain_requested = req.explain_options.is_some();
+    let start = explain_requested.then(Instant::now);
     let storage = storage.read().await;
 
     // Extract the aggregation query from the request
@@ -567,10 +538,10 @@ pub async fn run_aggregation_query(
     };
 
     // Get the base query if it exists
-    let base_query = match aggregation_query.clone().query_type {
-        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(
-            query,
-        )) => Some(query),
+    let base_query = match aggregation_query.query_type.as_ref() {
+        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
+            Some(query)
+        }
         _ => {
             // todo: Handle other query types if needed
             None
@@ -581,47 +552,51 @@ pub async fn run_aggregation_query(
     let read_time = system_time_to_timestamp(SystemTime::now());
 
     // Process each aggregation
-    let mut matching_entities = Vec::new();
+    let mut matching_entities: Vec<Arc<EntityWithMetadata>> = Vec::new();
 
-    if let Some(query) = &base_query {
-        // Get entities matching the kind filter
-        let filters = query
-            .filter
-            .as_ref()
-            .unwrap_or(&Filter { filter_type: None });
+    if let Some(query) = base_query {
+        let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.as_ref());
 
-        // Iterate over all entities and filter by project_id, kind and other filters
-        for (key_struct, entity_metadata) in storage.entities.iter() {
-            // Filter by project_id first
-            if key_struct.project_id != req.project_id {
-                continue;
-            }
-
-            // Check if the entity's kind matches any of the kinds in the query
-            let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
-            if entity_kind.is_none()
-                || !query
-                    .kind
-                    .iter()
-                    .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
-            {
-                continue; // Skip if kind doesn't match
-            }
-
-            // Check if the entity is found (key should always be present in EntityWithMetadata)
-            if entity_metadata.entity.key.is_none() {
-                // This case should ideally not happen if data is consistent
-                tracing::warn!("Entity found in storage without a key in its Entity struct.");
-                continue;
-            }
-
-            // Apply filters if present
-            if let Some(filter_type) = &filters.filter_type {
-                if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
-                    matching_entities.push(entity_metadata);
+        // Reuse the query candidate pipeline so index lookups apply to aggregation
+        // queries too. Multi-kind aggregations fall back to a scan because
+        // query_candidates is per-kind.
+        if query.kind.len() == 1 {
+            let kind_name = query.kind[0].name.as_str();
+            let (candidates, _) =
+                storage.query_candidates(&req.project_id, kind_name, filter_type, false);
+            matching_entities = candidates
+                .into_iter()
+                .filter(|c| c.entity_metadata.entity.key.is_some())
+                .map(|c| c.entity_metadata)
+                .collect();
+        } else {
+            for (key_struct, entity_metadata) in storage.entities.iter() {
+                if key_struct.project_id != req.project_id {
+                    continue;
                 }
-            } else {
-                matching_entities.push(entity_metadata); // No filter, include if kind matches
+
+                let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
+                if entity_kind.is_none()
+                    || !query
+                        .kind
+                        .iter()
+                        .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
+                {
+                    continue;
+                }
+
+                if entity_metadata.entity.key.is_none() {
+                    tracing::warn!("Entity found in storage without a key in its Entity struct.");
+                    continue;
+                }
+
+                if let Some(filter_type) = filter_type {
+                    if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
+                        matching_entities.push(Arc::clone(entity_metadata));
+                    }
+                } else {
+                    matching_entities.push(Arc::clone(entity_metadata));
+                }
             }
         }
     } else {
@@ -662,8 +637,7 @@ pub async fn run_aggregation_query(
                         if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
-                            } else if let Some(ValueType::DoubleValue(value)) =
-                                &property.value_type
+                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
                             {
                                 sum_value += *value;
                             }
@@ -698,8 +672,7 @@ pub async fn run_aggregation_query(
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
                                 count += 1;
-                            } else if let Some(ValueType::DoubleValue(value)) =
-                                &property.value_type
+                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
                             {
                                 sum_value += *value;
                                 count += 1;
@@ -736,26 +709,23 @@ pub async fn run_aggregation_query(
         more_results: 3, // NO_MORE_RESULTS
         read_time: Some(read_time.clone()),
     };
-    let total_results = batch.aggregation_results.len() as i64;
-    // Create execution metrics
-    let mut fields = HashMap::new();
-    fields.insert(
-        "query_type".to_string(),
-        ValueProps {
-            kind: Some(Kind::StringValue("aggregation".to_string())),
-        },
-    );
+    let explain_metrics = if let Some(start) = start {
+        let total_results = batch.aggregation_results.len() as i64;
+        let mut fields = HashMap::new();
+        fields.insert(
+            "query_type".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("aggregation".to_string())),
+            },
+        );
 
-    let debug_stats = Struct {
-        fields: fields.clone(),
-    };
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
 
-    let execution_duration = start.elapsed();
-    Ok(RunAggregationQueryResponse {
-        batch: Some(batch),
-        query: Some(aggregation_query),
-        transaction: Vec::new(),
-        explain_metrics: Some(ExplainMetrics {
+        let execution_duration = start.elapsed();
+
+        Some(ExplainMetrics {
             plan_summary: Some(PlanSummary {
                 indexes_used: vec![],
             }),
@@ -765,6 +735,15 @@ pub async fn run_aggregation_query(
                 read_operations: storage.entities.len() as i64,
                 debug_stats: Some(debug_stats),
             }),
-        }),
+        })
+    } else {
+        None
+    };
+
+    Ok(RunAggregationQueryResponse {
+        batch: Some(batch),
+        query: None,
+        transaction: Vec::new(),
+        explain_metrics,
     })
 }
