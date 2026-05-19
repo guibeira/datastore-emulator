@@ -284,11 +284,11 @@ pub async fn commit(
     }
 
     for mutation in req.mutations {
-        if let Some(ref mutation) = mutation.operation {
+        if let Some(mutation) = mutation.operation {
             match mutation {
                 Operation::Insert(entity) => {
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
-                    match storage.insert_entity_at(entity, commit_time.clone()) {
+                    match storage.insert_owned_entity_at(entity, commit_time.clone()) {
                         Ok((final_key, _metadata)) => {
                             mutation_results
                                 .push(commit_mutation_result(allocates_key.then_some(final_key)));
@@ -311,9 +311,8 @@ pub async fn commit(
 
                     let create_time = existing_entity_metadata.create_time.clone();
                     let version = existing_entity_metadata.version + 1;
-                    let previous_entity = existing_entity_metadata.entity.clone();
                     let updated_metadata = Arc::new(EntityWithMetadata {
-                        entity: entity.clone(),
+                        entity,
                         version,
                         create_time,
                         update_time: commit_time.clone(),
@@ -322,9 +321,13 @@ pub async fn commit(
                     storage
                         .entities
                         .insert(key_struct.clone(), Arc::clone(&updated_metadata));
-                    storage.upsert_scoped_entity(&key_struct, updated_metadata);
+                    storage.upsert_scoped_entity(&key_struct, Arc::clone(&updated_metadata));
 
-                    storage.replace_indexes(&key_struct, &previous_entity, entity);
+                    storage.replace_indexes(
+                        &key_struct,
+                        &existing_entity_metadata.entity,
+                        &updated_metadata.entity,
+                    );
 
                     mutation_results.push(commit_mutation_result(None));
                 }
@@ -337,58 +340,53 @@ pub async fn commit(
 
                     if allocates_key {
                         let (final_key, _metadata) =
-                            storage.insert_entity_at(entity, commit_time.clone())?;
+                            storage.insert_owned_entity_at(entity, commit_time.clone())?;
                         mutation_results.push(commit_mutation_result(Some(final_key)));
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(key);
 
-                        let previous_entity;
-                        let observe_key_counters;
+                        let previous_metadata = storage.entities.get(&key_struct).cloned();
+                        let observe_key_counters = previous_metadata.is_none();
 
-                        let metadata = if let Some(previous_metadata) =
-                            storage.entities.get(&key_struct).cloned()
-                        {
-                            let version = previous_metadata.version + 1;
-                            previous_entity = Some(previous_metadata.entity.clone());
-                            observe_key_counters = false;
-                            Arc::new(EntityWithMetadata {
-                                entity: entity.clone(),
-                                version,
-                                create_time: previous_metadata.create_time.clone(),
-                                update_time: commit_time.clone(),
-                            })
-                        } else {
-                            previous_entity = None;
-                            observe_key_counters = true;
-                            Arc::new(EntityWithMetadata {
-                                entity: entity.clone(),
-                                version: 1,
-                                create_time: commit_time.clone(),
-                                update_time: commit_time.clone(),
-                            })
-                        };
-
-                        storage
-                            .entities
-                            .insert(key_struct.clone(), Arc::clone(&metadata));
-                        storage.upsert_scoped_entity(&key_struct, metadata);
-
+                        let version = previous_metadata
+                            .as_ref()
+                            .map_or(1, |previous| previous.version + 1);
+                        let create_time = previous_metadata.as_ref().map_or_else(
+                            || commit_time.clone(),
+                            |previous| previous.create_time.clone(),
+                        );
                         if observe_key_counters {
                             storage.observe_key_id(key);
                             storage.add_ancestor_indexes(&key_struct);
                         }
 
-                        if let Some(prev) = previous_entity {
-                            storage.replace_indexes(&key_struct, &prev, entity);
+                        let metadata = Arc::new(EntityWithMetadata {
+                            entity,
+                            version,
+                            create_time,
+                            update_time: commit_time.clone(),
+                        });
+
+                        storage
+                            .entities
+                            .insert(key_struct.clone(), Arc::clone(&metadata));
+                        storage.upsert_scoped_entity(&key_struct, Arc::clone(&metadata));
+
+                        if let Some(previous_metadata) = previous_metadata {
+                            storage.replace_indexes(
+                                &key_struct,
+                                &previous_metadata.entity,
+                                &metadata.entity,
+                            );
                         } else {
-                            storage.update_indexes(&key_struct, entity);
+                            storage.update_indexes(&key_struct, &metadata.entity);
                         }
 
                         mutation_results.push(commit_mutation_result(None));
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if storage.delete_entity(key_to_delete).is_some() {
+                    if storage.delete_entity(&key_to_delete).is_some() {
                         mutation_results.push(commit_mutation_result(None));
                     } else {
                         tracing::warn!(

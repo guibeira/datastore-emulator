@@ -1103,6 +1103,133 @@ pub struct DatastoreStorage {
 }
 
 impl DatastoreStorage {
+    fn candidates_from_index_keys<'a>(
+        &self,
+        project_id_filter: &str,
+        kind_name: &str,
+        retain_key_struct: bool,
+        keys: impl IntoIterator<Item = &'a KeyStruct>,
+    ) -> Vec<QueryCandidate> {
+        let scope_key = (project_id_filter.to_string(), kind_name.to_string());
+        let scoped_entities = self.scoped_entities.get(&scope_key);
+
+        keys.into_iter()
+            .filter(|key_struct| {
+                key_struct.project_id == project_id_filter
+                    && key_struct
+                        .path_elements
+                        .last()
+                        .is_some_and(|(k, _)| k == kind_name)
+            })
+            .filter_map(|key_struct| {
+                scoped_entities
+                    .and_then(|entities| entities.get(key_struct))
+                    .or_else(|| self.entities.get(key_struct))
+                    .map(|entity_metadata| QueryCandidate {
+                        key_struct: retain_key_struct.then(|| key_struct.clone()),
+                        entity_metadata: Arc::clone(entity_metadata),
+                    })
+            })
+            .collect()
+    }
+
+    fn query_simple_index_candidates(
+        &self,
+        project_id_filter: &str,
+        kind_name: &str,
+        filter_type: &FilterType,
+        retain_key_struct: bool,
+    ) -> Option<Vec<QueryCandidate>> {
+        let FilterType::PropertyFilter(property_filter) = filter_type else {
+            return None;
+        };
+        let property = property_filter.property.as_ref()?;
+        let filter_value = property_filter.value.as_ref()?;
+
+        if property.name == "__key__" {
+            if property_filter.op != 11 {
+                return None;
+            }
+
+            let Some(ValueType::KeyValue(key)) = &filter_value.value_type else {
+                return None;
+            };
+            let ancestor_key_struct = KeyStruct::from_datastore_key(key);
+            if ancestor_key_struct.project_id != project_id_filter
+                || ancestor_key_struct.path_elements.is_empty()
+            {
+                return Some(Vec::new());
+            }
+            if self.ancestor_index.is_empty()
+                && self.scoped_entities.is_empty()
+                && !self.entities.is_empty()
+            {
+                return None;
+            }
+
+            let index_key = (
+                project_id_filter.to_string(),
+                kind_name.to_string(),
+                ancestor_key_struct,
+            );
+            let Some(keys) = self.ancestor_index.get(&index_key) else {
+                return Some(Vec::new());
+            };
+            return Some(self.candidates_from_index_keys(
+                project_id_filter,
+                kind_name,
+                retain_key_struct,
+                keys.iter(),
+            ));
+        }
+
+        let indexed_values = get_indexable_strings_for_value(filter_value);
+        if indexed_values.is_empty() {
+            return None;
+        }
+
+        match property_filter.op {
+            5 if !matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))) => {
+                let index_key = (
+                    kind_name.to_string(),
+                    property.name.clone(),
+                    indexed_values.into_iter().next().unwrap(),
+                );
+                let Some(keys) = self.indexes.get(&index_key) else {
+                    return Some(Vec::new());
+                };
+                Some(self.candidates_from_index_keys(
+                    project_id_filter,
+                    kind_name,
+                    retain_key_struct,
+                    keys.iter(),
+                ))
+            }
+            6 if matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))) => {
+                let kind_key = kind_name.to_string();
+                let property_key = property.name.clone();
+                let mut unique_keys = BTreeSet::new();
+
+                for value_str in indexed_values {
+                    if let Some(keys) =
+                        self.indexes
+                            .get(&(kind_key.clone(), property_key.clone(), value_str))
+                    {
+                        unique_keys.extend(keys.iter());
+                    }
+                }
+
+                Some(self.candidates_from_index_keys(
+                    project_id_filter,
+                    kind_name,
+                    retain_key_struct,
+                    unique_keys,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn index_lookup_for_filter(
         &self,
         project_id: &str,
@@ -1483,6 +1610,14 @@ impl DatastoreStorage {
         entity: &Entity,
         timestamp_now: pbjson_types::Timestamp,
     ) -> Result<(Key, Arc<EntityWithMetadata>), tonic::Status> {
+        self.insert_owned_entity_at(entity.clone(), timestamp_now)
+    }
+
+    pub(crate) fn insert_owned_entity_at(
+        &mut self,
+        mut entity: Entity,
+        timestamp_now: pbjson_types::Timestamp,
+    ) -> Result<(Key, Arc<EntityWithMetadata>), tonic::Status> {
         let Some(original_key) = entity.key.as_ref() else {
             return Err(tonic::Status::invalid_argument("Entity missing key"));
         };
@@ -1508,11 +1643,10 @@ impl DatastoreStorage {
 
         let final_key_struct = KeyStruct::from_datastore_key(&key_with_new_id);
 
-        let mut db_entity = entity.clone();
-        db_entity.key = Some(key_with_new_id.clone());
+        entity.key = Some(key_with_new_id.clone());
 
         let entity_metadata = Arc::new(EntityWithMetadata {
-            entity: db_entity,
+            entity,
             version: 1, // Initial version
             create_time: timestamp_now.clone(),
             update_time: timestamp_now,
@@ -1860,6 +1994,17 @@ impl DatastoreStorage {
                     .collect(),
                 false,
             );
+        }
+
+        if let Some(filter_type) = filter_type
+            && let Some(candidates) = self.query_simple_index_candidates(
+                project_id_filter,
+                kind_name,
+                filter_type,
+                retain_key_struct,
+            )
+        {
+            return (candidates, true);
         }
 
         if let Some(filter_type) = filter_type
@@ -2332,10 +2477,6 @@ impl DatastoreStorage {
         previous_entity: &Entity,
         next_entity: &Entity,
     ) {
-        if previous_entity.properties == next_entity.properties {
-            return;
-        }
-
         let Some((kind, _)) = key_struct.path_elements.last() else {
             return;
         };
