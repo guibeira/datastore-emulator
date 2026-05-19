@@ -5,7 +5,8 @@ use datastore_emulator::{
     google::datastore::v1::{
         AggregationQuery, ArrayValue, BeginTransactionRequest, CommitRequest, Entity, Filter, Key,
         KindExpression, LookupRequest, Mutation, PartitionId, Projection, PropertyFilter,
-        PropertyOrder, PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest, Value,
+        PropertyOrder, PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest,
+        Value,
         aggregation_query::{
             Aggregation, QueryType as AggregationQueryType,
             aggregation::{Count, Operator as AggOperator},
@@ -31,6 +32,9 @@ use tokio::sync::RwLock;
 const PROJECT: &str = "bench-project";
 const KIND: &str = "BenchItem";
 const DEFAULT_ENTITY_COUNT: usize = 10_000;
+const DEFAULT_MIXED_SCOPE_ENTITIES_PER_KIND: usize = 1_000;
+const MIXED_SCOPE_PROJECTS: usize = 5;
+const MIXED_SCOPE_KINDS: usize = 5;
 
 struct BenchCase {
     name: &'static str,
@@ -39,12 +43,22 @@ struct BenchCase {
 
 fn criterion_benchmark(c: &mut Criterion) {
     let entity_count = env_usize("DATASTORE_QUERY_BENCH_ENTITIES", DEFAULT_ENTITY_COUNT);
+    let mixed_scope_entities_per_kind = env_usize(
+        "DATASTORE_QUERY_BENCH_MIXED_SCOPE_ENTITIES_PER_KIND",
+        DEFAULT_MIXED_SCOPE_ENTITIES_PER_KIND,
+    );
     let runtime = Runtime::new().expect("create tokio runtime");
     let storage = Arc::new(RwLock::new(seed_storage(entity_count)));
+    let mixed_scope_storage = Arc::new(RwLock::new(seed_mixed_scope_storage(
+        mixed_scope_entities_per_kind,
+    )));
 
     runtime.block_on(async {
         for case in bench_cases() {
             black_box(execute_query(&storage, &case.query).await);
+        }
+        for case in mixed_scope_bench_cases() {
+            black_box(execute_query(&mixed_scope_storage, &case.query).await);
         }
     });
 
@@ -60,6 +74,15 @@ fn criterion_benchmark(c: &mut Criterion) {
             let query = case.query.clone();
             b.to_async(&runtime).iter(|| async {
                 black_box(execute_query(&storage, black_box(&query)).await);
+            });
+        });
+    }
+
+    for case in mixed_scope_bench_cases() {
+        group.bench_function(case.name, |b| {
+            let query = case.query.clone();
+            b.to_async(&runtime).iter(|| async {
+                black_box(execute_query(&mixed_scope_storage, black_box(&query)).await);
             });
         });
     }
@@ -138,6 +161,39 @@ fn criterion_benchmark(c: &mut Criterion) {
                 };
                 async move {
                     black_box(core::commit(&storage, req).await.expect("update commit"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let wide_update_seed = wide_indexed_entity_for_name("wide-update-target", 1);
+    let wide_update_template = wide_indexed_entity_for_name("wide-update-target", 2);
+    group.bench_function("update_one_field_many_indexes", |b| {
+        b.to_async(&runtime).iter_batched(
+            || {
+                let mut storage = DatastoreStorage::default();
+                storage
+                    .insert_entity(&wide_update_seed)
+                    .expect("seed wide update bench entity");
+                Arc::new(RwLock::new(storage))
+            },
+            |storage| {
+                let req = CommitRequest {
+                    project_id: PROJECT.to_string(),
+                    mode: Mode::NonTransactional as i32,
+                    mutations: vec![Mutation {
+                        operation: Some(Operation::Update(wide_update_template.clone())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                async move {
+                    black_box(
+                        core::commit(&storage, req)
+                            .await
+                            .expect("wide update commit"),
+                    );
                 }
             },
             BatchSize::SmallInput,
@@ -246,7 +302,11 @@ fn criterion_benchmark(c: &mut Criterion) {
                     ..Default::default()
                 };
                 async move {
-                    black_box(core::commit(&storage, req).await.expect("batch insert commit"));
+                    black_box(
+                        core::commit(&storage, req)
+                            .await
+                            .expect("batch insert commit"),
+                    );
                 }
             },
             BatchSize::SmallInput,
@@ -320,10 +380,7 @@ fn bench_entity_for_name(name: &str) -> Entity {
                 "bucket".to_string(),
                 value(ValueType::StringValue("bucket-42".to_string())),
             ),
-            (
-                "score".to_string(),
-                value(ValueType::IntegerValue(123)),
-            ),
+            ("score".to_string(), value(ValueType::IntegerValue(123))),
             (
                 "region".to_string(),
                 value(ValueType::StringValue("region-3".to_string())),
@@ -355,6 +412,35 @@ fn bench_entity_for_name(name: &str) -> Entity {
                 })),
             ),
         ]),
+    }
+}
+
+fn wide_indexed_entity_for_name(name: &str, changed_value: i64) -> Entity {
+    let mut properties = HashMap::with_capacity(40);
+    for idx in 0..32 {
+        properties.insert(
+            format!("field_{idx:02}"),
+            value(ValueType::StringValue(format!("value-{idx:02}"))),
+        );
+    }
+    properties.insert(
+        "changed_field".to_string(),
+        value(ValueType::IntegerValue(changed_value)),
+    );
+    properties.insert(
+        "tags".to_string(),
+        value(ValueType::ArrayValue(ArrayValue {
+            values: vec![
+                value(ValueType::StringValue("wide-tag-1".to_string())),
+                value(ValueType::StringValue("wide-tag-2".to_string())),
+                value(ValueType::StringValue("wide-tag-3".to_string())),
+            ],
+        })),
+    );
+
+    Entity {
+        key: Some(key_for_name(name)),
+        properties,
     }
 }
 
@@ -441,15 +527,63 @@ fn seed_storage(entity_count: usize) -> DatastoreStorage {
     storage
 }
 
+fn seed_mixed_scope_storage(entities_per_kind: usize) -> DatastoreStorage {
+    let mut storage = DatastoreStorage::default();
+
+    for project_idx in 0..MIXED_SCOPE_PROJECTS {
+        let project = if project_idx == 0 {
+            PROJECT.to_string()
+        } else {
+            format!("{PROJECT}-other-{project_idx}")
+        };
+
+        for kind_idx in 0..MIXED_SCOPE_KINDS {
+            let kind = if kind_idx == 0 {
+                KIND.to_string()
+            } else {
+                format!("{KIND}Other{kind_idx}")
+            };
+
+            for idx in 0..entities_per_kind {
+                let score = ((idx * 37 + project_idx * 101 + kind_idx * 17) % 10_000) as i64;
+                let entity = Entity {
+                    key: Some(key_for_project_kind(&project, &kind, idx)),
+                    properties: HashMap::from([
+                        (
+                            "bucket".to_string(),
+                            value(ValueType::StringValue(format!("bucket-{}", idx % 100))),
+                        ),
+                        ("score".to_string(), value(ValueType::IntegerValue(score))),
+                        (
+                            "region".to_string(),
+                            value(ValueType::StringValue(format!("region-{}", idx % 8))),
+                        ),
+                    ]),
+                };
+
+                storage
+                    .insert_entity(&entity)
+                    .expect("seed mixed-scope benchmark entity");
+            }
+        }
+    }
+
+    storage
+}
+
 fn key_for(idx: usize) -> Key {
+    key_for_project_kind(PROJECT, KIND, idx)
+}
+
+fn key_for_project_kind(project: &str, kind: &str, idx: usize) -> Key {
     Key {
         partition_id: Some(PartitionId {
-            project_id: PROJECT.to_string(),
+            project_id: project.to_string(),
             database_id: String::new(),
             namespace_id: String::new(),
         }),
         path: vec![PathElement {
-            kind: KIND.to_string(),
+            kind: kind.to_string(),
             id_type: Some(IdType::Name(format!("entity-{idx:06}"))),
         }],
     }
@@ -563,6 +697,41 @@ fn bench_cases() -> Vec<BenchCase> {
                     },
                 ],
                 order: vec![order_by("region"), order_by("bucket")],
+                ..Default::default()
+            },
+        },
+    ]
+}
+
+fn mixed_scope_bench_cases() -> Vec<BenchCase> {
+    vec![
+        BenchCase {
+            name: "mixed_scope_full_kind_limit_50",
+            query: Query {
+                kind: kind(),
+                limit: Some(Int32Value { value: 50 }),
+                ..Default::default()
+            },
+        },
+        BenchCase {
+            name: "mixed_scope_ordered_limit_50",
+            query: Query {
+                kind: kind(),
+                order: vec![order_by("score")],
+                limit: Some(Int32Value { value: 50 }),
+                ..Default::default()
+            },
+        },
+        BenchCase {
+            name: "mixed_scope_inequality_limit_50",
+            query: Query {
+                kind: kind(),
+                filter: Some(property_filter(
+                    "score",
+                    property_filter::Operator::GreaterThan,
+                    value(ValueType::IntegerValue(5_000)),
+                )),
+                limit: Some(Int32Value { value: 50 }),
                 ..Default::default()
             },
         },
