@@ -1073,8 +1073,6 @@ pub struct DatastoreStorage {
     pub transactions: HashMap<String, TransactionState>,
     // Per-(project, namespace, kind) counters for auto ID allocation
     pub entity_id_counters: HashMap<(String, String, String), AtomicI64>,
-    // Counter used for transaction IDs
-    pub transaction_counter: AtomicI64,
 }
 
 impl DatastoreStorage {

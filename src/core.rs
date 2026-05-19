@@ -13,9 +13,12 @@ use crate::google::datastore::v1::{
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime};
 use tokio::sync::RwLock;
 use tonic::Status;
+
+static TRANSACTION_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 fn to_pbjson_duration(std_duration: std::time::Duration) -> Duration {
     Duration {
@@ -32,6 +35,15 @@ pub(crate) fn system_time_to_timestamp(time: SystemTime) -> pbjson_types::Timest
         },
         Err(_) => pbjson_types::Timestamp::default(),
     }
+}
+
+fn next_transaction_id(prefix: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let counter = TRANSACTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{timestamp}-{counter}")
 }
 
 /// Walk a filter and collect property names referenced by any inequality
@@ -432,35 +444,15 @@ pub async fn begin_transaction(
     req: BeginTransactionRequest,
 ) -> Result<BeginTransactionResponse, Status> {
     tracing::debug!("Received BeginTransactionRequest: {:?}", req);
-    let start = SystemTime::now();
-    let duration_since_epoch = start
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+    let transaction_id = next_transaction_id("tx");
 
-    let timestamp = pbjson_types::Timestamp {
-        seconds: duration_since_epoch.as_secs() as i64,
-        nanos: (duration_since_epoch.as_nanos() % 1_000_000_000) as i32,
-    };
-
-    // Generate a unique transaction ID and create transaction state
-    let transaction_bytes = {
+    let transaction_bytes = transaction_id.as_bytes().to_vec();
+    {
         let mut storage = storage.write().await;
-
-        // Generate transaction ID using timestamp and current counter
-        let counter = storage
-            .transaction_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
-        let transaction_bytes = transaction_id.as_bytes().to_vec();
-
-        // Create a new transaction state
-        let transaction_state = TransactionState;
-
         storage
             .transactions
-            .insert(transaction_id, transaction_state);
-        transaction_bytes
-    };
+            .insert(transaction_id, TransactionState);
+    }
 
     let transaction_response = BeginTransactionResponse {
         transaction: transaction_bytes,
@@ -482,11 +474,10 @@ pub async fn rollback(
     };
 
     let mut storage = storage.write().await;
-    if storage.transactions.contains_key(&transaction_id) {
-        storage.clean_transaction(&transaction_id);
-        tracing::info!("Transaction {} rolled back successfully", transaction_id);
+    if storage.transactions.remove(&transaction_id).is_some() {
+        tracing::debug!("Transaction {} rolled back successfully", transaction_id);
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "Attempted to rollback non-existent transaction: {}",
             transaction_id
         );

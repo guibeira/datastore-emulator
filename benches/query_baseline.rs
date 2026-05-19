@@ -5,8 +5,8 @@ use datastore_emulator::{
     google::datastore::v1::{
         AggregationQuery, ArrayValue, BeginTransactionRequest, CommitRequest, Entity, Filter, Key,
         KindExpression, LookupRequest, Mutation, PartitionId, Projection, PropertyFilter,
-        PropertyOrder, PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest,
-        Value,
+        PropertyOrder, PropertyReference, Query, RollbackRequest, RunAggregationQueryRequest,
+        RunQueryRequest, TransactionOptions, Value,
         aggregation_query::{
             Aggregation, QueryType as AggregationQueryType,
             aggregation::{Count, Operator as AggOperator},
@@ -18,6 +18,7 @@ use datastore_emulator::{
         property_filter, property_order,
         run_aggregation_query_request::QueryType as RunAggQueryType,
         run_query_request::QueryType,
+        transaction_options,
         value::ValueType,
     },
 };
@@ -364,6 +365,43 @@ fn criterion_benchmark(c: &mut Criterion) {
                             .expect("transactional batch insert commit"),
                     );
                 }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("read_only_transaction_lifecycle", |b| {
+        b.to_async(&runtime).iter_batched(
+            || Arc::new(RwLock::new(DatastoreStorage::default())),
+            |storage| async move {
+                let transaction = core::begin_transaction(
+                    &storage,
+                    BeginTransactionRequest {
+                        project_id: PROJECT.to_string(),
+                        transaction_options: Some(TransactionOptions {
+                            mode: Some(transaction_options::Mode::ReadOnly(
+                                transaction_options::ReadOnly::default(),
+                            )),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("begin read-only transaction")
+                .transaction;
+
+                black_box(
+                    core::rollback(
+                        &storage,
+                        RollbackRequest {
+                            project_id: PROJECT.to_string(),
+                            transaction,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("rollback read-only transaction"),
+                );
             },
             BatchSize::SmallInput,
         );
