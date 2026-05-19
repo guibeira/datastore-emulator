@@ -205,7 +205,7 @@ pub async fn run_query(
 
     Ok(RunQueryResponse {
         transaction: vec![],
-        query: Some(query_obj),
+        query: None,
         batch: Some(batch),
         explain_metrics,
     })
@@ -546,7 +546,8 @@ pub async fn run_aggregation_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunAggregationQueryRequest,
 ) -> Result<RunAggregationQueryResponse, Status> {
-    let start = Instant::now();
+    let explain_requested = req.explain_options.is_some();
+    let start = explain_requested.then(Instant::now);
     let storage = storage.read().await;
 
     // Extract the aggregation query from the request
@@ -734,26 +735,23 @@ pub async fn run_aggregation_query(
         more_results: 3, // NO_MORE_RESULTS
         read_time: Some(read_time.clone()),
     };
-    let total_results = batch.aggregation_results.len() as i64;
-    // Create execution metrics
-    let mut fields = HashMap::new();
-    fields.insert(
-        "query_type".to_string(),
-        ValueProps {
-            kind: Some(Kind::StringValue("aggregation".to_string())),
-        },
-    );
+    let explain_metrics = if let Some(start) = start {
+        let total_results = batch.aggregation_results.len() as i64;
+        let mut fields = HashMap::new();
+        fields.insert(
+            "query_type".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("aggregation".to_string())),
+            },
+        );
 
-    let debug_stats = Struct {
-        fields: fields.clone(),
-    };
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
 
-    let execution_duration = start.elapsed();
-    Ok(RunAggregationQueryResponse {
-        batch: Some(batch),
-        query: Some(aggregation_query),
-        transaction: Vec::new(),
-        explain_metrics: Some(ExplainMetrics {
+        let execution_duration = start.elapsed();
+
+        Some(ExplainMetrics {
             plan_summary: Some(PlanSummary {
                 indexes_used: vec![],
             }),
@@ -763,6 +761,15 @@ pub async fn run_aggregation_query(
                 read_operations: storage.entities.len() as i64,
                 debug_stats: Some(debug_stats),
             }),
-        }),
+        })
+    } else {
+        None
+    };
+
+    Ok(RunAggregationQueryResponse {
+        batch: Some(batch),
+        query: None,
+        transaction: Vec::new(),
+        explain_metrics,
     })
 }
