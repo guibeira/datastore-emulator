@@ -71,7 +71,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("query_baseline");
-    group.sample_size(env_usize("DATASTORE_QUERY_BENCH_SAMPLES", 50));
+    group.sample_size(env_usize("DATASTORE_QUERY_BENCH_SAMPLES", 50).max(10));
     group.measurement_time(Duration::from_secs(env_usize(
         "DATASTORE_QUERY_BENCH_MEASUREMENT_SECONDS",
         5,

@@ -15,4 +15,4 @@ candidate, which makes the per-entity clone noticeable in aggregate.
 
 | Case | Before | After | Change |
 |---|---|---|---|
-| nested_indexed_equality | 1.184 ms | 1.166 ms | **−3.76%** (p=0.00) |
+| nested_indexed_equality | 1.184 ms | 1.166 ms | **−1.52%** (p=0.00) |

@@ -9,7 +9,7 @@ cargo bench --bench query_baseline --locked
 Environment:
 
 - Entities: 10000
-- Iterations: 40
+- Iterations (app runs): 40
 - Project: bench-project
 - Kind: BenchItem
 

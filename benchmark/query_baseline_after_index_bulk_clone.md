@@ -5,5 +5,5 @@ Optimization: in `index_lookup_for_filter`, the EQ (op 5) and IN (op 6) paths we
 | Case | Before | After | Change |
 |---|---|---|---|
 | indexed_equality_limit_20 | 61.9 µs | 59.4 µs | **−3.89%** (p=0.00) |
-| indexed_array_in_limit_50 | 2.02 ms | 1.97 ms | +1.05% (no change) |
+| indexed_array_in_limit_50 | 2.02 ms | 1.97 ms | −2.48% (no change) |
 | nested_indexed_equality | 1.30 ms | 1.20 ms | **−6.55%** (p=0.00) |

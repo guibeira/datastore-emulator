@@ -13,4 +13,4 @@ Bench case added: `lookup_batch_100` (100 keys per call, all present).
 
 | Case | Before | After | Change |
 |---|---|---|---|
-| lookup_batch_100 | 155.0 µs | 104.8 µs | **−33.1%** (p=0.00) |
+| lookup_batch_100 | 155.0 µs | 104.8 µs | **−32.39%** (p=0.00) |

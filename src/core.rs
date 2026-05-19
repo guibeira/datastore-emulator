@@ -19,6 +19,9 @@ use tokio::sync::RwLock;
 use tonic::Status;
 
 static TRANSACTION_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
+/// Offset cursors are stored as a big-endian u32. Longer cursors are encoded
+/// KeyStruct values and need key retention to resume ordered scans correctly.
+const OFFSET_CURSOR_BYTE_LEN: usize = 4;
 
 fn to_pbjson_duration(std_duration: std::time::Duration) -> Duration {
     Duration {
@@ -52,10 +55,10 @@ fn key_is_incomplete(key: &Key) -> bool {
         .any(|path_element| path_element.id_type.is_none())
 }
 
-fn commit_mutation_result(key: Option<Key>) -> MutationResult {
+fn commit_mutation_result(key: Option<Key>, version: i64) -> MutationResult {
     MutationResult {
         key,
-        version: 0,
+        version,
         create_time: None,
         update_time: None,
         conflict_detected: false,
@@ -182,7 +185,7 @@ pub async fn run_query(
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
-    let retain_key_struct = query_obj.start_cursor.len() > 4
+    let retain_key_struct = query_obj.start_cursor.len() > OFFSET_CURSOR_BYTE_LEN
         || query_obj.distinct_on.iter().any(|p| p.name == "__key__")
         || order
             .iter()
@@ -212,10 +215,11 @@ pub async fn run_query(
         let mut fields = HashMap::new();
         let amount_results = batch.entity_results.len() as i64;
 
+        // TODO: Populate emulator explain metrics with real planner/index details.
         fields.insert(
-            "Some key".to_string(),
+            "placeholder_plan".to_string(),
             ValueProps {
-                kind: Some(Kind::StringValue("Some value".to_string())),
+                kind: Some(Kind::StringValue("not_implemented".to_string())),
             },
         );
         let debug_stats = Struct {
@@ -232,7 +236,7 @@ pub async fn run_query(
             execution_stats: Some(ExecutionStats {
                 results_returned: amount_results,
                 execution_duration: Some(to_pbjson_duration(execution_duration)),
-                read_operations: 10,
+                read_operations: amount_results,
                 debug_stats: Some(debug_stats),
             }),
         })
@@ -289,9 +293,11 @@ pub async fn commit(
                 Operation::Insert(entity) => {
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
                     match storage.insert_owned_entity_at(entity, commit_time.clone()) {
-                        Ok((final_key, _metadata)) => {
-                            mutation_results
-                                .push(commit_mutation_result(allocates_key.then_some(final_key)));
+                        Ok((final_key, metadata)) => {
+                            mutation_results.push(commit_mutation_result(
+                                allocates_key.then_some(final_key),
+                                metadata.version as i64,
+                            ));
                         }
                         Err(status) => {
                             return Err(status);
@@ -329,7 +335,7 @@ pub async fn commit(
                         &updated_metadata.entity,
                     );
 
-                    mutation_results.push(commit_mutation_result(None));
+                    mutation_results.push(commit_mutation_result(None, version as i64));
                 }
                 Operation::Upsert(entity) => {
                     let Some(key) = entity.key.as_ref() else {
@@ -339,9 +345,12 @@ pub async fn commit(
                     let allocates_key = key_is_incomplete(key);
 
                     if allocates_key {
-                        let (final_key, _metadata) =
+                        let (final_key, metadata) =
                             storage.insert_owned_entity_at(entity, commit_time.clone())?;
-                        mutation_results.push(commit_mutation_result(Some(final_key)));
+                        mutation_results.push(commit_mutation_result(
+                            Some(final_key),
+                            metadata.version as i64,
+                        ));
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(key);
 
@@ -382,18 +391,18 @@ pub async fn commit(
                             storage.update_indexes(&key_struct, &metadata.entity);
                         }
 
-                        mutation_results.push(commit_mutation_result(None));
+                        mutation_results.push(commit_mutation_result(None, version as i64));
                     }
                 }
                 Operation::Delete(key_to_delete) => {
                     if storage.delete_entity(&key_to_delete).is_some() {
-                        mutation_results.push(commit_mutation_result(None));
+                        mutation_results.push(commit_mutation_result(None, 0));
                     } else {
                         tracing::warn!(
                             "Entity not found for deletion with key: {:?}",
                             key_to_delete.path
                         );
-                        mutation_results.push(commit_mutation_result(None));
+                        mutation_results.push(commit_mutation_result(None, 0));
                     }
                 }
             }

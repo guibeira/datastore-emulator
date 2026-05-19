@@ -26,11 +26,13 @@ use crate::leveldb::LogReader; // Added to resolve error E0433
 use bincode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write}; // For file I/O
 use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
+const OFFSET_CURSOR_BYTE_LEN: usize = 4;
 const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
 
 fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
@@ -1038,7 +1040,10 @@ fn compare_query_candidates(
             break;
         }
 
-        let prop_name = &order_by.property.as_ref().unwrap().name;
+        let Some(property) = order_by.property.as_ref() else {
+            continue;
+        };
+        let prop_name = &property.name;
         let descending = order_by.direction == property_order::Direction::Descending as i32;
 
         if prop_name == "__key__" {
@@ -1084,6 +1089,104 @@ fn compare_query_candidates(
         };
     }
     final_ordering
+}
+
+fn hash_distinct_value<H: Hasher>(hasher: &mut H, value: &Value, scratch: &mut Vec<u8>) {
+    match &value.value_type {
+        Some(ValueType::StringValue(s)) => {
+            b's'.hash(hasher);
+            s.hash(hasher);
+        }
+        Some(ValueType::IntegerValue(i)) => {
+            b'i'.hash(hasher);
+            i.hash(hasher);
+        }
+        Some(ValueType::BooleanValue(b)) => {
+            b'b'.hash(hasher);
+            b.hash(hasher);
+        }
+        _ => {
+            b'?'.hash(hasher);
+            scratch.clear();
+            value
+                .encode_length_delimited(scratch)
+                .expect("encode distinct value signature");
+            scratch.hash(hasher);
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum DistinctComponent {
+    Key(Option<KeyStruct>),
+    Value(Value),
+    Missing,
+}
+
+fn hash_distinct_signature(
+    candidate: &QueryCandidate,
+    distinct_on: &[PropertyReference],
+    scratch: &mut Vec<u8>,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for prop in distinct_on {
+        if prop.name == "__key__" {
+            1u8.hash(&mut hasher);
+            candidate.key_struct.hash(&mut hasher);
+        } else if let Some(value) = candidate.entity_metadata.entity.properties.get(&prop.name) {
+            2u8.hash(&mut hasher);
+            hash_distinct_value(&mut hasher, value, scratch);
+        } else {
+            3u8.hash(&mut hasher);
+        }
+        0xFFu8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn build_distinct_signature(
+    candidate: &QueryCandidate,
+    distinct_on: &[PropertyReference],
+) -> Vec<DistinctComponent> {
+    distinct_on
+        .iter()
+        .map(|prop| {
+            if prop.name == "__key__" {
+                DistinctComponent::Key(candidate.key_struct.clone())
+            } else if let Some(value) = candidate.entity_metadata.entity.properties.get(&prop.name)
+            {
+                DistinctComponent::Value(value.clone())
+            } else {
+                DistinctComponent::Missing
+            }
+        })
+        .collect()
+}
+
+fn distinct_signature_matches(
+    stored: &[DistinctComponent],
+    candidate: &QueryCandidate,
+    distinct_on: &[PropertyReference],
+) -> bool {
+    stored.len() == distinct_on.len()
+        && stored
+            .iter()
+            .zip(distinct_on)
+            .all(|(stored, prop)| match stored {
+                DistinctComponent::Key(stored) if prop.name == "__key__" => {
+                    stored.as_ref() == candidate.key_struct.as_ref()
+                }
+                DistinctComponent::Value(stored) => {
+                    candidate.entity_metadata.entity.properties.get(&prop.name) == Some(stored)
+                }
+                DistinctComponent::Missing => candidate
+                    .entity_metadata
+                    .entity
+                    .properties
+                    .get(&prop.name)
+                    .is_none(),
+                _ => false,
+            })
 }
 
 #[derive(Default, Debug)]
@@ -2160,57 +2263,24 @@ impl DatastoreStorage {
         }
 
         if !distinct_on.is_empty() {
-            use std::hash::{Hash, Hasher};
-
-            let mut seen_signatures: HashSet<u64> = HashSet::new();
+            let mut seen_signatures: HashMap<u64, Vec<Vec<DistinctComponent>>> = HashMap::new();
             let mut distinct_entities = Vec::new();
             let mut scratch: Vec<u8> = Vec::new();
 
             for candidate in filtered_entities.into_iter() {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                let signature_hash =
+                    hash_distinct_signature(&candidate, &distinct_on, &mut scratch);
 
-                for prop in &distinct_on {
-                    if prop.name == "__key__" {
-                        hasher.write_u8(1);
-                        if let Some(key_struct) = candidate.key_struct.as_ref() {
-                            key_struct.hash(&mut hasher);
-                        }
-                    } else if let Some(value) =
-                        candidate.entity_metadata.entity.properties.get(&prop.name)
-                    {
-                        hasher.write_u8(2);
-                        match &value.value_type {
-                            Some(ValueType::StringValue(s)) => {
-                                hasher.write_u8(b's');
-                                hasher.write(s.as_bytes());
-                            }
-                            Some(ValueType::IntegerValue(i)) => {
-                                hasher.write_u8(b'i');
-                                hasher.write_i64(*i);
-                            }
-                            Some(ValueType::BooleanValue(b)) => {
-                                hasher.write_u8(b'b');
-                                hasher.write_u8(*b as u8);
-                            }
-                            _ => {
-                                hasher.write_u8(b'?');
-                                scratch.clear();
-                                value
-                                    .encode_length_delimited(&mut scratch)
-                                    .expect("encode distinct value signature");
-                                hasher.write(&scratch);
-                            }
-                        }
-                    } else {
-                        hasher.write_u8(3);
-                        hasher.write(prop.name.as_bytes());
-                    }
-                    hasher.write_u8(0xFF);
+                let matching_signatures = seen_signatures.entry(signature_hash).or_default();
+                if matching_signatures
+                    .iter()
+                    .any(|existing| distinct_signature_matches(existing, &candidate, &distinct_on))
+                {
+                    continue;
                 }
 
-                if seen_signatures.insert(hasher.finish()) {
-                    distinct_entities.push(candidate);
-                }
+                matching_signatures.push(build_distinct_signature(&candidate, &distinct_on));
+                distinct_entities.push(candidate);
             }
 
             filtered_entities = distinct_entities;
@@ -2245,10 +2315,10 @@ impl DatastoreStorage {
                     }
                     start_index = index;
                 }
-            } else if start_cursor.len() >= 4 {
+            } else if start_cursor.len() >= OFFSET_CURSOR_BYTE_LEN {
                 start_index = u32::from_be_bytes(
                     start_cursor
-                        .get(0..4)
+                        .get(0..OFFSET_CURSOR_BYTE_LEN)
                         .and_then(|bytes| bytes.try_into().ok())
                         .unwrap_or([0, 0, 0, 0]),
                 ) as usize;
@@ -2273,6 +2343,13 @@ impl DatastoreStorage {
             && projection
                 .iter()
                 .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
+        let entity_result_type = if is_keys_only {
+            3 // KEY_ONLY
+        } else if !projection.is_empty() {
+            2 // PROJECTION
+        } else {
+            1 // FULL
+        };
 
         for candidate in filtered_entities.iter().skip(start_index) {
             let entity_metadata = candidate.entity_metadata.as_ref();
@@ -2323,12 +2400,22 @@ impl DatastoreStorage {
                 entity_metadata.entity.clone()
             };
 
+            let (create_time, update_time, version) = if entity_result_type == 1 {
+                (
+                    Some(entity_metadata.create_time.clone()),
+                    Some(entity_metadata.update_time.clone()),
+                    entity_metadata.version as i64,
+                )
+            } else {
+                (None, None, 0)
+            };
+
             results.push(EntityResult {
                 entity: Some(result_entity),
-                create_time: None,
-                update_time: None,
+                create_time,
+                update_time,
                 cursor: Vec::new(),
-                version: 0,
+                version,
             });
             current_entities_payload_size += entity_size_bytes;
             next_offset += 1;
@@ -2365,14 +2452,6 @@ impl DatastoreStorage {
             db_entities_count,
             end_cursor.len()
         );
-
-        let entity_result_type = if is_keys_only {
-            3 // KEY_ONLY
-        } else if !projection.is_empty() {
-            2 // PROJECTION
-        } else {
-            1 // FULL
-        };
 
         crate::google::datastore::v1::QueryResultBatch {
             entity_result_type,
