@@ -1,6 +1,7 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
+    database::KeyStruct,
     google::datastore::v1::{
         AggregationQuery, ArrayValue, BeginTransactionRequest, CommitRequest, Entity, Filter, Key,
         KindExpression, LookupRequest, Mutation, PartitionId, Projection, PropertyFilter,
@@ -79,6 +80,36 @@ fn criterion_benchmark(c: &mut Criterion) {
                 storage
                     .insert_entity(&insert_template)
                     .expect("insert bench entity");
+                black_box(storage);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let key_only_template = Entity {
+        key: Some(key_for_name("key-only-insert-target")),
+        properties: HashMap::new(),
+    };
+    group.bench_function("insert_entity_key_only", |b| {
+        b.iter_batched(
+            || DatastoreStorage::default(),
+            |mut storage| {
+                storage
+                    .insert_entity(&key_only_template)
+                    .expect("insert key-only bench entity");
+                black_box(storage);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let index_template = bench_entity_template();
+    let index_key = KeyStruct::from_datastore_key(index_template.key.as_ref().unwrap());
+    group.bench_function("index_entity_with_nested", |b| {
+        b.iter_batched(
+            || DatastoreStorage::default(),
+            |mut storage| {
+                storage.update_indexes(&index_key, &index_template);
                 black_box(storage);
             },
             BatchSize::SmallInput,
@@ -283,17 +314,7 @@ fn insert_mutations(entities: &[Entity]) -> Vec<Mutation> {
 
 fn bench_entity_for_name(name: &str) -> Entity {
     Entity {
-        key: Some(Key {
-            partition_id: Some(PartitionId {
-                project_id: PROJECT.to_string(),
-                database_id: String::new(),
-                namespace_id: String::new(),
-            }),
-            path: vec![PathElement {
-                kind: KIND.to_string(),
-                id_type: Some(IdType::Name(name.to_string())),
-            }],
-        }),
+        key: Some(key_for_name(name)),
         properties: HashMap::from([
             (
                 "bucket".to_string(),
@@ -334,6 +355,20 @@ fn bench_entity_for_name(name: &str) -> Entity {
                 })),
             ),
         ]),
+    }
+}
+
+fn key_for_name(name: &str) -> Key {
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: PROJECT.to_string(),
+            database_id: String::new(),
+            namespace_id: String::new(),
+        }),
+        path: vec![PathElement {
+            kind: KIND.to_string(),
+            id_type: Some(IdType::Name(name.to_string())),
+        }],
     }
 }
 
