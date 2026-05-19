@@ -964,17 +964,15 @@ impl DatastoreStorage {
                                     property_key.clone(),
                                     value_str.clone(),
                                 )) {
-                                    let filtered: BTreeSet<KeyStruct> = keys
-                                        .iter()
-                                        .filter(|key_struct| key_struct.project_id == project_id)
-                                        .cloned()
-                                        .collect();
+                                    // project_id and kind filtering happens again in
+                                    // query_candidates, so skip the redundant per-key
+                                    // filter+clone here and bulk-clone the index set.
                                     result = Some(match result {
                                         Some(mut acc) => {
-                                            acc.extend(filtered);
+                                            acc.extend(keys.iter().cloned());
                                             acc
                                         }
-                                        None => filtered,
+                                        None => keys.clone(),
                                     });
                                 }
                             }
@@ -988,13 +986,7 @@ impl DatastoreStorage {
                                     property_key.clone(),
                                     value_str.clone(),
                                 )) {
-                                    acc.extend(
-                                        keys.iter()
-                                            .filter(|key_struct| {
-                                                key_struct.project_id == project_id
-                                            })
-                                            .cloned(),
-                                    );
+                                    acc.extend(keys.iter().cloned());
                                 }
                             }
                             Some(acc)
