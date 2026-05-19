@@ -1986,7 +1986,7 @@ impl DatastoreStorage {
                 cursor: cursor_value,
                 version: entity_metadata.version as i64,
             });
-            current_entities_payload_size += entity_metadata.entity.encoded_len(); // Use original size for payload calculation
+            current_entities_payload_size += entity_size_bytes;
             next_offset += 1;
             last_cursor_bytes = Some(cursor_clone);
         }
