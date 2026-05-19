@@ -423,6 +423,40 @@ fn try_prepare_key_filter(filter: &FilterType) -> Option<PreparedKeyFilter> {
     }
 }
 
+fn index_lookup_covers_filter(filter: &FilterType) -> bool {
+    match filter {
+        FilterType::PropertyFilter(property_filter) => {
+            let Some(property) = property_filter.property.as_ref() else {
+                return false;
+            };
+            let Some(filter_value) = property_filter.value.as_ref() else {
+                return false;
+            };
+
+            if property.name == "__key__" {
+                return matches!(property_filter.op, 5 | 6 | 11);
+            }
+
+            match property_filter.op {
+                5 => !matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))),
+                6 => matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))),
+                _ => false,
+            }
+        }
+        FilterType::CompositeFilter(composite_filter) => {
+            if !matches!(composite_filter.op, 1 | 2) {
+                return false;
+            }
+            composite_filter.filters.iter().all(|filter| {
+                filter
+                    .filter_type
+                    .as_ref()
+                    .is_some_and(index_lookup_covers_filter)
+            })
+        }
+    }
+}
+
 fn match_prepared_key_filter(key_struct: &KeyStruct, kind: &PreparedKeyFilter) -> bool {
     match kind {
         PreparedKeyFilter::Compare(op, target) => {
@@ -1836,6 +1870,7 @@ impl DatastoreStorage {
             && let Some(candidate_keys) =
                 self.index_lookup_for_filter(project_id_filter, kind_name, filter_type)
         {
+            let candidates_prefiltered = index_lookup_covers_filter(filter_type);
             let scope_key = (project_id_filter.to_string(), kind_name.to_string());
             let scoped_entities = self.scoped_entities.get(&scope_key);
             return (
@@ -1860,7 +1895,7 @@ impl DatastoreStorage {
                             })
                     })
                     .collect(),
-                false,
+                candidates_prefiltered,
             );
         }
 
