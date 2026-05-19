@@ -174,7 +174,10 @@ fn sort_value(value: &Value, descending: bool) -> Option<&Value> {
 
 /// Resolves a nested property path (e.g., "organizations.key.consistentId") against an entity's properties.
 /// Returns all values found at the path (handles arrays at any level).
-fn resolve_nested_property(properties: &HashMap<String, Value>, property_path: &str) -> Vec<Value> {
+fn resolve_nested_property<'a>(
+    properties: &'a HashMap<String, Value>,
+    property_path: &str,
+) -> Vec<&'a Value> {
     let parts: Vec<&str> = property_path.split('.').collect();
     if parts.is_empty() {
         return Vec::new();
@@ -184,10 +187,10 @@ fn resolve_nested_property(properties: &HashMap<String, Value>, property_path: &
 }
 
 /// Recursively resolve a property path through nested entities and arrays.
-fn resolve_property_path_recursive(
-    properties: &HashMap<String, Value>,
+fn resolve_property_path_recursive<'a>(
+    properties: &'a HashMap<String, Value>,
     path_parts: &[&str],
-) -> Vec<Value> {
+) -> Vec<&'a Value> {
     if path_parts.is_empty() {
         return Vec::new();
     }
@@ -203,8 +206,8 @@ fn resolve_property_path_recursive(
     // If this is the last part of the path, return the value(s)
     if remaining_parts.is_empty() {
         return match &value.value_type {
-            Some(ValueType::ArrayValue(array)) => array.values.clone(),
-            _ => vec![value.clone()],
+            Some(ValueType::ArrayValue(array)) => array.values.iter().collect(),
+            _ => vec![value],
         };
     }
 
@@ -216,7 +219,7 @@ fn resolve_property_path_recursive(
         }
         Some(ValueType::ArrayValue(array)) => {
             // Array of values - for each element that is an entity, recurse and collect results
-            let mut results = Vec::new();
+            let mut results = Vec::with_capacity(array.values.len());
             for item in &array.values {
                 if let Some(ValueType::EntityValue(entity)) = &item.value_type {
                     results.extend(resolve_property_path_recursive(
@@ -1333,7 +1336,9 @@ impl DatastoreStorage {
                                     &property.name,
                                 );
                                 values_match_filter(
-                                    entity_values.iter().filter(|v| !v.exclude_from_indexes),
+                                    entity_values
+                                        .into_iter()
+                                        .filter(|v| !v.exclude_from_indexes),
                                     filter_value,
                                     property_filter.op,
                                 )
