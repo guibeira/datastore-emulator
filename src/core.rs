@@ -182,9 +182,19 @@ pub async fn run_query(
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
+    let retain_key_struct = query_obj.start_cursor.len() > 4
+        || query_obj.distinct_on.iter().any(|p| p.name == "__key__")
+        || order
+            .iter()
+            .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
     let (candidates, candidates_prefiltered) = {
         let storage = storage.read().await;
-        storage.query_candidates(&req.project_id, &kind_name, filter_type.as_ref())
+        storage.query_candidates(
+            &req.project_id,
+            &kind_name,
+            filter_type.as_ref(),
+            retain_key_struct,
+        )
     };
 
     let batch = DatastoreStorage::get_entities_from_candidates(
@@ -545,7 +555,8 @@ pub async fn run_aggregation_query(
         // query_candidates is per-kind.
         if query.kind.len() == 1 {
             let kind_name = query.kind[0].name.as_str();
-            let (candidates, _) = storage.query_candidates(&req.project_id, kind_name, filter_type);
+            let (candidates, _) =
+                storage.query_candidates(&req.project_id, kind_name, filter_type, false);
             matching_entities = candidates
                 .into_iter()
                 .filter(|c| c.entity_metadata.entity.key.is_some())

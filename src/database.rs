@@ -1025,13 +1025,6 @@ impl QueryCandidate {
             entity_metadata,
         }
     }
-
-    fn from_stored_entity(key_struct: KeyStruct, entity_metadata: Arc<EntityWithMetadata>) -> Self {
-        Self {
-            key_struct: Some(key_struct),
-            entity_metadata,
-        }
-    }
 }
 
 fn compare_query_candidates(
@@ -1857,6 +1850,7 @@ impl DatastoreStorage {
         project_id_filter: &str,
         kind_name: &str,
         filter_type: Option<&FilterType>,
+        retain_key_struct: bool,
     ) -> (Vec<QueryCandidate>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             return (
@@ -1890,10 +1884,11 @@ impl DatastoreStorage {
                             .and_then(|entities| entities.get(&key_struct))
                             .or_else(|| self.entities.get(&key_struct))
                             .map(|entity_metadata| {
-                                QueryCandidate::from_stored_entity(
+                                let key_struct = retain_key_struct.then_some(key_struct);
+                                QueryCandidate {
                                     key_struct,
-                                    Arc::clone(entity_metadata),
-                                )
+                                    entity_metadata: Arc::clone(entity_metadata),
+                                }
                             })
                     })
                     .collect(),
@@ -1917,10 +1912,11 @@ impl DatastoreStorage {
                     }
                 })
                 .map(|(key_struct, entity_metadata)| {
-                    QueryCandidate::from_stored_entity(
-                        key_struct.clone(),
-                        Arc::clone(entity_metadata),
-                    )
+                    let key_struct = retain_key_struct.then(|| key_struct.clone());
+                    QueryCandidate {
+                        key_struct,
+                        entity_metadata: Arc::clone(entity_metadata),
+                    }
                 })
                 .collect()
         } else if !self.scoped_entities.is_empty() {
@@ -1945,10 +1941,11 @@ impl DatastoreStorage {
                     }
                 })
                 .map(|(key_struct, entity_metadata)| {
-                    QueryCandidate::from_stored_entity(
-                        key_struct.clone(),
-                        Arc::clone(entity_metadata),
-                    )
+                    let key_struct = retain_key_struct.then(|| key_struct.clone());
+                    QueryCandidate {
+                        key_struct,
+                        entity_metadata: Arc::clone(entity_metadata),
+                    }
                 })
                 .collect()
         };
@@ -2258,7 +2255,7 @@ impl DatastoreStorage {
     ) -> crate::google::datastore::v1::QueryResultBatch {
         let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
         let (candidates, candidates_prefiltered) =
-            self.query_candidates(&project_id_filter, &kind_name, filter_type.as_ref());
+            self.query_candidates(&project_id_filter, &kind_name, filter_type.as_ref(), true);
         Self::get_entities_from_candidates(
             candidates,
             filter_type,
