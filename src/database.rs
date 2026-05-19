@@ -2151,18 +2151,16 @@ impl DatastoreStorage {
                 (next_offset as u32 + 1).to_be_bytes().to_vec()
             };
 
-            let cursor_clone = cursor_value.clone();
-
             results.push(EntityResult {
                 entity: Some(result_entity),
-                create_time: Some(entity_metadata.create_time.clone()),
-                update_time: Some(entity_metadata.update_time.clone()),
-                cursor: cursor_value,
-                version: entity_metadata.version as i64,
+                create_time: None,
+                update_time: None,
+                cursor: Vec::new(),
+                version: 0,
             });
             current_entities_payload_size += entity_size_bytes;
             next_offset += 1;
-            last_cursor_bytes = Some(cursor_clone);
+            last_cursor_bytes = Some(cursor_value);
         }
 
         let final_cursor_offset = next_offset;
