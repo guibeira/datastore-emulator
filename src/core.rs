@@ -208,28 +208,28 @@ pub async fn commit(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: CommitRequest,
 ) -> Result<CommitResponse, Status> {
+    let mutation_count = req.mutations.len();
     let mut storage = storage.write().await;
-    let mut mutation_results = Vec::new();
+    let mut mutation_results = Vec::with_capacity(mutation_count);
+    let commit_time = system_time_to_timestamp(SystemTime::now());
 
     // Handle transaction if present
     let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
         match transaction_selector {
-            TransactionSelector::Transaction(tx_bytes) => {
-                match String::from_utf8(tx_bytes.clone()) {
-                    Ok(id) => Some(id),
-                    Err(_) => {
-                        return Err(Status::invalid_argument("Invalid transaction ID format"));
-                    }
+            TransactionSelector::Transaction(tx_bytes) => match String::from_utf8(tx_bytes) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    return Err(Status::invalid_argument("Invalid transaction ID format"));
                 }
-            }
+            },
             TransactionSelector::SingleUseTransaction(_) => None,
         }
     } else {
         None
     };
 
-    if let Some(tx_id) = transaction_id.clone() {
-        if storage.transactions.get(&tx_id).is_some() {
+    if let Some(tx_id) = transaction_id.as_ref() {
+        if storage.transactions.get(tx_id).is_some() {
             tracing::info!("Committing transaction: {}", tx_id);
         } else {
             return Err(Status::not_found(format!(
@@ -242,45 +242,43 @@ pub async fn commit(
     for mutation in req.mutations {
         if let Some(ref mutation) = mutation.operation {
             match mutation {
-                Operation::Insert(entity) => match storage.insert_entity(entity) {
-                    Ok((final_key, metadata)) => {
-                        mutation_results.push(MutationResult {
-                            key: Some(final_key),
-                            version: metadata.version as i64,
-                            create_time: Some(metadata.create_time.clone()),
-                            update_time: Some(metadata.update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                Operation::Insert(entity) => {
+                    match storage.insert_entity_at(entity, commit_time.clone()) {
+                        Ok((final_key, metadata)) => {
+                            mutation_results.push(MutationResult {
+                                key: Some(final_key),
+                                version: metadata.version as i64,
+                                create_time: Some(metadata.create_time.clone()),
+                                update_time: Some(metadata.update_time.clone()),
+                                conflict_detected: false,
+                                transform_results: vec![],
+                            });
+                        }
+                        Err(status) => {
+                            return Err(status);
+                        }
                     }
-                    Err(status) => {
-                        return Err(status);
-                    }
-                },
+                }
                 Operation::Update(entity) => {
                     let Some(key) = entity.key.as_ref() else {
-                        return Err(Status::invalid_argument(
-                            "Entity missing key for update",
-                        ));
+                        return Err(Status::invalid_argument("Entity missing key for update"));
                     };
                     let key_struct = KeyStruct::from_datastore_key(key);
 
-                    let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct) else {
+                    let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct)
+                    else {
                         return Err(Status::not_found("Entity not found for update"));
                     };
 
-                    let timestamp_now = system_time_to_timestamp(SystemTime::now());
                     let existing_entity_metadata = Arc::make_mut(existing_entity_metadata);
-                    let previous_entity = std::mem::replace(
-                        &mut existing_entity_metadata.entity,
-                        entity.clone(),
-                    );
+                    let previous_entity =
+                        std::mem::replace(&mut existing_entity_metadata.entity, entity.clone());
                     existing_entity_metadata.version += 1;
-                    existing_entity_metadata.update_time = timestamp_now.clone();
+                    existing_entity_metadata.update_time = commit_time.clone();
 
                     let version = existing_entity_metadata.version;
                     let create_time = existing_entity_metadata.create_time.clone();
-                    let update_time = timestamp_now;
+                    let update_time = commit_time.clone();
 
                     storage.remove_from_indexes(&key_struct, &previous_entity);
                     storage.update_indexes(&key_struct, entity);
@@ -296,9 +294,7 @@ pub async fn commit(
                 }
                 Operation::Upsert(entity) => {
                     let Some(key) = entity.key.as_ref() else {
-                        return Err(Status::invalid_argument(
-                            "Entity missing key for upsert",
-                        ));
+                        return Err(Status::invalid_argument("Entity missing key for upsert"));
                     };
 
                     let key_is_incomplete = key
@@ -307,7 +303,8 @@ pub async fn commit(
                         .any(|path_element| path_element.id_type.is_none());
 
                     if key_is_incomplete {
-                        let (final_key, metadata) = storage.insert_entity(entity)?;
+                        let (final_key, metadata) =
+                            storage.insert_entity_at(entity, commit_time.clone())?;
                         mutation_results.push(MutationResult {
                             key: Some(final_key),
                             version: metadata.version as i64,
@@ -319,24 +316,18 @@ pub async fn commit(
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(key);
 
-                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
-
                         let mut observe_key_counters = false;
                         let entry = storage.entities.entry(key_struct.clone());
                         let version;
                         let create_time;
-                        let update_time = timestamp_now.clone();
+                        let update_time = commit_time.clone();
                         let mut previous_entity: Option<Entity> = None;
 
                         match entry {
-                            std::collections::btree_map::Entry::Occupied(
-                                mut occupied_entry,
-                            ) => {
+                            std::collections::btree_map::Entry::Occupied(mut occupied_entry) => {
                                 let metadata = Arc::make_mut(occupied_entry.get_mut());
-                                previous_entity = Some(std::mem::replace(
-                                    &mut metadata.entity,
-                                    entity.clone(),
-                                ));
+                                previous_entity =
+                                    Some(std::mem::replace(&mut metadata.entity, entity.clone()));
                                 metadata.version += 1;
                                 metadata.update_time = update_time.clone();
                                 version = metadata.version;
@@ -346,7 +337,7 @@ pub async fn commit(
                                 let new_metadata = EntityWithMetadata {
                                     entity: entity.clone(),
                                     version: 1,
-                                    create_time: timestamp_now.clone(),
+                                    create_time: commit_time.clone(),
                                     update_time: update_time.clone(),
                                 };
                                 version = new_metadata.version;
@@ -376,14 +367,12 @@ pub async fn commit(
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete)
-                    {
-                        let timestamp_now = system_time_to_timestamp(SystemTime::now());
+                    if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete) {
                         mutation_results.push(MutationResult {
                             key: Some(key_to_delete.clone()),
                             version: removed_entity_metadata.version as i64,
                             create_time: Some(removed_entity_metadata.create_time.clone()),
-                            update_time: Some(timestamp_now),
+                            update_time: Some(commit_time.clone()),
                             conflict_detected: false,
                             transform_results: vec![],
                         });
@@ -410,7 +399,6 @@ pub async fn commit(
     if let Some(tx_id) = transaction_id {
         storage.clean_transaction(&tx_id);
     }
-    let commit_time = system_time_to_timestamp(SystemTime::now());
 
     Ok(CommitResponse {
         mutation_results,
@@ -435,42 +423,23 @@ pub async fn begin_transaction(
     };
 
     // Generate a unique transaction ID and create transaction state
-    let transaction_id;
-    {
+    let transaction_bytes = {
         let mut storage = storage.write().await;
 
         // Generate transaction ID using timestamp and current counter
         let counter = storage
             .transaction_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
-
-        // Check if the transaction is read-only
-        let transaction_options = req.transaction_options.unwrap_or_default();
-        let read_only = if let Some(mode) = transaction_options.mode {
-            match mode {
-                crate::google::datastore::v1::transaction_options::Mode::ReadOnly(_) => true,
-                crate::google::datastore::v1::transaction_options::Mode::ReadWrite(_) => false,
-            }
-        } else {
-            // Default to read-write if no mode is specified
-            false
-        };
+        let transaction_id = format!("tx-{}-{}", timestamp.seconds, counter);
+        let transaction_bytes = transaction_id.as_bytes().to_vec();
 
         // Create a new transaction state
-        let transaction_state = TransactionState {
-            mutations: Vec::new(),
-            snapshot: HashMap::new(),
-            timestamp,
-            read_only,
-        };
+        let transaction_state = TransactionState;
 
-        storage
-            .transactions
-            .insert(transaction_id.clone(), transaction_state);
-    }
+        storage.transactions.insert(transaction_id, transaction_state);
+        transaction_bytes
+    };
 
-    let transaction_bytes = transaction_id.into_bytes();
     let transaction_response = BeginTransactionResponse {
         transaction: transaction_bytes,
     };
@@ -485,7 +454,7 @@ pub async fn rollback(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RollbackRequest,
 ) -> Result<RollbackResponse, Status> {
-    let transaction_id = match String::from_utf8(req.transaction.clone()) {
+    let transaction_id = match String::from_utf8(req.transaction) {
         Ok(id) => id,
         Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
     };

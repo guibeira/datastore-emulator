@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::sync::{Arc, atomic::AtomicI64};
 
-use crate::google::datastore::v1::{Entity, EntityResult, Key, Mutation};
+use crate::google::datastore::v1::{Entity, EntityResult, Key};
 use crate::leveldb::LogReader; // Added to resolve error E0433
 use bincode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
@@ -924,12 +924,7 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
 
 // Transaction state
 #[derive(Debug)]
-pub struct TransactionState {
-    pub mutations: Vec<Mutation>,
-    pub snapshot: HashMap<KeyStruct, EntityWithMetadata>,
-    pub timestamp: pbjson_types::Timestamp,
-    pub read_only: bool,
-}
+pub struct TransactionState;
 
 #[derive(Clone)]
 pub(crate) struct QueryCandidate {
@@ -1294,6 +1289,22 @@ impl DatastoreStorage {
         &mut self,
         entity: &Entity,
     ) -> Result<(Key, Arc<EntityWithMetadata>), tonic::Status> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let timestamp_now = pbjson_types::Timestamp {
+            seconds: now.as_secs() as i64,
+            nanos: (now.as_nanos() % 1_000_000_000) as i32,
+        };
+
+        self.insert_entity_at(entity, timestamp_now)
+    }
+
+    pub(crate) fn insert_entity_at(
+        &mut self,
+        entity: &Entity,
+        timestamp_now: pbjson_types::Timestamp,
+    ) -> Result<(Key, Arc<EntityWithMetadata>), tonic::Status> {
         let Some(original_key) = entity.key.as_ref() else {
             return Err(tonic::Status::invalid_argument("Entity missing key"));
         };
@@ -1321,14 +1332,6 @@ impl DatastoreStorage {
 
         let mut db_entity = entity.clone();
         db_entity.key = Some(key_with_new_id.clone());
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        let timestamp_now = pbjson_types::Timestamp {
-            seconds: now.as_secs() as i64,
-            nanos: (now.as_nanos() % 1_000_000_000) as i32,
-        };
 
         let entity_metadata = Arc::new(EntityWithMetadata {
             entity: db_entity,
