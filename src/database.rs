@@ -2125,7 +2125,7 @@ impl DatastoreStorage {
         let mut current_entities_payload_size: usize = 0;
         let mut new_more_results_state = MoreResultsType::NoMoreResults;
         let mut next_offset = start_index;
-        let mut last_cursor_bytes: Option<Vec<u8>> = None;
+        let mut last_cursor_key: Option<&KeyStruct> = None;
 
         let is_keys_only = !projection.is_empty()
             && projection
@@ -2181,13 +2181,6 @@ impl DatastoreStorage {
                 entity_metadata.entity.clone()
             };
 
-            let cursor_value = if let Some(key_struct) = candidate.key_struct.as_ref() {
-                bincode::serde::encode_to_vec(key_struct, bincode::config::standard())
-                    .unwrap_or_else(|_| (next_offset as u32 + 1).to_be_bytes().to_vec())
-            } else {
-                (next_offset as u32 + 1).to_be_bytes().to_vec()
-            };
-
             results.push(EntityResult {
                 entity: Some(result_entity),
                 create_time: None,
@@ -2197,14 +2190,17 @@ impl DatastoreStorage {
             });
             current_entities_payload_size += entity_size_bytes;
             next_offset += 1;
-            last_cursor_bytes = Some(cursor_value);
+            last_cursor_key = candidate.key_struct.as_ref();
         }
 
         let final_cursor_offset = next_offset;
 
         let end_cursor = {
-            if let Some(cursor_bytes) = last_cursor_bytes {
-                cursor_bytes
+            if let Some(key_struct) = last_cursor_key {
+                bincode::serde::encode_to_vec(key_struct, bincode::config::standard())
+                    .unwrap_or_else(|_| (final_cursor_offset as u32).to_be_bytes().to_vec())
+            } else if !results.is_empty() {
+                (final_cursor_offset as u32).to_be_bytes().to_vec()
             } else if final_cursor_offset >= db_entities_count {
                 vec![]
             } else {
