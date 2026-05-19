@@ -1662,7 +1662,7 @@ impl DatastoreStorage {
 
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_by(|a, b| {
+            filtered_entities.sort_unstable_by(|a, b| {
                 let mut final_ordering = Ordering::Equal;
                 for order_by in &order {
                     if final_ordering != Ordering::Equal {
