@@ -1720,29 +1720,37 @@ impl DatastoreStorage {
         }
 
         if !distinct_on.is_empty() {
-            let mut seen_signatures = HashSet::new();
+            let mut seen_signatures: HashSet<Vec<u8>> = HashSet::new();
             let mut distinct_entities = Vec::new();
 
             for candidate in filtered_entities.into_iter() {
-                let mut signature_parts = Vec::with_capacity(distinct_on.len());
+                let mut signature: Vec<u8> = Vec::new();
 
                 for prop in &distinct_on {
                     if prop.name == "__key__" {
+                        signature.push(1);
                         if let Some(key_struct) = candidate.key_struct.as_ref() {
-                            signature_parts.push(format!("KEY:{:?}", key_struct));
-                        } else {
-                            signature_parts.push("KEY:<missing>".to_string());
+                            bincode::serde::encode_into_std_write(
+                                key_struct,
+                                &mut signature,
+                                bincode::config::standard(),
+                            )
+                            .expect("encode distinct __key__ signature");
                         }
                     } else if let Some(value) =
                         candidate.entity_metadata.entity.properties.get(&prop.name)
                     {
-                        signature_parts.push(format!("{:?}", value));
+                        signature.push(2);
+                        value
+                            .encode_length_delimited(&mut signature)
+                            .expect("encode distinct value signature");
                     } else {
-                        signature_parts.push(format!("{}:<missing>", prop.name));
+                        signature.push(3);
+                        signature.extend_from_slice(prop.name.as_bytes());
                     }
+                    signature.push(0xFF);
                 }
 
-                let signature = signature_parts.join("|");
                 if seen_signatures.insert(signature) {
                     distinct_entities.push(candidate);
                 }

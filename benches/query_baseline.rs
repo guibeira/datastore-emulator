@@ -213,6 +213,22 @@ fn bench_cases() -> Vec<BenchCase> {
                 ..Default::default()
             },
         },
+        BenchCase {
+            name: "distinct_on_region_bucket",
+            query: Query {
+                kind: kind(),
+                distinct_on: vec![
+                    PropertyReference {
+                        name: "region".to_string(),
+                    },
+                    PropertyReference {
+                        name: "bucket".to_string(),
+                    },
+                ],
+                order: vec![order_by("region"), order_by("bucket")],
+                ..Default::default()
+            },
+        },
     ]
 }
 
