@@ -2,7 +2,7 @@ use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, Transacti
 use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
-    EntityResult, ExecutionStats, ExplainMetrics, Filter, LookupRequest, LookupResponse,
+    EntityResult, ExecutionStats, ExplainMetrics, Filter, Key, LookupRequest, LookupResponse,
     MutationResult, PlanSummary, PropertyOrder, PropertyReference, ReserveIdsRequest,
     ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
     RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse, Value,
@@ -44,6 +44,23 @@ fn next_transaction_id(prefix: &str) -> String {
         .as_secs();
     let counter = TRANSACTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{timestamp}-{counter}")
+}
+
+fn key_is_incomplete(key: &Key) -> bool {
+    key.path
+        .iter()
+        .any(|path_element| path_element.id_type.is_none())
+}
+
+fn commit_mutation_result(key: Option<Key>) -> MutationResult {
+    MutationResult {
+        key,
+        version: 0,
+        create_time: None,
+        update_time: None,
+        conflict_detected: false,
+        transform_results: Vec::new(),
+    }
 }
 
 /// Walk a filter and collect property names referenced by any inequality
@@ -262,16 +279,11 @@ pub async fn commit(
         if let Some(ref mutation) = mutation.operation {
             match mutation {
                 Operation::Insert(entity) => {
+                    let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
                     match storage.insert_entity_at(entity, commit_time.clone()) {
-                        Ok((final_key, metadata)) => {
-                            mutation_results.push(MutationResult {
-                                key: Some(final_key),
-                                version: metadata.version as i64,
-                                create_time: Some(metadata.create_time.clone()),
-                                update_time: Some(metadata.update_time.clone()),
-                                conflict_detected: false,
-                                transform_results: vec![],
-                            });
+                        Ok((final_key, _metadata)) => {
+                            mutation_results
+                                .push(commit_mutation_result(allocates_key.then_some(final_key)));
                         }
                         Err(status) => {
                             return Err(status);
@@ -290,14 +302,13 @@ pub async fn commit(
                     };
 
                     let create_time = existing_entity_metadata.create_time.clone();
-                    let update_time = commit_time.clone();
                     let version = existing_entity_metadata.version + 1;
                     let previous_entity = existing_entity_metadata.entity.clone();
                     let updated_metadata = Arc::new(EntityWithMetadata {
                         entity: entity.clone(),
                         version,
-                        create_time: create_time.clone(),
-                        update_time: update_time.clone(),
+                        create_time,
+                        update_time: commit_time.clone(),
                     });
 
                     storage
@@ -307,68 +318,45 @@ pub async fn commit(
 
                     storage.replace_indexes(&key_struct, &previous_entity, entity);
 
-                    mutation_results.push(MutationResult {
-                        key: entity.key.clone(),
-                        version: version as i64,
-                        create_time: Some(create_time),
-                        update_time: Some(update_time),
-                        conflict_detected: false,
-                        transform_results: vec![],
-                    });
+                    mutation_results.push(commit_mutation_result(None));
                 }
                 Operation::Upsert(entity) => {
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for upsert"));
                     };
 
-                    let key_is_incomplete = key
-                        .path
-                        .iter()
-                        .any(|path_element| path_element.id_type.is_none());
+                    let allocates_key = key_is_incomplete(key);
 
-                    if key_is_incomplete {
-                        let (final_key, metadata) =
+                    if allocates_key {
+                        let (final_key, _metadata) =
                             storage.insert_entity_at(entity, commit_time.clone())?;
-                        mutation_results.push(MutationResult {
-                            key: Some(final_key),
-                            version: metadata.version as i64,
-                            create_time: Some(metadata.create_time.clone()),
-                            update_time: Some(metadata.update_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                        mutation_results.push(commit_mutation_result(Some(final_key)));
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(key);
 
-                        let version;
-                        let create_time;
-                        let update_time = commit_time.clone();
                         let previous_entity;
                         let observe_key_counters;
 
                         let metadata = if let Some(previous_metadata) =
                             storage.entities.get(&key_struct).cloned()
                         {
-                            version = previous_metadata.version + 1;
-                            create_time = previous_metadata.create_time.clone();
+                            let version = previous_metadata.version + 1;
                             previous_entity = Some(previous_metadata.entity.clone());
                             observe_key_counters = false;
                             Arc::new(EntityWithMetadata {
                                 entity: entity.clone(),
                                 version,
-                                create_time: create_time.clone(),
-                                update_time: update_time.clone(),
+                                create_time: previous_metadata.create_time.clone(),
+                                update_time: commit_time.clone(),
                             })
                         } else {
-                            version = 1;
-                            create_time = commit_time.clone();
                             previous_entity = None;
                             observe_key_counters = true;
                             Arc::new(EntityWithMetadata {
                                 entity: entity.clone(),
-                                version,
-                                create_time: create_time.clone(),
-                                update_time: update_time.clone(),
+                                version: 1,
+                                create_time: commit_time.clone(),
+                                update_time: commit_time.clone(),
                             })
                         };
 
@@ -388,39 +376,18 @@ pub async fn commit(
                             storage.update_indexes(&key_struct, entity);
                         }
 
-                        mutation_results.push(MutationResult {
-                            key: Some(key.clone()),
-                            version: version as i64,
-                            create_time: Some(create_time),
-                            update_time: Some(update_time),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                        mutation_results.push(commit_mutation_result(None));
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if let Some(removed_entity_metadata) = storage.delete_entity(key_to_delete) {
-                        mutation_results.push(MutationResult {
-                            key: Some(key_to_delete.clone()),
-                            version: removed_entity_metadata.version as i64,
-                            create_time: Some(removed_entity_metadata.create_time.clone()),
-                            update_time: Some(commit_time.clone()),
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                    if storage.delete_entity(key_to_delete).is_some() {
+                        mutation_results.push(commit_mutation_result(None));
                     } else {
                         tracing::warn!(
                             "Entity not found for deletion with key: {:?}",
                             key_to_delete.path
                         );
-                        mutation_results.push(MutationResult {
-                            key: Some(key_to_delete.clone()),
-                            version: 0,
-                            create_time: None,
-                            update_time: None,
-                            conflict_detected: false,
-                            transform_results: vec![],
-                        });
+                        mutation_results.push(commit_mutation_result(None));
                     }
                 }
             }
