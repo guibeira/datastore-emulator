@@ -1065,6 +1065,8 @@ pub struct DatastoreStorage {
     pub entities: BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
     // Secondary view used to avoid full-store scans when a query targets one project/kind.
     pub scoped_entities: HashMap<(String, String), BTreeMap<KeyStruct, Arc<EntityWithMetadata>>>,
+    // Secondary view for ancestor queries, keyed by (project, descendant kind, ancestor key).
+    pub ancestor_index: HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>>,
     // Indexes for efficient queries
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
@@ -1123,6 +1125,34 @@ impl DatastoreStorage {
                                     }
                                 }
                                 return Some(result);
+                            }
+                            None
+                        }
+                        11 => {
+                            if let Some(ValueType::KeyValue(key)) = &filter_value.value_type {
+                                let ancestor_key_struct = KeyStruct::from_datastore_key(key);
+                                if ancestor_key_struct.project_id != project_id
+                                    || ancestor_key_struct.path_elements.is_empty()
+                                {
+                                    return Some(BTreeSet::new());
+                                }
+                                if self.ancestor_index.is_empty()
+                                    && self.scoped_entities.is_empty()
+                                    && !self.entities.is_empty()
+                                {
+                                    return None;
+                                }
+
+                                return Some(
+                                    self.ancestor_index
+                                        .get(&(
+                                            project_id.to_string(),
+                                            kind_name.to_string(),
+                                            ancestor_key_struct,
+                                        ))
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                );
                             }
                             None
                         }
@@ -1327,6 +1357,8 @@ impl DatastoreStorage {
             (String, String),
             BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
         > = HashMap::new();
+        let mut new_ancestor_index: HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>> =
+            HashMap::new();
         for (key_struct, metadata) in &self.entities {
             for (prop_name, prop_value) in &metadata.entity.properties {
                 if !prop_value.exclude_from_indexes
@@ -1347,9 +1379,11 @@ impl DatastoreStorage {
                     .or_default()
                     .insert(key_struct.clone(), Arc::clone(metadata));
             }
+            Self::add_ancestor_index_entries(&mut new_ancestor_index, key_struct);
         }
         self.indexes = new_indexes;
         self.scoped_entities = new_scoped_entities;
+        self.ancestor_index = new_ancestor_index;
         self.rebuild_entity_id_counters();
 
         let end_time = SystemTime::now();
@@ -1462,6 +1496,7 @@ impl DatastoreStorage {
         self.entities
             .insert(final_key_struct.clone(), Arc::clone(&entity_metadata));
         self.upsert_scoped_entity(&final_key_struct, Arc::clone(&entity_metadata));
+        self.add_ancestor_indexes(&final_key_struct);
         self.update_indexes(&final_key_struct, &entity_metadata.entity);
         if let Some(ref key) = entity_metadata.entity.key {
             self.observe_key_id(key);
@@ -1853,6 +1888,8 @@ impl DatastoreStorage {
                     )
                 })
                 .collect()
+        } else if !self.scoped_entities.is_empty() {
+            Vec::new()
         } else {
             self.entities
                 .iter()
@@ -2063,7 +2100,15 @@ impl DatastoreStorage {
         for candidate in filtered_entities.iter().skip(start_index) {
             let entity_metadata = candidate.entity_metadata.as_ref();
             // Apply limit and payload size checks
-            let entity_size_bytes = entity_metadata.entity.encoded_len(); // This might need adjustment for projections
+            let entity_size_bytes = if is_keys_only {
+                entity_metadata
+                    .entity
+                    .key
+                    .as_ref()
+                    .map_or(0, Message::encoded_len)
+            } else {
+                entity_metadata.entity.encoded_len()
+            };
             if !results.is_empty()
                 && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
             {
@@ -2304,6 +2349,71 @@ impl DatastoreStorage {
             .insert(key_struct.clone(), entity_metadata);
     }
 
+    fn add_ancestor_index_entries(
+        ancestor_index: &mut HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>>,
+        key_struct: &KeyStruct,
+    ) {
+        let Some((descendant_kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+        if key_struct.path_elements.len() <= 1 {
+            return;
+        }
+
+        for ancestor_len in 1..key_struct.path_elements.len() {
+            let ancestor_key = KeyStruct {
+                project_id: key_struct.project_id.clone(),
+                namespace: key_struct.namespace.clone(),
+                path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
+            };
+            ancestor_index
+                .entry((
+                    key_struct.project_id.clone(),
+                    descendant_kind.clone(),
+                    ancestor_key,
+                ))
+                .or_default()
+                .insert(key_struct.clone());
+        }
+    }
+
+    pub(crate) fn add_ancestor_indexes(&mut self, key_struct: &KeyStruct) {
+        Self::add_ancestor_index_entries(&mut self.ancestor_index, key_struct);
+    }
+
+    fn remove_ancestor_indexes(&mut self, key_struct: &KeyStruct) {
+        let Some((descendant_kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+        if key_struct.path_elements.len() <= 1 {
+            return;
+        }
+
+        let mut empty_entries = Vec::new();
+        for ancestor_len in 1..key_struct.path_elements.len() {
+            let ancestor_key = KeyStruct {
+                project_id: key_struct.project_id.clone(),
+                namespace: key_struct.namespace.clone(),
+                path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
+            };
+            let index_key = (
+                key_struct.project_id.clone(),
+                descendant_kind.clone(),
+                ancestor_key,
+            );
+            if let Some(indexed_keys) = self.ancestor_index.get_mut(&index_key) {
+                indexed_keys.remove(key_struct);
+                if indexed_keys.is_empty() {
+                    empty_entries.push(index_key);
+                }
+            }
+        }
+
+        for index_key in empty_entries {
+            self.ancestor_index.remove(&index_key);
+        }
+    }
+
     fn remove_scoped_entity(&mut self, key_struct: &KeyStruct) {
         let Some((kind, _)) = key_struct.path_elements.last() else {
             return;
@@ -2327,6 +2437,7 @@ impl DatastoreStorage {
 
         let removed_entity_metadata = self.entities.remove(&key_struct_to_delete)?;
         self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
+        self.remove_ancestor_indexes(&key_struct_to_delete);
         self.remove_scoped_entity(&key_struct_to_delete);
         Some(removed_entity_metadata)
     }

@@ -31,6 +31,8 @@ use tokio::sync::RwLock;
 
 const PROJECT: &str = "bench-project";
 const KIND: &str = "BenchItem";
+const SIGNUP_KIND: &str = "SignUpModel";
+const SIGNUP_ROW_KIND: &str = "SignUpRow";
 const DEFAULT_ENTITY_COUNT: usize = 10_000;
 const DEFAULT_MIXED_SCOPE_ENTITIES_PER_KIND: usize = 1_000;
 const MIXED_SCOPE_PROJECTS: usize = 5;
@@ -52,6 +54,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mixed_scope_storage = Arc::new(RwLock::new(seed_mixed_scope_storage(
         mixed_scope_entities_per_kind,
     )));
+    let ancestor_storage = Arc::new(RwLock::new(seed_ancestor_storage(500, 20)));
+    let missing_kind_keys_only_query = keys_only_query_for_kind("MissingCleanupKind");
+    let ancestor_query = ancestor_query_for(250);
 
     runtime.block_on(async {
         for case in bench_cases() {
@@ -60,6 +65,8 @@ fn criterion_benchmark(c: &mut Criterion) {
         for case in mixed_scope_bench_cases() {
             black_box(execute_query(&mixed_scope_storage, &case.query).await);
         }
+        black_box(execute_query(&mixed_scope_storage, &missing_kind_keys_only_query).await);
+        black_box(execute_query(&ancestor_storage, &ancestor_query).await);
     });
 
     let mut group = c.benchmark_group("query_baseline");
@@ -86,6 +93,20 @@ fn criterion_benchmark(c: &mut Criterion) {
             });
         });
     }
+
+    group.bench_function("missing_kind_keys_only_cleanup", |b| {
+        let query = missing_kind_keys_only_query.clone();
+        b.to_async(&runtime).iter(|| async {
+            black_box(execute_query(&mixed_scope_storage, black_box(&query)).await);
+        });
+    });
+
+    group.bench_function("ancestor_query_rows_20", |b| {
+        let query = ancestor_query.clone();
+        b.to_async(&runtime).iter(|| async {
+            black_box(execute_query(&ancestor_storage, black_box(&query)).await);
+        });
+    });
 
     let lookup_keys: Vec<Key> = (0..100).map(|i| key_for(i * 100)).collect();
     group.bench_function("lookup_batch_100", |b| {
@@ -571,6 +592,44 @@ fn seed_mixed_scope_storage(entities_per_kind: usize) -> DatastoreStorage {
     storage
 }
 
+fn seed_ancestor_storage(parent_count: usize, rows_per_parent: usize) -> DatastoreStorage {
+    let mut storage = DatastoreStorage::default();
+
+    for parent_idx in 0..parent_count {
+        let parent = Entity {
+            key: Some(signup_key(parent_idx)),
+            properties: HashMap::from([(
+                "title".to_string(),
+                value(ValueType::StringValue(format!("signup-{parent_idx}"))),
+            )]),
+        };
+        storage
+            .insert_entity(&parent)
+            .expect("seed ancestor parent entity");
+
+        for row_idx in 0..rows_per_parent {
+            let row = Entity {
+                key: Some(signup_row_key(parent_idx, row_idx)),
+                properties: HashMap::from([
+                    (
+                        "user_id".to_string(),
+                        value(ValueType::StringValue(format!("user-{}", row_idx % 5))),
+                    ),
+                    (
+                        "position_index".to_string(),
+                        value(ValueType::IntegerValue(row_idx as i64)),
+                    ),
+                ]),
+            };
+            storage
+                .insert_entity(&row)
+                .expect("seed ancestor child entity");
+        }
+    }
+
+    storage
+}
+
 fn key_for(idx: usize) -> Key {
     key_for_project_kind(PROJECT, KIND, idx)
 }
@@ -586,6 +645,64 @@ fn key_for_project_kind(project: &str, kind: &str, idx: usize) -> Key {
             kind: kind.to_string(),
             id_type: Some(IdType::Name(format!("entity-{idx:06}"))),
         }],
+    }
+}
+
+fn signup_key(idx: usize) -> Key {
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: PROJECT.to_string(),
+            database_id: String::new(),
+            namespace_id: String::new(),
+        }),
+        path: vec![PathElement {
+            kind: SIGNUP_KIND.to_string(),
+            id_type: Some(IdType::Id(idx as i64)),
+        }],
+    }
+}
+
+fn signup_row_key(parent_idx: usize, row_idx: usize) -> Key {
+    Key {
+        partition_id: Some(PartitionId {
+            project_id: PROJECT.to_string(),
+            database_id: String::new(),
+            namespace_id: String::new(),
+        }),
+        path: vec![
+            PathElement {
+                kind: SIGNUP_KIND.to_string(),
+                id_type: Some(IdType::Id(parent_idx as i64)),
+            },
+            PathElement {
+                kind: SIGNUP_ROW_KIND.to_string(),
+                id_type: Some(IdType::Name(format!("row-{row_idx:03}"))),
+            },
+        ],
+    }
+}
+
+fn keys_only_query_for_kind(kind_name: &str) -> Query {
+    Query {
+        kind: kind_named(kind_name),
+        projection: vec![Projection {
+            property: Some(PropertyReference {
+                name: "__key__".to_string(),
+            }),
+        }],
+        ..Default::default()
+    }
+}
+
+fn ancestor_query_for(parent_idx: usize) -> Query {
+    Query {
+        kind: kind_named(SIGNUP_ROW_KIND),
+        filter: Some(property_filter(
+            "__key__",
+            property_filter::Operator::HasAncestor,
+            value(ValueType::KeyValue(signup_key(parent_idx))),
+        )),
+        ..Default::default()
     }
 }
 
@@ -739,8 +856,12 @@ fn mixed_scope_bench_cases() -> Vec<BenchCase> {
 }
 
 fn kind() -> Vec<KindExpression> {
+    kind_named(KIND)
+}
+
+fn kind_named(kind_name: &str) -> Vec<KindExpression> {
     vec![KindExpression {
-        name: KIND.to_string(),
+        name: kind_name.to_string(),
     }]
 }
 

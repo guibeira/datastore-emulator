@@ -120,7 +120,8 @@ pub async fn run_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunQueryRequest,
 ) -> Result<RunQueryResponse, Status> {
-    let start = Instant::now();
+    let explain_requested = req.explain_options.is_some();
+    let start = explain_requested.then(Instant::now);
     let query_obj = match req.query_type {
         Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
         _ => return Err(Status::invalid_argument("Missing or invalid query")),
@@ -170,25 +171,22 @@ pub async fn run_query(
         query_obj.distinct_on.clone(),
         order,
     );
-    let mut fields = HashMap::new();
-    let amount_results = batch.entity_results.len() as i64;
+    let explain_metrics = if let Some(start) = start {
+        let mut fields = HashMap::new();
+        let amount_results = batch.entity_results.len() as i64;
 
-    fields.insert(
-        "Some key".to_string(),
-        ValueProps {
-            kind: Some(Kind::StringValue("Some value".to_string())),
-        },
-    );
-    let debug_stats = Struct {
-        fields: fields.clone(),
-    };
-    let execution_duration = start.elapsed();
+        fields.insert(
+            "Some key".to_string(),
+            ValueProps {
+                kind: Some(Kind::StringValue("Some value".to_string())),
+            },
+        );
+        let debug_stats = Struct {
+            fields: fields.clone(),
+        };
+        let execution_duration = start.elapsed();
 
-    Ok(RunQueryResponse {
-        transaction: vec![],
-        query: Some(query_obj),
-        batch: Some(batch),
-        explain_metrics: Some(ExplainMetrics {
+        Some(ExplainMetrics {
             plan_summary: Some(PlanSummary {
                 indexes_used: vec![Struct {
                     fields: fields.clone(),
@@ -200,7 +198,16 @@ pub async fn run_query(
                 read_operations: 10,
                 debug_stats: Some(debug_stats),
             }),
-        }),
+        })
+    } else {
+        None
+    };
+
+    Ok(RunQueryResponse {
+        transaction: vec![],
+        query: Some(query_obj),
+        batch: Some(batch),
+        explain_metrics,
     })
 }
 
@@ -360,6 +367,7 @@ pub async fn commit(
 
                         if observe_key_counters {
                             storage.observe_key_id(key);
+                            storage.add_ancestor_indexes(&key_struct);
                         }
 
                         if let Some(prev) = previous_entity {
