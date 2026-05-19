@@ -2,14 +2,19 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
-        ArrayValue, CommitRequest, Entity, Filter, Key, KindExpression, LookupRequest, Mutation,
-        PartitionId, Projection, PropertyFilter, PropertyOrder, PropertyReference, Query,
-        RunQueryRequest, Value,
+        AggregationQuery, ArrayValue, CommitRequest, Entity, Filter, Key, KindExpression,
+        LookupRequest, Mutation, PartitionId, Projection, PropertyFilter, PropertyOrder,
+        PropertyReference, Query, RunAggregationQueryRequest, RunQueryRequest, Value,
+        aggregation_query::{
+            Aggregation, QueryType as AggregationQueryType,
+            aggregation::{Count, Operator as AggOperator},
+        },
         commit_request::Mode,
         filter::FilterType,
         key::{PathElement, path_element::IdType},
         mutation::Operation,
         property_filter, property_order,
+        run_aggregation_query_request::QueryType as RunAggQueryType,
         run_query_request::QueryType,
         value::ValueType,
     },
@@ -106,6 +111,39 @@ fn criterion_benchmark(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+    });
+
+    let agg_query = AggregationQuery {
+        query_type: Some(AggregationQueryType::NestedQuery(Query {
+            kind: kind(),
+            filter: Some(property_filter(
+                "bucket",
+                property_filter::Operator::Equal,
+                value(ValueType::StringValue("bucket-42".to_string())),
+            )),
+            ..Default::default()
+        })),
+        aggregations: vec![Aggregation {
+            alias: "count".to_string(),
+            operator: Some(AggOperator::Count(Count { up_to: None })),
+        }],
+    };
+    group.bench_function("aggregation_count_bucket", |b| {
+        let aq = agg_query.clone();
+        b.to_async(&runtime).iter(|| {
+            let req = RunAggregationQueryRequest {
+                project_id: PROJECT.to_string(),
+                query_type: Some(RunAggQueryType::AggregationQuery(aq.clone())),
+                ..Default::default()
+            };
+            async {
+                black_box(
+                    core::run_aggregation_query(&storage, req)
+                        .await
+                        .expect("aggregation"),
+                );
+            }
+        });
     });
 
     let upsert_template = bench_entity_template();

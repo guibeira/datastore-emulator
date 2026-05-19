@@ -573,7 +573,7 @@ pub async fn run_aggregation_query(
     };
 
     // Get the base query if it exists
-    let base_query = match aggregation_query.clone().query_type {
+    let base_query = match aggregation_query.query_type.as_ref() {
         Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(
             query,
         )) => Some(query),
@@ -587,47 +587,51 @@ pub async fn run_aggregation_query(
     let read_time = system_time_to_timestamp(SystemTime::now());
 
     // Process each aggregation
-    let mut matching_entities = Vec::new();
+    let mut matching_entities: Vec<Arc<EntityWithMetadata>> = Vec::new();
 
-    if let Some(query) = &base_query {
-        // Get entities matching the kind filter
-        let filters = query
-            .filter
-            .as_ref()
-            .unwrap_or(&Filter { filter_type: None });
+    if let Some(query) = base_query {
+        let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.as_ref());
 
-        // Iterate over all entities and filter by project_id, kind and other filters
-        for (key_struct, entity_metadata) in storage.entities.iter() {
-            // Filter by project_id first
-            if key_struct.project_id != req.project_id {
-                continue;
-            }
-
-            // Check if the entity's kind matches any of the kinds in the query
-            let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
-            if entity_kind.is_none()
-                || !query
-                    .kind
-                    .iter()
-                    .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
-            {
-                continue; // Skip if kind doesn't match
-            }
-
-            // Check if the entity is found (key should always be present in EntityWithMetadata)
-            if entity_metadata.entity.key.is_none() {
-                // This case should ideally not happen if data is consistent
-                tracing::warn!("Entity found in storage without a key in its Entity struct.");
-                continue;
-            }
-
-            // Apply filters if present
-            if let Some(filter_type) = &filters.filter_type {
-                if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
-                    matching_entities.push(entity_metadata);
+        // Reuse the query candidate pipeline so index lookups apply to aggregation
+        // queries too. Multi-kind aggregations fall back to a scan because
+        // query_candidates is per-kind.
+        if query.kind.len() == 1 {
+            let kind_name = query.kind[0].name.as_str();
+            let (candidates, _) =
+                storage.query_candidates(&req.project_id, kind_name, filter_type);
+            matching_entities = candidates
+                .into_iter()
+                .filter(|c| c.entity_metadata.entity.key.is_some())
+                .map(|c| c.entity_metadata)
+                .collect();
+        } else {
+            for (key_struct, entity_metadata) in storage.entities.iter() {
+                if key_struct.project_id != req.project_id {
+                    continue;
                 }
-            } else {
-                matching_entities.push(entity_metadata); // No filter, include if kind matches
+
+                let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
+                if entity_kind.is_none()
+                    || !query
+                        .kind
+                        .iter()
+                        .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
+                {
+                    continue;
+                }
+
+                if entity_metadata.entity.key.is_none() {
+                    tracing::warn!("Entity found in storage without a key in its Entity struct.");
+                    continue;
+                }
+
+                if let Some(filter_type) = filter_type {
+                    if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
+                        matching_entities.push(Arc::clone(entity_metadata));
+                    }
+                } else {
+                    matching_entities.push(Arc::clone(entity_metadata));
+                }
             }
         }
     } else {

@@ -933,8 +933,8 @@ pub struct TransactionState {
 
 #[derive(Clone)]
 pub(crate) struct QueryCandidate {
-    key_struct: Option<KeyStruct>,
-    entity_metadata: Arc<EntityWithMetadata>,
+    pub(crate) key_struct: Option<KeyStruct>,
+    pub(crate) entity_metadata: Arc<EntityWithMetadata>,
 }
 
 impl QueryCandidate {
