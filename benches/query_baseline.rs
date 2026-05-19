@@ -2,8 +2,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
-        ArrayValue, Entity, Filter, Key, KindExpression, PartitionId, Projection, PropertyFilter,
-        PropertyOrder, PropertyReference, Query, RunQueryRequest, Value,
+        ArrayValue, Entity, Filter, Key, KindExpression, LookupRequest, PartitionId, Projection,
+        PropertyFilter, PropertyOrder, PropertyReference, Query, RunQueryRequest, Value,
         filter::FilterType,
         key::{PathElement, path_element::IdType},
         property_filter, property_order,
@@ -55,7 +55,25 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     }
 
+    let lookup_keys: Vec<Key> = (0..100).map(|i| key_for(i * 100)).collect();
+    group.bench_function("lookup_batch_100", |b| {
+        let keys = lookup_keys.clone();
+        b.to_async(&runtime).iter(|| async {
+            black_box(execute_lookup(&storage, black_box(&keys)).await);
+        });
+    });
+
     group.finish();
+}
+
+async fn execute_lookup(storage: &Arc<RwLock<DatastoreStorage>>, keys: &[Key]) -> usize {
+    let req = LookupRequest {
+        project_id: PROJECT.to_string(),
+        keys: keys.to_vec(),
+        ..Default::default()
+    };
+    let resp = core::lookup(storage, req).await.expect("lookup");
+    resp.found.len()
 }
 
 async fn execute_query(storage: &Arc<RwLock<DatastoreStorage>>, query: &Query) -> usize {

@@ -1413,21 +1413,9 @@ impl DatastoreStorage {
         // Therefore, removing the final `true` is safe, as the match should be exhaustive for valid FilterType.
     }
 
-    pub fn get_entity(&self, key: &Key) -> Option<EntityWithMetadata> {
+    pub fn get_entity(&self, key: &Key) -> Option<Arc<EntityWithMetadata>> {
         let key_struct = KeyStruct::from_datastore_key(key);
-
-        //Debug print items (optional, can be removed or adjusted)
-        // for (k_struct, entity_meta) in self.entities.iter() {
-        //     println!(
-        //         "Stored KeyStruct: {:?}, Entity Path: {:?}",
-        //         k_struct,
-        //         entity_meta.entity.key.as_ref().map(|k| &k.path)
-        //     );
-        // }
-
-        self.entities
-            .get(&key_struct)
-            .map(|metadata| metadata.as_ref().clone())
+        self.entities.get(&key_struct).cloned()
     }
     fn get_metadata(&self, metadata_key: &str, project_id: &str) -> Vec<EntityWithMetadata> {
         let mut results = Vec::new();
