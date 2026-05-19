@@ -237,63 +237,6 @@ fn resolve_property_path_recursive<'a>(
     }
 }
 
-/// Collects all indexable property paths from an entity, including nested paths.
-/// Returns tuples of (property_path, indexable_values).
-/// For example, for "organizations.key.consistentId", this would return:
-/// [("organizations.key.consistentId", vec!["value1", "value2", ...])]
-fn collect_nested_indexable_paths(
-    properties: &HashMap<String, Value>,
-    prefix: &str,
-) -> Vec<(String, Vec<String>)> {
-    let mut results = Vec::with_capacity(properties.len());
-
-    for (prop_name, prop_value) in properties {
-        if prop_value.exclude_from_indexes {
-            continue;
-        }
-
-        let full_path = if prefix.is_empty() {
-            prop_name.clone()
-        } else {
-            let mut s = String::with_capacity(prefix.len() + 1 + prop_name.len());
-            s.push_str(prefix);
-            s.push('.');
-            s.push_str(prop_name);
-            s
-        };
-
-        // Get indexable values for this property at its current level
-        let indexable_values = get_indexable_strings_for_value(prop_value);
-        if !indexable_values.is_empty() {
-            results.push((full_path.clone(), indexable_values));
-        }
-
-        // Recurse into nested entities
-        match &prop_value.value_type {
-            Some(ValueType::EntityValue(entity)) => {
-                results.extend(collect_nested_indexable_paths(
-                    &entity.properties,
-                    &full_path,
-                ));
-            }
-            Some(ValueType::ArrayValue(array)) => {
-                // For arrays, collect nested properties from each entity element
-                for item in &array.values {
-                    if let Some(ValueType::EntityValue(entity)) = &item.value_type {
-                        results.extend(collect_nested_indexable_paths(
-                            &entity.properties,
-                            &full_path,
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    results
-}
-
 fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
     let capacity = match &value.value_type {
         Some(ValueType::ArrayValue(array)) => array.values.len(),
@@ -329,6 +272,77 @@ fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
         }
     }
     values
+}
+
+fn for_each_indexable_string_for_value(value: &Value, mut visitor: impl FnMut(String)) {
+    if let Some(value_type) = &value.value_type {
+        let mut process_value = |v_type: &ValueType| match v_type {
+            ValueType::StringValue(s) => visitor(s.clone()),
+            ValueType::IntegerValue(i) => visitor(i.to_string()),
+            ValueType::DoubleValue(d) => visitor(d.to_string()),
+            ValueType::BooleanValue(b) => visitor(b.to_string()),
+            ValueType::TimestampValue(t) => {
+                if let Some(dt) = DateTime::from_timestamp(t.seconds, t.nanos as u32) {
+                    visitor(dt.to_rfc3339())
+                }
+            }
+            ValueType::KeyValue(k) => {
+                visitor(format!("{:?}", KeyStruct::from_datastore_key(k)))
+            }
+            _ => {}
+        };
+
+        match value_type {
+            ValueType::ArrayValue(array_value) => {
+                for v in &array_value.values {
+                    if let Some(inner_value_type) = &v.value_type {
+                        process_value(inner_value_type);
+                    }
+                }
+            }
+            other => process_value(other),
+        }
+    }
+}
+
+fn for_each_nested_indexable_path(
+    properties: &HashMap<String, Value>,
+    prefix: &str,
+    visitor: &mut impl FnMut(&str, String),
+) {
+    for (prop_name, prop_value) in properties {
+        if prop_value.exclude_from_indexes {
+            continue;
+        }
+
+        let full_path = if prefix.is_empty() {
+            prop_name.clone()
+        } else {
+            let mut s = String::with_capacity(prefix.len() + 1 + prop_name.len());
+            s.push_str(prefix);
+            s.push('.');
+            s.push_str(prop_name);
+            s
+        };
+
+        for_each_indexable_string_for_value(prop_value, |value_str| {
+            visitor(&full_path, value_str);
+        });
+
+        match &prop_value.value_type {
+            Some(ValueType::EntityValue(entity)) => {
+                for_each_nested_indexable_path(&entity.properties, &full_path, visitor);
+            }
+            Some(ValueType::ArrayValue(array)) => {
+                for item in &array.values {
+                    if let Some(ValueType::EntityValue(entity)) = &item.value_type {
+                        for_each_nested_indexable_path(&entity.properties, &full_path, visitor);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 enum PreparedKeyFilter {
@@ -2089,18 +2103,13 @@ impl DatastoreStorage {
             return;
         };
 
-        // Collect all indexable property paths including nested ones
-        let nested_paths = collect_nested_indexable_paths(&entity.properties, "");
-
-        for (prop_path, indexable_values) in nested_paths {
-            for value_str in indexable_values {
-                let index_key = (kind.clone(), prop_path.clone(), value_str);
-                self.indexes
-                    .entry(index_key)
-                    .or_default()
-                    .insert(key_struct.clone());
-            }
-        }
+        for_each_nested_indexable_path(&entity.properties, "", &mut |prop_path, value_str| {
+            let index_key = (kind.clone(), prop_path.to_string(), value_str);
+            self.indexes
+                .entry(index_key)
+                .or_default()
+                .insert(key_struct.clone());
+        });
     }
 
     pub fn remove_from_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
@@ -2108,17 +2117,12 @@ impl DatastoreStorage {
             return;
         };
 
-        // Collect all indexable property paths including nested ones
-        let nested_paths = collect_nested_indexable_paths(&entity.properties, "");
-
-        for (prop_path, indexable_values) in nested_paths {
-            for value_str in indexable_values {
-                let index_key = (kind.clone(), prop_path.clone(), value_str);
-                if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                    indexed_keys_set.remove(key_struct);
-                }
+        for_each_nested_indexable_path(&entity.properties, "", &mut |prop_path, value_str| {
+            let index_key = (kind.clone(), prop_path.to_string(), value_str);
+            if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                indexed_keys_set.remove(key_struct);
             }
-        }
+        });
     }
 
     pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<Arc<EntityWithMetadata>> {
