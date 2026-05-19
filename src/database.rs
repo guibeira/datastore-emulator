@@ -331,6 +331,74 @@ fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
     values
 }
 
+enum PreparedKeyFilter {
+    Compare(i32, KeyStruct),
+    In(Vec<KeyStruct>),
+    NotIn(Vec<KeyStruct>),
+}
+
+fn try_prepare_key_filter(filter: &FilterType) -> Option<PreparedKeyFilter> {
+    let FilterType::PropertyFilter(pf) = filter else {
+        return None;
+    };
+    if pf.op == 11 {
+        return None;
+    }
+    let property = pf.property.as_ref()?;
+    if property.name != "__key__" {
+        return None;
+    }
+    let value = pf.value.as_ref()?;
+
+    match (pf.op, &value.value_type) {
+        (op @ (1 | 2 | 3 | 4 | 5 | 9), Some(ValueType::KeyValue(k))) => Some(
+            PreparedKeyFilter::Compare(op, KeyStruct::from_datastore_key(k)),
+        ),
+        (6, Some(ValueType::ArrayValue(arr))) => {
+            let keys = arr
+                .values
+                .iter()
+                .filter_map(|v| match &v.value_type {
+                    Some(ValueType::KeyValue(k)) => Some(KeyStruct::from_datastore_key(k)),
+                    _ => None,
+                })
+                .collect();
+            Some(PreparedKeyFilter::In(keys))
+        }
+        (13, Some(ValueType::ArrayValue(arr))) => {
+            let keys = arr
+                .values
+                .iter()
+                .filter_map(|v| match &v.value_type {
+                    Some(ValueType::KeyValue(k)) => Some(KeyStruct::from_datastore_key(k)),
+                    _ => None,
+                })
+                .collect();
+            Some(PreparedKeyFilter::NotIn(keys))
+        }
+        _ => None,
+    }
+}
+
+fn match_prepared_key_filter(key_struct: &KeyStruct, kind: &PreparedKeyFilter) -> bool {
+    match kind {
+        PreparedKeyFilter::Compare(op, target) => {
+            let ord = key_struct.cmp(target);
+            match op {
+                1 => ord.is_lt(),
+                2 => ord.is_le(),
+                3 => ord.is_gt(),
+                4 => ord.is_ge(),
+                5 => ord.is_eq(),
+                9 => !ord.is_eq(),
+                _ => false,
+            }
+        }
+        PreparedKeyFilter::In(keys) => keys.iter().any(|k| k == key_struct),
+        PreparedKeyFilter::NotIn(keys) => !keys.iter().any(|k| k == key_struct),
+    }
+}
+
 fn match_key_against_filter(entity_key: &Key, filter_value: &Value, op: i32) -> bool {
     let entity_key_struct = KeyStruct::from_datastore_key(entity_key);
 
@@ -1638,6 +1706,8 @@ impl DatastoreStorage {
             );
         }
 
+        let prepared_key_filter = filter_type.and_then(try_prepare_key_filter);
+
         let candidates = self
             .entities
             .iter()
@@ -1648,10 +1718,14 @@ impl DatastoreStorage {
                         .last()
                         .is_some_and(|(k, _)| k == kind_name)
             })
-            .filter(|(_, entity_metadata)| {
-                filter_type.is_none_or(|filter_type| {
-                    DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
-                })
+            .filter(|(key_struct, entity_metadata)| {
+                if let Some(ref pkf) = prepared_key_filter {
+                    match_prepared_key_filter(key_struct, pkf)
+                } else {
+                    filter_type.is_none_or(|filter_type| {
+                        DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
+                    })
+                }
             })
             .map(|(key_struct, entity_metadata)| {
                 QueryCandidate::from_stored_entity(key_struct.clone(), Arc::clone(entity_metadata))
@@ -1672,11 +1746,20 @@ impl DatastoreStorage {
         distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
     ) -> crate::google::datastore::v1::QueryResultBatch {
-        let matches_filter = |entity_metadata: &EntityWithMetadata| -> bool {
+        let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
+
+        let matches_filter = |candidate: &QueryCandidate| -> bool {
             if candidates_prefiltered {
-                true
-            } else if let Some(ref filter_type) = filter_type {
-                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                return true;
+            }
+            if let Some(ref pkf) = prepared_key_filter {
+                let Some(ks) = candidate.key_struct.as_ref() else {
+                    return false;
+                };
+                return match_prepared_key_filter(ks, pkf);
+            }
+            if let Some(ref filter_type) = filter_type {
+                DatastoreStorage::apply_filter(candidate.entity_metadata.as_ref(), filter_type)
             } else {
                 true
             }
@@ -1686,7 +1769,7 @@ impl DatastoreStorage {
 
         let mut filtered_entities: Vec<QueryCandidate> = candidates
             .into_iter()
-            .filter(|candidate| matches_filter(candidate.entity_metadata.as_ref()))
+            .filter(|candidate| matches_filter(candidate))
             .collect();
 
         // 2. Sort entities
