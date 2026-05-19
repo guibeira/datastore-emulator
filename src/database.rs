@@ -245,7 +245,7 @@ fn collect_nested_indexable_paths(
     properties: &HashMap<String, Value>,
     prefix: &str,
 ) -> Vec<(String, Vec<String>)> {
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(properties.len());
 
     for (prop_name, prop_value) in properties {
         if prop_value.exclude_from_indexes {
@@ -255,7 +255,11 @@ fn collect_nested_indexable_paths(
         let full_path = if prefix.is_empty() {
             prop_name.clone()
         } else {
-            format!("{}.{}", prefix, prop_name)
+            let mut s = String::with_capacity(prefix.len() + 1 + prop_name.len());
+            s.push_str(prefix);
+            s.push('.');
+            s.push_str(prop_name);
+            s
         };
 
         // Get indexable values for this property at its current level
@@ -291,7 +295,11 @@ fn collect_nested_indexable_paths(
 }
 
 fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
-    let mut values = Vec::new();
+    let capacity = match &value.value_type {
+        Some(ValueType::ArrayValue(array)) => array.values.len(),
+        _ => 1,
+    };
+    let mut values = Vec::with_capacity(capacity);
     if let Some(value_type) = &value.value_type {
         let mut process_value = |v_type: &ValueType| match v_type {
             ValueType::StringValue(s) => values.push(s.clone()),

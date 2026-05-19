@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
@@ -63,7 +63,77 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     });
 
+    let insert_template = bench_entity_template();
+    group.bench_function("insert_entity_with_nested", |b| {
+        b.iter_batched(
+            || DatastoreStorage::default(),
+            |mut storage| {
+                storage
+                    .insert_entity(&insert_template)
+                    .expect("insert bench entity");
+                black_box(storage);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
+}
+
+fn bench_entity_template() -> Entity {
+    Entity {
+        key: Some(Key {
+            partition_id: Some(PartitionId {
+                project_id: PROJECT.to_string(),
+                database_id: String::new(),
+                namespace_id: String::new(),
+            }),
+            path: vec![PathElement {
+                kind: KIND.to_string(),
+                id_type: Some(IdType::Name("insert-bench-target".to_string())),
+            }],
+        }),
+        properties: HashMap::from([
+            (
+                "bucket".to_string(),
+                value(ValueType::StringValue("bucket-42".to_string())),
+            ),
+            (
+                "score".to_string(),
+                value(ValueType::IntegerValue(123)),
+            ),
+            (
+                "region".to_string(),
+                value(ValueType::StringValue("region-3".to_string())),
+            ),
+            (
+                "tags".to_string(),
+                value(ValueType::ArrayValue(ArrayValue {
+                    values: vec![
+                        value(ValueType::StringValue("tag-1".to_string())),
+                        value(ValueType::StringValue("tag-2".to_string())),
+                        value(ValueType::StringValue("tag-3".to_string())),
+                    ],
+                })),
+            ),
+            (
+                "profile".to_string(),
+                value(ValueType::EntityValue(Entity {
+                    key: None,
+                    properties: HashMap::from([
+                        (
+                            "tier".to_string(),
+                            value(ValueType::StringValue("tier-2".to_string())),
+                        ),
+                        (
+                            "country".to_string(),
+                            value(ValueType::StringValue("BR".to_string())),
+                        ),
+                    ]),
+                })),
+            ),
+        ]),
+    }
 }
 
 async fn execute_lookup(storage: &Arc<RwLock<DatastoreStorage>>, keys: &[Key]) -> usize {
