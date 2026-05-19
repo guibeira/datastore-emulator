@@ -1852,10 +1852,29 @@ impl DatastoreStorage {
                     } else if let Some(value) =
                         candidate.entity_metadata.entity.properties.get(&prop.name)
                     {
-                        signature.push(2);
-                        value
-                            .encode_length_delimited(&mut signature)
-                            .expect("encode distinct value signature");
+                        match &value.value_type {
+                            Some(ValueType::StringValue(s)) => {
+                                signature.push(2);
+                                signature.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                                signature.extend_from_slice(s.as_bytes());
+                            }
+                            Some(ValueType::IntegerValue(i)) => {
+                                signature.push(2);
+                                signature.push(b'i');
+                                signature.extend_from_slice(&i.to_le_bytes());
+                            }
+                            Some(ValueType::BooleanValue(b)) => {
+                                signature.push(2);
+                                signature.push(b'b');
+                                signature.push(*b as u8);
+                            }
+                            _ => {
+                                signature.push(2);
+                                value
+                                    .encode_length_delimited(&mut signature)
+                                    .expect("encode distinct value signature");
+                            }
+                        }
                     } else {
                         signature.push(3);
                         signature.extend_from_slice(prop.name.as_bytes());
