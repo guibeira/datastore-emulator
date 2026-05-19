@@ -1645,26 +1645,28 @@ impl DatastoreStorage {
                 }
             }
             FilterType::CompositeFilter(composity_filter) => {
-                let mut filter_results = Vec::new();
-                for filter in composity_filter.filters.clone() {
-                    // Apply filter recursively
-                    if let Some(filter_type) = filter.filter_type {
-                        filter_results.push(DatastoreStorage::apply_filter(
-                            entity_metadata,
-                            &filter_type,
-                        ));
-                    }
-                }
                 // Combine results based on the composite filter operator
                 // AND = 1, OR = 2
                 match composity_filter.op {
                     1 => {
                         // AND we can translate to ALL are true
-                        filter_results.iter().all(|&result| result)
+                        composity_filter
+                            .filters
+                            .iter()
+                            .filter_map(|filter| filter.filter_type.as_ref())
+                            .all(|filter_type| {
+                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                            })
                     }
                     2 => {
                         // Or we can translate to ANY is true
-                        filter_results.iter().any(|&result| result)
+                        composity_filter
+                            .filters
+                            .iter()
+                            .filter_map(|filter| filter.filter_type.as_ref())
+                            .any(|filter_type| {
+                                DatastoreStorage::apply_filter(entity_metadata, filter_type)
+                            })
                     }
                     _ => {
                         // OPERATOR_UNSPECIFIED
@@ -2133,6 +2135,13 @@ impl DatastoreStorage {
         for candidate in filtered_entities.iter().skip(start_index) {
             let entity_metadata = candidate.entity_metadata.as_ref();
             // Apply limit and payload size checks
+            if let Some(limit_value) = limit
+                && results.len() >= limit_value as usize
+            {
+                new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
+                break;
+            }
+
             let entity_size_bytes = if is_keys_only {
                 entity_metadata
                     .entity
@@ -2146,13 +2155,6 @@ impl DatastoreStorage {
                 && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
             {
                 new_more_results_state = MoreResultsType::NotFinished;
-                break;
-            }
-
-            if let Some(limit_value) = limit
-                && results.len() >= limit_value as usize
-            {
-                new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
                 break;
             }
 
