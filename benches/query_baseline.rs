@@ -214,6 +214,19 @@ fn bench_cases() -> Vec<BenchCase> {
             },
         },
         BenchCase {
+            name: "key_filter_greater_than",
+            query: Query {
+                kind: kind(),
+                filter: Some(property_filter(
+                    "__key__",
+                    property_filter::Operator::GreaterThan,
+                    value(ValueType::KeyValue(key_for(5000))),
+                )),
+                limit: Some(Int32Value { value: 50 }),
+                ..Default::default()
+            },
+        },
+        BenchCase {
             name: "distinct_on_region_bucket",
             query: Query {
                 kind: kind(),

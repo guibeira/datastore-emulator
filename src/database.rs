@@ -320,6 +320,50 @@ fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
     values
 }
 
+fn match_key_against_filter(entity_key: &Key, filter_value: &Value, op: i32) -> bool {
+    let entity_key_struct = KeyStruct::from_datastore_key(entity_key);
+
+    let compare_with = |other: &Key| entity_key_struct.cmp(&KeyStruct::from_datastore_key(other));
+
+    match op {
+        0 => true,
+        1 | 2 | 3 | 4 | 5 | 9 => {
+            let Some(ValueType::KeyValue(filter_key)) = &filter_value.value_type else {
+                return false;
+            };
+            let ord = compare_with(filter_key);
+            match op {
+                1 => ord.is_lt(),
+                2 => ord.is_le(),
+                3 => ord.is_gt(),
+                4 => ord.is_ge(),
+                5 => ord.is_eq(),
+                9 => !ord.is_eq(),
+                _ => false,
+            }
+        }
+        6 => {
+            let Some(ValueType::ArrayValue(arr)) = &filter_value.value_type else {
+                return false;
+            };
+            arr.values.iter().any(|v| match &v.value_type {
+                Some(ValueType::KeyValue(k)) => compare_with(k).is_eq(),
+                _ => false,
+            })
+        }
+        13 => {
+            let Some(ValueType::ArrayValue(arr)) = &filter_value.value_type else {
+                return true;
+            };
+            !arr.values.iter().any(|v| match &v.value_type {
+                Some(ValueType::KeyValue(k)) => compare_with(k).is_eq(),
+                _ => false,
+            })
+        }
+        _ => false,
+    }
+}
+
 fn values_match_filter<'a>(
     entity_values: impl IntoIterator<Item = &'a Value>,
     filter_value: &Value,
@@ -1286,15 +1330,7 @@ impl DatastoreStorage {
                             // Check if this is a nested property path (contains dots)
                             if property.name == "__key__" {
                                 if let Some(key) = entity_metadata.entity.key.as_ref() {
-                                    let key_value = Value {
-                                        value_type: Some(ValueType::KeyValue(key.clone())),
-                                        ..Default::default()
-                                    };
-                                    values_match_filter(
-                                        std::iter::once(&key_value),
-                                        filter_value,
-                                        property_filter.op,
-                                    )
+                                    match_key_against_filter(key, filter_value, property_filter.op)
                                 } else {
                                     false
                                 }
