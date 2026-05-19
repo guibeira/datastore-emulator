@@ -295,13 +295,10 @@ pub async fn commit(
                     });
                 }
                 Operation::Upsert(entity) => {
-                    let key = match entity.key {
-                        Some(ref key) => key.clone(),
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Entity missing key for upsert",
-                            ));
-                        }
+                    let Some(key) = entity.key.as_ref() else {
+                        return Err(Status::invalid_argument(
+                            "Entity missing key for upsert",
+                        ));
                     };
 
                     let key_is_incomplete = key
@@ -320,7 +317,7 @@ pub async fn commit(
                             transform_results: vec![],
                         });
                     } else {
-                        let key_struct = KeyStruct::from_datastore_key(&key);
+                        let key_struct = KeyStruct::from_datastore_key(key);
 
                         let timestamp_now = system_time_to_timestamp(SystemTime::now());
 
@@ -336,8 +333,10 @@ pub async fn commit(
                                 mut occupied_entry,
                             ) => {
                                 let metadata = Arc::make_mut(occupied_entry.get_mut());
-                                previous_entity = Some(metadata.entity.clone());
-                                metadata.entity = entity.clone();
+                                previous_entity = Some(std::mem::replace(
+                                    &mut metadata.entity,
+                                    entity.clone(),
+                                ));
                                 metadata.version += 1;
                                 metadata.update_time = update_time.clone();
                                 version = metadata.version;
@@ -358,7 +357,7 @@ pub async fn commit(
                         }
 
                         if observe_key_counters {
-                            storage.observe_key_id(&key);
+                            storage.observe_key_id(key);
                         }
 
                         if let Some(prev) = previous_entity {
@@ -367,10 +366,10 @@ pub async fn commit(
                         storage.update_indexes(&key_struct, entity);
 
                         mutation_results.push(MutationResult {
-                            key: Some(key),
+                            key: Some(key.clone()),
                             version: version as i64,
-                            create_time: Some(create_time.clone()),
-                            update_time: Some(update_time.clone()),
+                            create_time: Some(create_time),
+                            update_time: Some(update_time),
                             conflict_detected: false,
                             transform_results: vec![],
                         });

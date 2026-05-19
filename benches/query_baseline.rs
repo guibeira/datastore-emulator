@@ -108,6 +108,34 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     });
 
+    let upsert_template = bench_entity_template();
+    group.bench_function("upsert_existing_entity_with_nested", |b| {
+        b.to_async(&runtime).iter_batched(
+            || {
+                let mut storage = DatastoreStorage::default();
+                storage
+                    .insert_entity(&upsert_template)
+                    .expect("seed upsert bench entity");
+                Arc::new(RwLock::new(storage))
+            },
+            |storage| {
+                let req = CommitRequest {
+                    project_id: PROJECT.to_string(),
+                    mode: Mode::NonTransactional as i32,
+                    mutations: vec![Mutation {
+                        operation: Some(Operation::Upsert(upsert_template.clone())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                async move {
+                    black_box(core::commit(&storage, req).await.expect("upsert commit"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
