@@ -831,14 +831,14 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum KeyId {
     IntId(i64),
     StringId(String),
 }
 
 // Custom key structure for efficient indexing
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct KeyStruct {
     pub project_id: String,
     pub namespace: String,
@@ -1832,57 +1832,55 @@ impl DatastoreStorage {
         }
 
         if !distinct_on.is_empty() {
-            let mut seen_signatures: HashSet<Vec<u8>> = HashSet::new();
+            use std::hash::{Hash, Hasher};
+
+            let mut seen_signatures: HashSet<u64> = HashSet::new();
             let mut distinct_entities = Vec::new();
+            let mut scratch: Vec<u8> = Vec::new();
 
             for candidate in filtered_entities.into_iter() {
-                let mut signature: Vec<u8> = Vec::new();
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
                 for prop in &distinct_on {
                     if prop.name == "__key__" {
-                        signature.push(1);
+                        hasher.write_u8(1);
                         if let Some(key_struct) = candidate.key_struct.as_ref() {
-                            bincode::serde::encode_into_std_write(
-                                key_struct,
-                                &mut signature,
-                                bincode::config::standard(),
-                            )
-                            .expect("encode distinct __key__ signature");
+                            key_struct.hash(&mut hasher);
                         }
                     } else if let Some(value) =
                         candidate.entity_metadata.entity.properties.get(&prop.name)
                     {
+                        hasher.write_u8(2);
                         match &value.value_type {
                             Some(ValueType::StringValue(s)) => {
-                                signature.push(2);
-                                signature.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                                signature.extend_from_slice(s.as_bytes());
+                                hasher.write_u8(b's');
+                                hasher.write(s.as_bytes());
                             }
                             Some(ValueType::IntegerValue(i)) => {
-                                signature.push(2);
-                                signature.push(b'i');
-                                signature.extend_from_slice(&i.to_le_bytes());
+                                hasher.write_u8(b'i');
+                                hasher.write_i64(*i);
                             }
                             Some(ValueType::BooleanValue(b)) => {
-                                signature.push(2);
-                                signature.push(b'b');
-                                signature.push(*b as u8);
+                                hasher.write_u8(b'b');
+                                hasher.write_u8(*b as u8);
                             }
                             _ => {
-                                signature.push(2);
+                                hasher.write_u8(b'?');
+                                scratch.clear();
                                 value
-                                    .encode_length_delimited(&mut signature)
+                                    .encode_length_delimited(&mut scratch)
                                     .expect("encode distinct value signature");
+                                hasher.write(&scratch);
                             }
                         }
                     } else {
-                        signature.push(3);
-                        signature.extend_from_slice(prop.name.as_bytes());
+                        hasher.write_u8(3);
+                        hasher.write(prop.name.as_bytes());
                     }
-                    signature.push(0xFF);
+                    hasher.write_u8(0xFF);
                 }
 
-                if seen_signatures.insert(signature) {
+                if seen_signatures.insert(hasher.finish()) {
                     distinct_entities.push(candidate);
                 }
             }
