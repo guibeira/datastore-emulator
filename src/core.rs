@@ -258,15 +258,12 @@ pub async fn commit(
                     }
                 },
                 Operation::Update(entity) => {
-                    let key = match entity.key {
-                        Some(ref key) => key.clone(),
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Entity missing key for update",
-                            ));
-                        }
+                    let Some(key) = entity.key.as_ref() else {
+                        return Err(Status::invalid_argument(
+                            "Entity missing key for update",
+                        ));
                     };
-                    let key_struct = KeyStruct::from_datastore_key(&key);
+                    let key_struct = KeyStruct::from_datastore_key(key);
 
                     let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct) else {
                         return Err(Status::not_found("Entity not found for update"));
@@ -274,18 +271,19 @@ pub async fn commit(
 
                     let timestamp_now = system_time_to_timestamp(SystemTime::now());
                     let existing_entity_metadata = Arc::make_mut(existing_entity_metadata);
-                    let previous_entity = existing_entity_metadata.entity.clone();
-                    existing_entity_metadata.entity = entity.clone();
+                    let previous_entity = std::mem::replace(
+                        &mut existing_entity_metadata.entity,
+                        entity.clone(),
+                    );
                     existing_entity_metadata.version += 1;
                     existing_entity_metadata.update_time = timestamp_now.clone();
 
-                    let entity_for_index = existing_entity_metadata.entity.clone();
                     let version = existing_entity_metadata.version;
                     let create_time = existing_entity_metadata.create_time.clone();
                     let update_time = timestamp_now;
 
                     storage.remove_from_indexes(&key_struct, &previous_entity);
-                    storage.update_indexes(&key_struct, &entity_for_index);
+                    storage.update_indexes(&key_struct, entity);
 
                     mutation_results.push(MutationResult {
                         key: entity.key.clone(),

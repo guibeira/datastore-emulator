@@ -2,10 +2,13 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
-        ArrayValue, Entity, Filter, Key, KindExpression, LookupRequest, PartitionId, Projection,
-        PropertyFilter, PropertyOrder, PropertyReference, Query, RunQueryRequest, Value,
+        ArrayValue, CommitRequest, Entity, Filter, Key, KindExpression, LookupRequest, Mutation,
+        PartitionId, Projection, PropertyFilter, PropertyOrder, PropertyReference, Query,
+        RunQueryRequest, Value,
+        commit_request::Mode,
         filter::FilterType,
         key::{PathElement, path_element::IdType},
+        mutation::Operation,
         property_filter, property_order,
         run_query_request::QueryType,
         value::ValueType,
@@ -72,6 +75,34 @@ fn criterion_benchmark(c: &mut Criterion) {
                     .insert_entity(&insert_template)
                     .expect("insert bench entity");
                 black_box(storage);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let update_template = bench_entity_template();
+    group.bench_function("update_entity_with_nested", |b| {
+        b.to_async(&runtime).iter_batched(
+            || {
+                let mut storage = DatastoreStorage::default();
+                storage
+                    .insert_entity(&update_template)
+                    .expect("seed update bench entity");
+                Arc::new(RwLock::new(storage))
+            },
+            |storage| {
+                let req = CommitRequest {
+                    project_id: PROJECT.to_string(),
+                    mode: Mode::NonTransactional as i32,
+                    mutations: vec![Mutation {
+                        operation: Some(Operation::Update(update_template.clone())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                async move {
+                    black_box(core::commit(&storage, req).await.expect("update commit"));
+                }
             },
             BatchSize::SmallInput,
         );
