@@ -1293,29 +1293,27 @@ impl DatastoreStorage {
     pub fn insert_entity(
         &mut self,
         entity: &Entity,
-    ) -> Result<(Key, EntityWithMetadata), tonic::Status> {
-        let original_key = match entity.key {
-            Some(ref key) => key.clone(),
-            None => return Err(tonic::Status::invalid_argument("Entity missing key")),
+    ) -> Result<(Key, Arc<EntityWithMetadata>), tonic::Status> {
+        let Some(original_key) = entity.key.as_ref() else {
+            return Err(tonic::Status::invalid_argument("Entity missing key"));
         };
-
-        let mut key_with_new_id = original_key.clone();
 
         let needs_auto_id = original_key
             .path
             .iter()
             .any(|path_element| path_element.id_type.is_none());
-        let mut new_id_value = None;
-        if needs_auto_id {
-            new_id_value = Some(self.next_auto_id(&original_key)?);
-        }
+        let new_id_value = if needs_auto_id {
+            Some(self.next_auto_id(original_key)?)
+        } else {
+            None
+        };
 
-        // Apply the new ID to any PathElement in the key that is without an ID.
-        for path_element in key_with_new_id.path.iter_mut() {
-            if path_element.id_type.is_none()
-                && let Some(id_value) = new_id_value
-            {
-                path_element.id_type = Some(IdType::Id(id_value));
+        let mut key_with_new_id = original_key.clone();
+        if let Some(id_value) = new_id_value {
+            for path_element in key_with_new_id.path.iter_mut() {
+                if path_element.id_type.is_none() {
+                    path_element.id_type = Some(IdType::Id(id_value));
+                }
             }
         }
 
@@ -1332,18 +1330,17 @@ impl DatastoreStorage {
             nanos: (now.as_nanos() % 1_000_000_000) as i32,
         };
 
-        let entity_metadata = EntityWithMetadata {
-            entity: db_entity.clone(),
+        let entity_metadata = Arc::new(EntityWithMetadata {
+            entity: db_entity,
             version: 1, // Initial version
             create_time: timestamp_now.clone(),
-            update_time: timestamp_now.clone(),
-        };
+            update_time: timestamp_now,
+        });
 
-        // Insert into the BTreeMap<KeyStruct, EntityWithMetadata>
         self.entities
-            .insert(final_key_struct.clone(), Arc::new(entity_metadata.clone()));
-        self.update_indexes(&final_key_struct, &db_entity);
-        if let Some(ref key) = db_entity.key {
+            .insert(final_key_struct.clone(), Arc::clone(&entity_metadata));
+        self.update_indexes(&final_key_struct, &entity_metadata.entity);
+        if let Some(ref key) = entity_metadata.entity.key {
             self.observe_key_id(key);
         }
 
