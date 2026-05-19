@@ -9,6 +9,7 @@ WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY src ./src
+COPY benches ./benches
 
 RUN cargo build --release --locked
 
