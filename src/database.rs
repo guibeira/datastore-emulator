@@ -286,9 +286,7 @@ fn for_each_indexable_string_for_value(value: &Value, mut visitor: impl FnMut(St
                     visitor(dt.to_rfc3339())
                 }
             }
-            ValueType::KeyValue(k) => {
-                visitor(format!("{:?}", KeyStruct::from_datastore_key(k)))
-            }
+            ValueType::KeyValue(k) => visitor(format!("{:?}", KeyStruct::from_datastore_key(k))),
             _ => {}
         };
 
@@ -342,6 +340,37 @@ fn for_each_nested_indexable_path(
             }
             _ => {}
         }
+    }
+}
+
+fn for_each_nested_indexable_value_path(
+    prop_path: &str,
+    value: &Value,
+    visitor: &mut impl FnMut(&str, String),
+) {
+    if value.exclude_from_indexes {
+        return;
+    }
+
+    for_each_indexable_string_for_value(value, |value_str| {
+        visitor(prop_path, value_str);
+    });
+
+    match &value.value_type {
+        Some(ValueType::EntityValue(entity)) => {
+            for_each_nested_indexable_path(&entity.properties, prop_path, visitor);
+        }
+        Some(ValueType::ArrayValue(array)) => {
+            for item in &array.values {
+                if item.exclude_from_indexes {
+                    continue;
+                }
+                if let Some(ValueType::EntityValue(entity)) = &item.value_type {
+                    for_each_nested_indexable_path(&entity.properties, prop_path, visitor);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -845,14 +874,18 @@ pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug,
+)]
 pub enum KeyId {
     IntId(i64),
     StringId(String),
 }
 
 // Custom key structure for efficient indexing
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug,
+)]
 pub struct KeyStruct {
     pub project_id: String,
     pub namespace: String,
@@ -967,10 +1000,71 @@ impl QueryCandidate {
     }
 }
 
+fn compare_query_candidates(
+    a: &QueryCandidate,
+    b: &QueryCandidate,
+    order: &[PropertyOrder],
+) -> Ordering {
+    let mut final_ordering = Ordering::Equal;
+    for order_by in order {
+        if final_ordering != Ordering::Equal {
+            break;
+        }
+
+        let prop_name = &order_by.property.as_ref().unwrap().name;
+        let descending = order_by.direction == property_order::Direction::Descending as i32;
+
+        if prop_name == "__key__" {
+            let ordering = match (a.key_struct.as_ref(), b.key_struct.as_ref()) {
+                (Some(a), Some(b)) => a.cmp(b),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            };
+
+            final_ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            continue;
+        }
+
+        let a_val = a
+            .entity_metadata
+            .entity
+            .properties
+            .get(prop_name)
+            .and_then(|v| sort_value(v, descending));
+        let b_val = b
+            .entity_metadata
+            .entity
+            .properties
+            .get(prop_name)
+            .and_then(|v| sort_value(v, descending));
+
+        let ordering = match (a_val, b_val) {
+            (Some(a), Some(b)) => compare_values(a, b),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        };
+
+        final_ordering = if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+    }
+    final_ordering
+}
+
 #[derive(Default, Debug)]
 pub struct DatastoreStorage {
     // Stores using BTreeMap for ordered storage, mapping a full KeyStruct to its EntityWithMetadata
     pub entities: BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
+    // Secondary view used to avoid full-store scans when a query targets one project/kind.
+    pub scoped_entities: HashMap<(String, String), BTreeMap<KeyStruct, Arc<EntityWithMetadata>>>,
     // Indexes for efficient queries
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
@@ -1229,6 +1323,10 @@ impl DatastoreStorage {
         tracing::info!("Rebuilding indexes for {} entities...", self.entities.len());
         let mut new_indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>> =
             HashMap::new();
+        let mut new_scoped_entities: HashMap<
+            (String, String),
+            BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
+        > = HashMap::new();
         for (key_struct, metadata) in &self.entities {
             for (prop_name, prop_value) in &metadata.entity.properties {
                 if !prop_value.exclude_from_indexes
@@ -1243,8 +1341,15 @@ impl DatastoreStorage {
                     }
                 }
             }
+            if let Some((kind, _)) = key_struct.path_elements.last() {
+                new_scoped_entities
+                    .entry((key_struct.project_id.clone(), kind.clone()))
+                    .or_default()
+                    .insert(key_struct.clone(), Arc::clone(metadata));
+            }
         }
         self.indexes = new_indexes;
+        self.scoped_entities = new_scoped_entities;
         self.rebuild_entity_id_counters();
 
         let end_time = SystemTime::now();
@@ -1356,6 +1461,7 @@ impl DatastoreStorage {
 
         self.entities
             .insert(final_key_struct.clone(), Arc::clone(&entity_metadata));
+        self.upsert_scoped_entity(&final_key_struct, Arc::clone(&entity_metadata));
         self.update_indexes(&final_key_struct, &entity_metadata.entity);
         if let Some(ref key) = entity_metadata.entity.key {
             self.observe_key_id(key);
@@ -1697,6 +1803,8 @@ impl DatastoreStorage {
             && let Some(candidate_keys) =
                 self.index_lookup_for_filter(project_id_filter, kind_name, filter_type)
         {
+            let scope_key = (project_id_filter.to_string(), kind_name.to_string());
+            let scoped_entities = self.scoped_entities.get(&scope_key);
             return (
                 candidate_keys
                     .into_iter()
@@ -1708,12 +1816,15 @@ impl DatastoreStorage {
                                 .is_some_and(|(k, _)| k == kind_name)
                     })
                     .filter_map(|key_struct| {
-                        self.entities.get(&key_struct).map(|entity_metadata| {
-                            QueryCandidate::from_stored_entity(
-                                key_struct,
-                                Arc::clone(entity_metadata),
-                            )
-                        })
+                        scoped_entities
+                            .and_then(|entities| entities.get(&key_struct))
+                            .or_else(|| self.entities.get(&key_struct))
+                            .map(|entity_metadata| {
+                                QueryCandidate::from_stored_entity(
+                                    key_struct,
+                                    Arc::clone(entity_metadata),
+                                )
+                            })
                     })
                     .collect(),
                 false,
@@ -1722,29 +1833,53 @@ impl DatastoreStorage {
 
         let prepared_key_filter = filter_type.and_then(try_prepare_key_filter);
 
-        let candidates = self
-            .entities
-            .iter()
-            .filter(|(key_struct, _)| {
-                key_struct.project_id == project_id_filter
-                    && key_struct
-                        .path_elements
-                        .last()
-                        .is_some_and(|(k, _)| k == kind_name)
-            })
-            .filter(|(key_struct, entity_metadata)| {
-                if let Some(ref pkf) = prepared_key_filter {
-                    match_prepared_key_filter(key_struct, pkf)
-                } else {
-                    filter_type.is_none_or(|filter_type| {
-                        DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
-                    })
-                }
-            })
-            .map(|(key_struct, entity_metadata)| {
-                QueryCandidate::from_stored_entity(key_struct.clone(), Arc::clone(entity_metadata))
-            })
-            .collect();
+        let scope_key = (project_id_filter.to_string(), kind_name.to_string());
+        let candidates = if let Some(scoped_entities) = self.scoped_entities.get(&scope_key) {
+            scoped_entities
+                .iter()
+                .filter(|(key_struct, entity_metadata)| {
+                    if let Some(ref pkf) = prepared_key_filter {
+                        match_prepared_key_filter(key_struct, pkf)
+                    } else {
+                        filter_type.is_none_or(|filter_type| {
+                            DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
+                        })
+                    }
+                })
+                .map(|(key_struct, entity_metadata)| {
+                    QueryCandidate::from_stored_entity(
+                        key_struct.clone(),
+                        Arc::clone(entity_metadata),
+                    )
+                })
+                .collect()
+        } else {
+            self.entities
+                .iter()
+                .filter(|(key_struct, _)| {
+                    key_struct.project_id == project_id_filter
+                        && key_struct
+                            .path_elements
+                            .last()
+                            .is_some_and(|(k, _)| k == kind_name)
+                })
+                .filter(|(key_struct, entity_metadata)| {
+                    if let Some(ref pkf) = prepared_key_filter {
+                        match_prepared_key_filter(key_struct, pkf)
+                    } else {
+                        filter_type.is_none_or(|filter_type| {
+                            DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
+                        })
+                    }
+                })
+                .map(|(key_struct, entity_metadata)| {
+                    QueryCandidate::from_stored_entity(
+                        key_struct.clone(),
+                        Arc::clone(entity_metadata),
+                    )
+                })
+                .collect()
+        };
 
         (candidates, filter_type.is_some())
     }
@@ -1788,61 +1923,26 @@ impl DatastoreStorage {
 
         // 2. Sort entities
         if !order.is_empty() {
-            filtered_entities.sort_unstable_by(|a, b| {
-                let mut final_ordering = Ordering::Equal;
-                for order_by in &order {
-                    if final_ordering != Ordering::Equal {
-                        break; // Already decided by a previous order property
-                    }
+            let bounded_sort_len = if start_cursor.is_empty() && distinct_on.is_empty() {
+                limit.map(|limit_value| {
+                    (offset.max(0) as usize)
+                        .saturating_add(limit_value as usize)
+                        .saturating_add(1)
+                })
+            } else {
+                None
+            };
 
-                    let prop_name = &order_by.property.as_ref().unwrap().name;
-                    let descending =
-                        order_by.direction == property_order::Direction::Descending as i32;
+            if let Some(bounded_sort_len) = bounded_sort_len
+                && filtered_entities.len() > bounded_sort_len
+            {
+                filtered_entities.select_nth_unstable_by(bounded_sort_len - 1, |a, b| {
+                    compare_query_candidates(a, b, &order)
+                });
+                filtered_entities.truncate(bounded_sort_len);
+            }
 
-                    if prop_name == "__key__" {
-                        let ordering = match (a.key_struct.as_ref(), b.key_struct.as_ref()) {
-                            (Some(a), Some(b)) => a.cmp(b),
-                            (Some(_), None) => Ordering::Greater,
-                            (None, Some(_)) => Ordering::Less,
-                            (None, None) => Ordering::Equal,
-                        };
-
-                        final_ordering = if descending {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
-                        continue;
-                    }
-
-                    let a_val = a
-                        .entity_metadata
-                        .entity
-                        .properties
-                        .get(prop_name)
-                        .and_then(|v| sort_value(v, descending));
-                    let b_val = b
-                        .entity_metadata
-                        .entity
-                        .properties
-                        .get(prop_name)
-                        .and_then(|v| sort_value(v, descending));
-
-                    let ordering = match (a_val, b_val) {
-                        (Some(a), Some(b)) => compare_values(a, b),
-                        (Some(_), None) => Ordering::Greater,
-                        (None, Some(_)) => Ordering::Less,
-                        (None, None) => Ordering::Equal,
-                    };
-
-                    final_ordering = if descending {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    };
-                }
-                final_ordering
-            });
+            filtered_entities.sort_unstable_by(|a, b| compare_query_candidates(a, b, &order));
         }
 
         if !distinct_on.is_empty() {
@@ -2125,11 +2225,109 @@ impl DatastoreStorage {
         });
     }
 
+    fn add_property_indexes(
+        &mut self,
+        key_struct: &KeyStruct,
+        kind: &str,
+        prop_name: &str,
+        value: &Value,
+    ) {
+        for_each_nested_indexable_value_path(prop_name, value, &mut |prop_path, value_str| {
+            self.indexes
+                .entry((kind.to_string(), prop_path.to_string(), value_str))
+                .or_default()
+                .insert(key_struct.clone());
+        });
+    }
+
+    fn remove_property_indexes(
+        &mut self,
+        key_struct: &KeyStruct,
+        kind: &str,
+        prop_name: &str,
+        value: &Value,
+    ) {
+        for_each_nested_indexable_value_path(prop_name, value, &mut |prop_path, value_str| {
+            let index_key = (kind.to_string(), prop_path.to_string(), value_str);
+            if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
+                indexed_keys_set.remove(key_struct);
+            }
+        });
+    }
+
+    pub fn replace_indexes(
+        &mut self,
+        key_struct: &KeyStruct,
+        previous_entity: &Entity,
+        next_entity: &Entity,
+    ) {
+        if previous_entity.properties == next_entity.properties {
+            return;
+        }
+
+        let Some((kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+
+        for (prop_name, previous_value) in &previous_entity.properties {
+            match next_entity.properties.get(prop_name) {
+                Some(next_value) if next_value == previous_value => {}
+                Some(next_value) => {
+                    self.remove_property_indexes(key_struct, kind, prop_name, previous_value);
+                    self.add_property_indexes(key_struct, kind, prop_name, next_value);
+                }
+                None => {
+                    self.remove_property_indexes(key_struct, kind, prop_name, previous_value);
+                }
+            }
+        }
+
+        for (prop_name, next_value) in &next_entity.properties {
+            if !previous_entity.properties.contains_key(prop_name) {
+                self.add_property_indexes(key_struct, kind, prop_name, next_value);
+            }
+        }
+    }
+
+    pub(crate) fn upsert_scoped_entity(
+        &mut self,
+        key_struct: &KeyStruct,
+        entity_metadata: Arc<EntityWithMetadata>,
+    ) {
+        let Some((kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+
+        self.scoped_entities
+            .entry((key_struct.project_id.clone(), kind.clone()))
+            .or_default()
+            .insert(key_struct.clone(), entity_metadata);
+    }
+
+    fn remove_scoped_entity(&mut self, key_struct: &KeyStruct) {
+        let Some((kind, _)) = key_struct.path_elements.last() else {
+            return;
+        };
+
+        let scope_key = (key_struct.project_id.clone(), kind.clone());
+        let remove_empty_scope =
+            if let Some(scoped_entities) = self.scoped_entities.get_mut(&scope_key) {
+                scoped_entities.remove(key_struct);
+                scoped_entities.is_empty()
+            } else {
+                false
+            };
+        if remove_empty_scope {
+            self.scoped_entities.remove(&scope_key);
+        }
+    }
+
     pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<Arc<EntityWithMetadata>> {
         let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
 
         let removed_entity_metadata = self.entities.remove(&key_struct_to_delete)?;
         self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
+        self.remove_scoped_entity(&key_struct_to_delete);
         Some(removed_entity_metadata)
     }
 }

@@ -265,23 +265,28 @@ pub async fn commit(
                     };
                     let key_struct = KeyStruct::from_datastore_key(key);
 
-                    let Some(existing_entity_metadata) = storage.entities.get_mut(&key_struct)
+                    let Some(existing_entity_metadata) = storage.entities.get(&key_struct).cloned()
                     else {
                         return Err(Status::not_found("Entity not found for update"));
                     };
 
-                    let existing_entity_metadata = Arc::make_mut(existing_entity_metadata);
-                    let previous_entity =
-                        std::mem::replace(&mut existing_entity_metadata.entity, entity.clone());
-                    existing_entity_metadata.version += 1;
-                    existing_entity_metadata.update_time = commit_time.clone();
-
-                    let version = existing_entity_metadata.version;
                     let create_time = existing_entity_metadata.create_time.clone();
                     let update_time = commit_time.clone();
+                    let version = existing_entity_metadata.version + 1;
+                    let previous_entity = existing_entity_metadata.entity.clone();
+                    let updated_metadata = Arc::new(EntityWithMetadata {
+                        entity: entity.clone(),
+                        version,
+                        create_time: create_time.clone(),
+                        update_time: update_time.clone(),
+                    });
 
-                    storage.remove_from_indexes(&key_struct, &previous_entity);
-                    storage.update_indexes(&key_struct, entity);
+                    storage
+                        .entities
+                        .insert(key_struct.clone(), Arc::clone(&updated_metadata));
+                    storage.upsert_scoped_entity(&key_struct, updated_metadata);
+
+                    storage.replace_indexes(&key_struct, &previous_entity, entity);
 
                     mutation_results.push(MutationResult {
                         key: entity.key.clone(),
@@ -316,45 +321,52 @@ pub async fn commit(
                     } else {
                         let key_struct = KeyStruct::from_datastore_key(key);
 
-                        let mut observe_key_counters = false;
-                        let entry = storage.entities.entry(key_struct.clone());
                         let version;
                         let create_time;
                         let update_time = commit_time.clone();
-                        let mut previous_entity: Option<Entity> = None;
+                        let previous_entity;
+                        let observe_key_counters;
 
-                        match entry {
-                            std::collections::btree_map::Entry::Occupied(mut occupied_entry) => {
-                                let metadata = Arc::make_mut(occupied_entry.get_mut());
-                                previous_entity =
-                                    Some(std::mem::replace(&mut metadata.entity, entity.clone()));
-                                metadata.version += 1;
-                                metadata.update_time = update_time.clone();
-                                version = metadata.version;
-                                create_time = metadata.create_time.clone();
-                            }
-                            std::collections::btree_map::Entry::Vacant(vacant_entry) => {
-                                let new_metadata = EntityWithMetadata {
-                                    entity: entity.clone(),
-                                    version: 1,
-                                    create_time: commit_time.clone(),
-                                    update_time: update_time.clone(),
-                                };
-                                version = new_metadata.version;
-                                create_time = new_metadata.create_time.clone();
-                                observe_key_counters = true;
-                                vacant_entry.insert(Arc::new(new_metadata));
-                            }
-                        }
+                        let metadata = if let Some(previous_metadata) =
+                            storage.entities.get(&key_struct).cloned()
+                        {
+                            version = previous_metadata.version + 1;
+                            create_time = previous_metadata.create_time.clone();
+                            previous_entity = Some(previous_metadata.entity.clone());
+                            observe_key_counters = false;
+                            Arc::new(EntityWithMetadata {
+                                entity: entity.clone(),
+                                version,
+                                create_time: create_time.clone(),
+                                update_time: update_time.clone(),
+                            })
+                        } else {
+                            version = 1;
+                            create_time = commit_time.clone();
+                            previous_entity = None;
+                            observe_key_counters = true;
+                            Arc::new(EntityWithMetadata {
+                                entity: entity.clone(),
+                                version,
+                                create_time: create_time.clone(),
+                                update_time: update_time.clone(),
+                            })
+                        };
+
+                        storage
+                            .entities
+                            .insert(key_struct.clone(), Arc::clone(&metadata));
+                        storage.upsert_scoped_entity(&key_struct, metadata);
 
                         if observe_key_counters {
                             storage.observe_key_id(key);
                         }
 
                         if let Some(prev) = previous_entity {
-                            storage.remove_from_indexes(&key_struct, &prev);
+                            storage.replace_indexes(&key_struct, &prev, entity);
+                        } else {
+                            storage.update_indexes(&key_struct, entity);
                         }
-                        storage.update_indexes(&key_struct, entity);
 
                         mutation_results.push(MutationResult {
                             key: Some(key.clone()),
@@ -436,7 +448,9 @@ pub async fn begin_transaction(
         // Create a new transaction state
         let transaction_state = TransactionState;
 
-        storage.transactions.insert(transaction_id, transaction_state);
+        storage
+            .transactions
+            .insert(transaction_id, transaction_state);
         transaction_bytes
     };
 
@@ -543,9 +557,9 @@ pub async fn run_aggregation_query(
 
     // Get the base query if it exists
     let base_query = match aggregation_query.query_type.as_ref() {
-        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(
-            query,
-        )) => Some(query),
+        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
+            Some(query)
+        }
         _ => {
             // todo: Handle other query types if needed
             None
@@ -566,8 +580,7 @@ pub async fn run_aggregation_query(
         // query_candidates is per-kind.
         if query.kind.len() == 1 {
             let kind_name = query.kind[0].name.as_str();
-            let (candidates, _) =
-                storage.query_candidates(&req.project_id, kind_name, filter_type);
+            let (candidates, _) = storage.query_candidates(&req.project_id, kind_name, filter_type);
             matching_entities = candidates
                 .into_iter()
                 .filter(|c| c.entity_metadata.entity.key.is_some())
@@ -641,8 +654,7 @@ pub async fn run_aggregation_query(
                         if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
-                            } else if let Some(ValueType::DoubleValue(value)) =
-                                &property.value_type
+                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
                             {
                                 sum_value += *value;
                             }
@@ -677,8 +689,7 @@ pub async fn run_aggregation_query(
                             if let Some(ValueType::IntegerValue(value)) = &property.value_type {
                                 sum_value += *value as f64;
                                 count += 1;
-                            } else if let Some(ValueType::DoubleValue(value)) =
-                                &property.value_type
+                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
                             {
                                 sum_value += *value;
                                 count += 1;
