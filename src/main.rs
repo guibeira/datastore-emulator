@@ -1,13 +1,13 @@
-use datastore_emulator::{
-    api::create_router,
-    google::datastore::v1::datastore_server::DatastoreServer,
-    AppState, DatastoreEmulator,
-};
 use axum::{
     body::{Body, boxed},
     http::Request,
 };
 use clap::Parser;
+use datastore_emulator::{
+    AppState, DatastoreEmulator, api::create_router,
+    google::datastore::v1::datastore_server::DatastoreServer,
+};
+use hyper::server::conn::AddrIncoming;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -75,7 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listen_addr
     );
 
-    let server = axum::Server::bind(&listen_addr).serve(app.into_make_service());
+    let mut incoming = AddrIncoming::bind(&listen_addr)?;
+    incoming.set_nodelay(true);
+    let server = axum::Server::builder(incoming).serve(app.into_make_service());
 
     // --- Run the server with graceful shutdown ---
     tokio::select! {
