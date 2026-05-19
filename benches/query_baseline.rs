@@ -146,6 +146,35 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     });
 
+    let delete_template = bench_entity_template();
+    let delete_key = delete_template.key.clone().unwrap();
+    group.bench_function("delete_entity_with_nested", |b| {
+        b.to_async(&runtime).iter_batched(
+            || {
+                let mut storage = DatastoreStorage::default();
+                storage
+                    .insert_entity(&delete_template)
+                    .expect("seed delete bench entity");
+                Arc::new(RwLock::new(storage))
+            },
+            |storage| {
+                let req = CommitRequest {
+                    project_id: PROJECT.to_string(),
+                    mode: Mode::NonTransactional as i32,
+                    mutations: vec![Mutation {
+                        operation: Some(Operation::Delete(delete_key.clone())),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                async move {
+                    black_box(core::commit(&storage, req).await.expect("delete commit"));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     let upsert_template = bench_entity_template();
     group.bench_function("upsert_existing_entity_with_nested", |b| {
         b.to_async(&runtime).iter_batched(

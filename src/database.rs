@@ -2118,15 +2118,11 @@ impl DatastoreStorage {
         }
     }
 
-    pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<EntityWithMetadata> {
+    pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<Arc<EntityWithMetadata>> {
         let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
 
-        if let Some(removed_entity_metadata) = self.entities.remove(&key_struct_to_delete) {
-            // If entity was removed, also remove it from indexes
-            self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
-            Some(removed_entity_metadata.as_ref().clone())
-        } else {
-            None
-        }
+        let removed_entity_metadata = self.entities.remove(&key_struct_to_delete)?;
+        self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
+        Some(removed_entity_metadata)
     }
 }
