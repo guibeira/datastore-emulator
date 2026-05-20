@@ -103,30 +103,42 @@ pub async fn bg_import_data(
         input_url.clone()
     };
 
-    let folder_name = "dump";
-    let extraction_result = task::spawn_blocking({
+    let prepare_result = task::spawn_blocking({
         let path = local_file_path.clone();
-        move || extract_file(path)
+        move || prepare_export_dir(path)
     })
     .await;
 
-    match extraction_result {
-        Ok(Ok(())) => {
-            tracing::info!("File {:?} extracted successfully.", local_file_path);
+    let (export_dir, extracted_dump) = match prepare_result {
+        Ok(Ok(result)) => {
+            tracing::info!(
+                "Prepared export dir {:?} from input {:?} (extracted_dump={})",
+                result.0,
+                local_file_path,
+                result.1
+            );
+            result
         }
         Ok(Err(e)) => {
-            tracing::error!("Failed to extract file {:?}: {}", local_file_path, e);
+            tracing::error!(
+                "Failed to prepare export dir from {:?}: {}",
+                local_file_path,
+                e
+            );
             let mut operations = operations.write().await;
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
-                state.error = Some(format!("Failed to extract file {}", local_file_path));
+                state.error = Some(format!(
+                    "Failed to prepare export dir from {}: {}",
+                    local_file_path, e
+                ));
             }
             return;
         }
         Err(join_err) => {
             tracing::error!(
-                "Extraction task panicked for {:?}: {}",
+                "Preparation task panicked for {:?}: {}",
                 local_file_path,
                 join_err
             );
@@ -134,16 +146,16 @@ pub async fn bg_import_data(
             if let Some(state) = operations.get_mut(&operation_id) {
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
-                state.error = Some("Background extraction task failed".to_string());
+                state.error = Some("Background preparation task failed".to_string());
             }
             return;
         }
-    }
+    };
 
     let start = Instant::now();
     let import_result = {
         let mut storage_guard = storage.write().await;
-        storage_guard.import_dump(folder_name)
+        storage_guard.import_dump(&export_dir)
     };
 
     let duration = start.elapsed();
@@ -181,16 +193,18 @@ pub async fn bg_import_data(
         }
     }
 
-    let folder = folder_name.to_string();
-    match task::spawn_blocking(move || std::fs::remove_dir_all(&folder)).await {
-        Ok(Ok(())) => {
-            tracing::info!("Dump directory cleaned up successfully.");
-        }
-        Ok(Err(e)) => {
-            tracing::error!("Failed to clean up dump directory: {}", e);
-        }
-        Err(join_err) => {
-            tracing::error!("Cleanup task for dump directory failed: {}", join_err);
+    if extracted_dump {
+        let folder = export_dir.clone();
+        match task::spawn_blocking(move || std::fs::remove_dir_all(&folder)).await {
+            Ok(Ok(())) => {
+                tracing::info!("Dump directory cleaned up successfully.");
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Failed to clean up dump directory: {}", e);
+            }
+            Err(join_err) => {
+                tracing::error!("Cleanup task for dump directory failed: {}", join_err);
+            }
         }
     }
 
@@ -220,26 +234,187 @@ pub async fn bg_import_data(
     tracing::info!("Background import completed.");
 }
 
-fn extract_file(input_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let dump_path = std::path::Path::new("dump");
-    if !dump_path.exists() {
-        std::fs::create_dir_all(dump_path).expect("Failed to create dump directory");
+/// Inspect `input_url` and return `(export_dir, extracted_dump)`.
+///
+/// `export_dir` is a path suitable for `DatastoreStorage::import_dump`, i.e. it
+/// satisfies `<export_dir>/exports/<name>.overall_export_metadata`.
+///
+/// `extracted_dump` is `true` when this function extracted a zip archive into
+/// `./dump` and the caller is expected to clean it up.
+///
+/// Accepted input formats:
+///   * A zip archive (`*.zip` or magic-byte detected) that contains an
+///     `exports/<name>.overall_export_metadata` tree at the archive root.
+///   * A `.overall_export_metadata` LevelDB log file. The export root is the
+///     grandparent directory (metadata files live in `<root>/exports/`).
+///   * A directory that either already is the export root or contains the
+///     metadata file directly.
+fn prepare_export_dir(
+    input_url: String,
+) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let path = std::path::Path::new(&input_url);
+
+    if !path.exists() {
+        return Err(format!("Input path does not exist: {}", input_url).into());
     }
-    let zip_file = std::fs::File::open(&input_url).expect("Failed to open zip file");
-    let mut archive = zip::ZipArchive::new(zip_file).expect("Failed to read zip file");
+
+    if path.is_file() {
+        if input_url.ends_with(".overall_export_metadata") {
+            let exports_dir = path
+                .parent()
+                .ok_or("Metadata file has no parent directory")?;
+            let export_root = exports_dir
+                .parent()
+                .ok_or("Metadata file parent has no parent directory")?;
+            return Ok((export_root.to_string_lossy().into_owned(), false));
+        }
+
+        if is_zip_file(path)? {
+            extract_zip_to_dump(path)?;
+            return Ok(("dump".to_string(), true));
+        }
+
+        return Err(format!(
+            "Unsupported file input (expected .zip or .overall_export_metadata): {}",
+            input_url
+        )
+        .into());
+    }
+
+    if path.is_dir() {
+        let exports_subdir = path.join("exports");
+        if exports_subdir.is_dir() && contains_overall_metadata(&exports_subdir)? {
+            return Ok((input_url, false));
+        }
+        if contains_overall_metadata(path)? {
+            let parent = path
+                .parent()
+                .ok_or("Export directory has no parent directory")?;
+            return Ok((parent.to_string_lossy().into_owned(), false));
+        }
+        return Err(format!(
+            "Directory {} does not contain a *.overall_export_metadata file",
+            input_url
+        )
+        .into());
+    }
+
+    Err(format!("Unsupported input path: {}", input_url).into())
+}
+
+fn is_zip_file(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    let read = file.read(&mut magic)?;
+    Ok(read == 4 && &magic == b"PK\x03\x04")
+}
+
+fn contains_overall_metadata(dir: &std::path::Path) -> Result<bool, std::io::Error> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".overall_export_metadata")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn extract_zip_to_dump(
+    zip_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dump_path = std::path::Path::new("dump");
+    if dump_path.exists() {
+        std::fs::remove_dir_all(dump_path)?;
+    }
+    std::fs::create_dir_all(dump_path)?;
+
+    let zip_file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(zip_file)?;
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).expect("Failed to read file from zip");
+        let mut file = archive.by_index(i)?;
         let outpath = dump_path.join(file.mangled_name());
         if file.name().ends_with('/') {
-            std::fs::create_dir_all(&outpath).expect("Failed to create directory");
+            std::fs::create_dir_all(&outpath)?;
         } else {
             if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).expect("Failed to create parent directory");
+                std::fs::create_dir_all(p)?;
             }
-            let mut outfile =
-                std::fs::File::create(&outpath).expect("Failed to create output file");
-            std::io::copy(&mut file, &mut outfile).expect("Failed to copy file contents");
+            let mut outfile = std::fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn temp_export_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "datastore-emulator-import-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("exports")).unwrap();
+        std::fs::write(
+            root.join("exports")
+                .join("all_namespaces_kind_Task.overall_export_metadata"),
+            b"",
+        )
+        .unwrap();
+        root
+    }
+
+    fn assert_prepared_path_eq(actual: String, expected: &Path) {
+        assert_eq!(PathBuf::from(actual), expected);
+    }
+
+    #[test]
+    fn prepare_export_dir_accepts_export_root_directory() {
+        let root = temp_export_root();
+
+        let (export_dir, extracted_dump) =
+            prepare_export_dir(root.to_string_lossy().into_owned()).unwrap();
+
+        assert_prepared_path_eq(export_dir, &root);
+        assert!(!extracted_dump);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_export_dir_accepts_exports_directory() {
+        let root = temp_export_root();
+        let exports_dir = root.join("exports");
+
+        let (export_dir, extracted_dump) =
+            prepare_export_dir(exports_dir.to_string_lossy().into_owned()).unwrap();
+
+        assert_prepared_path_eq(export_dir, &root);
+        assert!(!extracted_dump);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_export_dir_accepts_overall_metadata_file() {
+        let root = temp_export_root();
+        let metadata_file = root
+            .join("exports")
+            .join("all_namespaces_kind_Task.overall_export_metadata");
+
+        let (export_dir, extracted_dump) =
+            prepare_export_dir(metadata_file.to_string_lossy().into_owned()).unwrap();
+
+        assert_prepared_path_eq(export_dir, &root);
+        assert!(!extracted_dump);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

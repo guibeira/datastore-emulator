@@ -156,12 +156,26 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
         .await
         .insert(operation_id.clone(), operation_state);
 
-    tokio::spawn(bg_import_data(
+    bg_import_data(
         state.storage.clone(),
         state.operations.clone(),
         operation_id.clone(),
         payload.input_url.clone(),
-    ));
+    )
+    .await;
+
+    let final_state = state
+        .operations
+        .read()
+        .await
+        .get(&operation_id)
+        .map(|s| match s.status {
+            OperationStatus::Successful => "SUCCESSFUL",
+            OperationStatus::Failed => "FAILED",
+            OperationStatus::Processing => "PROCESSING",
+        })
+        .unwrap_or("PROCESSING")
+        .to_string();
 
     let response = ImportResponse {
         name: format!("projects/{}/operations/{}", project_id, operation_id),
@@ -171,7 +185,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
             common: CommonMetadata {
                 start_time: Utc::now().to_rfc3339(),
                 operation_type: "IMPORT_ENTITIES".to_string(),
-                state: "PROCESSING".to_string(),
+                state: final_state,
             },
             entity_filter: serde_json::json!({}),
             input_url: payload.input_url,
@@ -568,9 +582,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata"]["common"]["state"], "FAILED");
 
-        // operation registered
-        assert_eq!(state.operations.read().await.len(), 1);
+        let operations = state.operations.read().await;
+        assert_eq!(operations.len(), 1);
+        let operation = operations.values().next().unwrap();
+        assert!(matches!(operation.status.clone(), OperationStatus::Failed));
+        assert!(operation
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("File not found"));
     }
 
     #[tokio::test]
