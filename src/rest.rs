@@ -144,9 +144,10 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     };
 
     let operation_id = Uuid::new_v4().to_string();
+    let operation_start_time = Utc::now();
     let operation_state = OperationState {
         status: OperationStatus::Processing,
-        start_time: Utc::now(),
+        start_time: operation_start_time.clone(),
         end_time: None,
         error: None,
     };
@@ -156,12 +157,29 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
         .await
         .insert(operation_id.clone(), operation_state);
 
-    tokio::spawn(bg_import_data(
+    bg_import_data(
         state.storage.clone(),
         state.operations.clone(),
         operation_id.clone(),
         payload.input_url.clone(),
-    ));
+        Some(project_id.clone()),
+    )
+    .await;
+
+    let (final_state, start_time) = state
+        .operations
+        .read()
+        .await
+        .get(&operation_id)
+        .map(|s| {
+            let state = match s.status {
+                OperationStatus::Successful => "SUCCESSFUL",
+                OperationStatus::Failed => "FAILED",
+                OperationStatus::Processing => "PROCESSING",
+            };
+            (state.to_string(), s.start_time.to_rfc3339())
+        })
+        .unwrap_or_else(|| ("PROCESSING".to_string(), operation_start_time.to_rfc3339()));
 
     let response = ImportResponse {
         name: format!("projects/{}/operations/{}", project_id, operation_id),
@@ -169,9 +187,9 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
             type_url: "type.googleapis.com/google.datastore.admin.v1.ImportEntitiesMetadata"
                 .to_string(),
             common: CommonMetadata {
-                start_time: Utc::now().to_rfc3339(),
+                start_time,
                 operation_type: "IMPORT_ENTITIES".to_string(),
-                state: "PROCESSING".to_string(),
+                state: final_state,
             },
             entity_filter: serde_json::json!({}),
             input_url: payload.input_url,
@@ -568,9 +586,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata"]["common"]["state"], "FAILED");
 
-        // operation registered
-        assert_eq!(state.operations.read().await.len(), 1);
+        let operations = state.operations.read().await;
+        assert_eq!(operations.len(), 1);
+        let operation = operations.values().next().unwrap();
+        assert_eq!(
+            v["metadata"]["common"]["startTime"],
+            operation.start_time.to_rfc3339()
+        );
+        assert!(matches!(operation.status.clone(), OperationStatus::Failed));
+        assert!(operation
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("File not found"));
     }
 
     #[tokio::test]

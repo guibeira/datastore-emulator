@@ -627,11 +627,22 @@ fn convert_reference_value_to_key(reference_value: &ReferenceValue) -> Key {
 
     Key {
         partition_id: Some(PartitionId {
-            project_id: reference_value.app.clone(),
+            project_id: normalize_app_id(&reference_value.app),
             namespace_id: reference_value.name_space.clone().unwrap_or_default(),
             database_id: "".to_string(),
         }),
         path,
+    }
+}
+
+/// Legacy GAE app IDs are prefixed with a partition specifier (`s~`, `e~`,
+/// `dev~`). Datastore v1 callers use the bare project_id, so strip the
+/// prefix when present.
+fn normalize_app_id(app: &str) -> String {
+    if let Some(idx) = app.find('~') {
+        app[idx + 1..].to_string()
+    } else {
+        app.to_string()
     }
 }
 
@@ -655,7 +666,7 @@ fn convert_reference_to_key(reference: &Reference) -> Key {
 
     Key {
         partition_id: Some(PartitionId {
-            project_id: reference.app.clone(),
+            project_id: normalize_app_id(&reference.app),
             namespace_id: reference.name_space.clone().unwrap_or_default(),
             database_id: "".to_string(),
         }),
@@ -741,11 +752,72 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
         .collect()
 }
 
-pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
+fn rewrite_key_project_id(key: &mut Key, project_id: &str) {
+    if let Some(partition) = key.partition_id.as_mut() {
+        partition.project_id = project_id.to_string();
+    }
+}
+
+fn rewrite_value_project_id(value: &mut Value, project_id: &str) {
+    match value.value_type.as_mut() {
+        Some(ValueType::KeyValue(key)) => rewrite_key_project_id(key, project_id),
+        Some(ValueType::ArrayValue(array)) => {
+            for value in array.values.iter_mut() {
+                rewrite_value_project_id(value, project_id);
+            }
+        }
+        Some(ValueType::EntityValue(entity)) => rewrite_entity_project_id(entity, project_id),
+        _ => {}
+    }
+}
+
+fn rewrite_entity_project_id(entity: &mut Entity, project_id: &str) {
+    if let Some(key) = entity.key.as_mut() {
+        rewrite_key_project_id(key, project_id);
+    }
+    for value in entity.properties.values_mut() {
+        rewrite_value_project_id(value, project_id);
+    }
+}
+
+type ImportReadResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn validate_export_relative_path(
+    raw_path: &str,
+    description: &str,
+) -> ImportReadResult<std::path::PathBuf> {
+    if raw_path.is_empty() {
+        return Err(format!("{} path is empty", description).into());
+    }
+    if raw_path.starts_with('/') || raw_path.starts_with('\\') || raw_path.contains('\\') {
+        return Err(format!(
+            "{} path must be a relative slash-separated path: {}",
+            description, raw_path
+        )
+        .into());
+    }
+
+    let path = std::path::Path::new(raw_path);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "{} path must not contain root, current, or parent components: {}",
+            description, raw_path
+        )
+        .into());
+    }
+
+    Ok(path.to_path_buf())
+}
+
+pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExportMetadata> {
     let mut metadata_file = None;
     let path_to_search = std::path::Path::new(export_dir).join("exports");
-    for entry in std::fs::read_dir(path_to_search).expect("Failed to read export directory") {
-        let entry = entry.expect("Failed to read directory entry");
+    for entry in std::fs::read_dir(&path_to_search)? {
+        let entry = entry?;
         if entry
             .file_name()
             .to_string_lossy()
@@ -756,158 +828,108 @@ pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> 
         }
     }
 
-    let _metadata_file = metadata_file.expect("Could not find .overall_export_metadata file.");
-    tracing::debug!("Found metadata file: {}", _metadata_file.display());
-    // let reader = LogReader::new(_metadata_file.clone())
-    //     .expect("Failed to create LogReader for metadata file");
-    // dbg!("LogReader created for metadata file:", reader);
-    match LogReader::new(_metadata_file.clone()) {
-        Ok(reader) => {
-            for (i, record_result) in reader.enumerate() {
-                match record_result {
-                    Ok(record) => {
-                        match OverallExportMetadata::decode(&record[..]) {
-                            Ok(metadata) => {
-                                // Now you have the decoded 'metadata'.
-                                // You might want to process or store it.
-                                return Some(metadata); // Returning the metadata
-                            }
-                            Err(decode_err) => {
-                                tracing::error!(
-                                    "Failed to decode OverallExportMetadata: {}",
-                                    decode_err
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Error reading record {}: {}", i + 1, e); // Translated eprintln
-                        break;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Error opening file: {}", e);
-        }
+    let metadata_file = metadata_file.ok_or_else(|| {
+        format!(
+            "Could not find .overall_export_metadata file in {}",
+            path_to_search.display()
+        )
+    })?;
+    tracing::debug!("Found metadata file: {}", metadata_file.display());
+
+    let reader = LogReader::new(&metadata_file)?;
+    for record_result in reader {
+        let record = record_result?;
+        return OverallExportMetadata::decode(&record[..])
+            .map_err(|e| format!("Failed to decode OverallExportMetadata: {}", e).into());
     }
-    None // Returning None as we are not returning the metadata here
+
+    Err(format!(
+        "No records found in overall metadata file {}",
+        metadata_file.display()
+    )
+    .into())
 }
 
-pub fn read_dump(export_dir: &str) -> Vec<EntityProto> {
+pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
     tracing::info!("Reading datastore export from: {}", export_dir);
-    let overall_metadata = read_overall_metadata(export_dir);
-    if let Some(metadata) = overall_metadata {
-        let entity_protos: Vec<EntityProto> = metadata
-            .exports
-            .into_par_iter()
-            .flat_map(|export_entry| {
-                let kind_name = export_entry
-                    .kind
-                    .as_ref()
-                    .map_or_else(String::new, |k| k.kind.clone());
-                tracing::info!("Processing kind: {}", kind_name);
-                let metadata_path = std::path::PathBuf::from(export_dir)
-                    .join("exports")
-                    .join(&export_entry.path);
+    let metadata = read_overall_metadata(export_dir)?;
+    let mut entity_protos = Vec::new();
 
-                if !metadata_path.exists() {
-                    tracing::error!(
-                        "Metadata file for kind {} not found at: {}",
-                        kind_name,
-                        metadata_path.display()
-                    );
-                    return Vec::new().into_par_iter();
-                }
+    for export_entry in metadata.exports {
+        let kind_name = export_entry
+            .kind
+            .as_ref()
+            .map_or_else(String::new, |k| k.kind.clone());
+        tracing::info!("Processing kind: {}", kind_name);
+        let metadata_relative_path =
+            validate_export_relative_path(&export_entry.path, "Export metadata")?;
+        let metadata_path = std::path::PathBuf::from(export_dir)
+            .join("exports")
+            .join(metadata_relative_path);
 
-                let export_metadata = match std::fs::read(&metadata_path)
-                    .map_err(|e| {
-                        tracing::error!(
-                            "Failed to read metadata file {}: {}",
-                            metadata_path.display(),
-                            e
-                        );
+        if !metadata_path.exists() {
+            return Err(format!(
+                "Metadata file for kind {} not found at: {}",
+                kind_name,
+                metadata_path.display()
+            )
+            .into());
+        }
+
+        let data = std::fs::read(&metadata_path).map_err(|e| {
+            format!(
+                "Failed to read metadata file {}: {}",
+                metadata_path.display(),
+                e
+            )
+        })?;
+        let export_metadata = ExportMetadata::decode(&data[..])
+            .map_err(|e| format!("Failed to decode ExportMetadata for {}: {}", kind_name, e))?;
+
+        let output_file_names = export_metadata
+            .items
+            .ok_or_else(|| format!("ExportMetadata for kind {} is missing items", kind_name))?
+            .outputs;
+        let parent_dir_for_output_files = metadata_path
+            .parent()
+            .ok_or_else(|| format!("Metadata path has no parent: {}", metadata_path.display()))?
+            .to_path_buf();
+
+        for output_file_name_str in output_file_names {
+            let output_relative_path =
+                validate_export_relative_path(&output_file_name_str, "Export output")?;
+            let output_file_path = parent_dir_for_output_files.join(output_relative_path);
+            if !output_file_path.exists() {
+                return Err(
+                    format!("Output file {} does not exist.", output_file_path.display()).into(),
+                );
+            }
+
+            let reader = LogReader::new(&output_file_path)
+                .map_err(|e| format!("Error opening file {}: {}", output_file_path.display(), e))?;
+            for (i, record_result) in reader.enumerate() {
+                let record = record_result.map_err(|e| {
+                    format!(
+                        "Error reading record {} from file {}: {}",
+                        i + 1,
+                        output_file_path.display(),
                         e
-                    })
-                    .and_then(|data| {
-                        ExportMetadata::decode(&data[..]).map_err(|e| {
-                            tracing::error!(
-                                "Failed to decode ExportMetadata for {}: {}",
-                                kind_name,
-                                e
-                            );
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                        })
-                    }) {
-                    Ok(meta) => meta,
-                    Err(_) => return Vec::new().into_par_iter(),
-                };
-
-                let output_file_names = export_metadata.items.unwrap_or_default().outputs;
-                let parent_dir_for_output_files = metadata_path
-                    .parent()
-                    .expect("Metadata path should have a parent directory")
-                    .to_path_buf();
-
-                let protos_for_this_export: Vec<EntityProto> = output_file_names
-                    .into_par_iter()
-                    .flat_map(move |output_file_name_str| {
-                        let output_file_path =
-                            parent_dir_for_output_files.join(output_file_name_str);
-                        let mut protos_in_file = Vec::new();
-                        if output_file_path.exists() {
-                            if let Ok(reader) = LogReader::new(output_file_path.clone()) {
-                                for (i, record_result) in reader.enumerate() {
-                                    match record_result {
-                                        Ok(record) => {
-                                            if let Ok(entity_proto) =
-                                                EntityProto::decode(&record[..])
-                                            {
-                                                protos_in_file.push(entity_proto);
-                                            } else {
-                                                tracing::error!(
-                                                    "Failed to decode EntityProto from file {}",
-                                                    output_file_path.display()
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Error reading record {} from file {}: {}",
-                                                i + 1,
-                                                output_file_path.display(),
-                                                e
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                tracing::error!(
-                                    "Error opening file: {}",
-                                    output_file_path.display()
-                                );
-                            }
-                        } else {
-                            tracing::error!(
-                                "Output file {} does not exist.",
-                                output_file_path.display()
-                            );
-                        }
-                        protos_in_file
-                    })
-                    .collect();
-
-                protos_for_this_export.into_par_iter()
-            })
-            .collect();
-
-        tracing::info!("Finished reading datastore export.");
-        entity_protos
-    } else {
-        tracing::warn!("No overall metadata found in the export directory.");
-        Vec::new()
+                    )
+                })?;
+                let entity_proto = EntityProto::decode(&record[..]).map_err(|e| {
+                    format!(
+                        "Failed to decode EntityProto from file {}: {}",
+                        output_file_path.display(),
+                        e
+                    )
+                })?;
+                entity_protos.push(entity_proto);
+            }
+        }
     }
+
+    tracing::info!("Finished reading datastore export.");
+    Ok(entity_protos)
 }
 
 #[derive(
@@ -1674,8 +1696,28 @@ impl DatastoreStorage {
     }
 
     pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
-        let dump_entities = read_dump(path);
-        let entities_with_metadata = converter_dump(dump_entities);
+        self.import_dump_for_project(path, None)
+    }
+
+    /// Import a Cloud Datastore export from `path`. If `target_project_id` is
+    /// `Some`, imported entity keys and key-valued properties are rewritten to
+    /// that value. This lets exports from prod be ingested into the local
+    /// emulator under a different project_id (the one the caller queries
+    /// with).
+    pub fn import_dump_for_project(
+        &mut self,
+        path: &str,
+        target_project_id: Option<&str>,
+    ) -> Result<(), tonic::Status> {
+        let dump_entities = read_dump(path).map_err(|e| {
+            tonic::Status::invalid_argument(format!("Failed to read datastore export: {}", e))
+        })?;
+        let mut entities_with_metadata = converter_dump(dump_entities);
+        if let Some(project_id) = target_project_id {
+            for ewm in entities_with_metadata.iter_mut() {
+                rewrite_entity_project_id(&mut ewm.entity, project_id);
+            }
+        }
         tracing::info!(
             "Importing {} entities from dump at {}",
             entities_with_metadata.len(),
@@ -2686,5 +2728,302 @@ impl DatastoreStorage {
         self.remove_ancestor_indexes(&key_struct_to_delete);
         self.remove_scoped_entity(&key_struct_to_delete);
         Some(removed_entity_metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::google::datastore::import_export::datastore_v3::{
+        Path as LegacyPath, Property, PropertyValue, path, property_value,
+        property_value::reference_value,
+    };
+    use crate::google::datastore::import_export::dsbackups::{
+        ExportMetadataEntry, ExportMetadataEntryKind, ExportMetadataItems,
+    };
+    use std::path::{Path, PathBuf};
+
+    const LOCAL_PROJECT: &str = "local-project";
+    const SOURCE_PROJECT: &str = "source-project";
+
+    fn legacy_path(kind: &str, name: &str) -> LegacyPath {
+        LegacyPath {
+            element: vec![path::Element {
+                r#type: kind.to_string(),
+                id: None,
+                name: Some(name.to_string()),
+            }],
+        }
+    }
+
+    fn legacy_reference(app: &str, kind: &str, name: &str) -> Reference {
+        Reference {
+            app: app.to_string(),
+            name_space: None,
+            path: legacy_path(kind, name),
+        }
+    }
+
+    fn legacy_entity(app: &str, kind: &str, name: &str) -> EntityProto {
+        EntityProto {
+            key: legacy_reference(app, kind, name),
+            entity_group: LegacyPath { element: vec![] },
+            owner: None,
+            kind: None,
+            kind_uri: None,
+            property: vec![],
+            raw_property: vec![],
+            rank: None,
+        }
+    }
+
+    fn reference_property(name: &str, app: &str, kind: &str, entity_name: &str) -> Property {
+        Property {
+            meaning: None,
+            meaning_uri: None,
+            name: name.to_string(),
+            value: PropertyValue {
+                int64_value: None,
+                boolean_value: None,
+                string_value: None,
+                double_value: None,
+                pointvalue: None,
+                uservalue: None,
+                referencevalue: Some(property_value::ReferenceValue {
+                    app: app.to_string(),
+                    name_space: None,
+                    pathelement: vec![reference_value::PathElement {
+                        r#type: kind.to_string(),
+                        id: None,
+                        name: Some(entity_name.to_string()),
+                    }],
+                }),
+            },
+            multiple: false,
+            searchable: Some(true),
+            fts_tokenization_option: None,
+            locale: None,
+        }
+    }
+
+    fn key_project_id(entity: &Entity) -> &str {
+        &entity
+            .key
+            .as_ref()
+            .unwrap()
+            .partition_id
+            .as_ref()
+            .unwrap()
+            .project_id
+    }
+
+    fn key_property_project_id<'a>(entity: &'a Entity, name: &str) -> &'a str {
+        let Some(ValueType::KeyValue(key)) =
+            entity.properties.get(name).unwrap().value_type.as_ref()
+        else {
+            panic!("expected key-valued property {name}");
+        };
+        &key.partition_id.as_ref().unwrap().project_id
+    }
+
+    fn temp_export_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "datastore-emulator-import-project-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn write_leveldb_full_record(path: &Path, data: &[u8]) {
+        let mut record = Vec::with_capacity(7 + data.len());
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        record.push(1);
+        record.extend_from_slice(data);
+        std::fs::write(path, record).unwrap();
+    }
+
+    fn write_minimal_export_with_paths(
+        root: &Path,
+        entity: EntityProto,
+        metadata_path: &str,
+        output_path: &str,
+        include_items: bool,
+    ) {
+        let exports_dir = root.join("exports");
+        let kind_dir = exports_dir.join("all_namespaces");
+        std::fs::create_dir_all(&kind_dir).unwrap();
+
+        let overall = OverallExportMetadata {
+            exports: vec![ExportMetadataEntry {
+                kind: Some(ExportMetadataEntryKind {
+                    unknown1: 0,
+                    kind: "Task".to_string(),
+                    unknown2: 0,
+                }),
+                path: metadata_path.to_string(),
+                count: 1,
+                size: 0,
+            }],
+        };
+        write_leveldb_full_record(
+            &exports_dir.join("all_namespaces_kind_Task.overall_export_metadata"),
+            &overall.encode_to_vec(),
+        );
+
+        let export_metadata = ExportMetadata {
+            operation: None,
+            items: include_items.then(|| ExportMetadataItems {
+                kind: "Task".to_string(),
+                outputs: vec![output_path.to_string()],
+            }),
+        };
+        std::fs::write(
+            exports_dir.join(metadata_path),
+            export_metadata.encode_to_vec(),
+        )
+        .unwrap();
+
+        write_leveldb_full_record(&kind_dir.join("output-0"), &entity.encode_to_vec());
+    }
+
+    fn write_minimal_export(root: &Path, entity: EntityProto) {
+        write_minimal_export_with_paths(
+            root,
+            entity,
+            "all_namespaces/kind_Task.export_metadata",
+            "output-0",
+            true,
+        );
+    }
+
+    #[test]
+    fn converter_dump_normalizes_legacy_app_ids_for_keys_and_reference_properties() {
+        let mut entity = legacy_entity("s~source-project", "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            "s~source-project",
+            "Owner",
+            "owner-one",
+        ));
+
+        let converted = converter_dump(vec![entity]);
+        let entity = &converted[0].entity;
+
+        assert_eq!(key_project_id(entity), SOURCE_PROJECT);
+        assert_eq!(key_property_project_id(entity, "owner"), SOURCE_PROJECT);
+    }
+
+    #[test]
+    fn import_dump_for_project_rewrites_entity_and_reference_property_projects() {
+        let root = temp_export_root();
+        let mut entity = legacy_entity(SOURCE_PROJECT, "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            SOURCE_PROJECT,
+            "Owner",
+            "owner-one",
+        ));
+        write_minimal_export(&root, entity);
+
+        let mut storage = DatastoreStorage::default();
+        storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap();
+
+        let stored_entity = &storage.entities.values().next().unwrap().entity;
+        assert_eq!(storage.entities.len(), 1);
+        assert_eq!(key_project_id(stored_entity), LOCAL_PROJECT);
+        assert_eq!(
+            key_property_project_id(stored_entity, "owner"),
+            LOCAL_PROJECT
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_fails_when_export_metadata_is_missing() {
+        let root = temp_export_root();
+        std::fs::create_dir_all(root.join("exports")).unwrap();
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("Could not find .overall_export_metadata")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_fails_when_kind_metadata_items_are_missing() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "all_namespaces/kind_Task.export_metadata",
+            "output-0",
+            false,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("missing items"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_rejects_unsafe_export_metadata_path() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "../kind_Task.export_metadata",
+            "output-0",
+            true,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Export metadata path"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_rejects_unsafe_output_path() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "all_namespaces/kind_Task.export_metadata",
+            "../output-0",
+            true,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Export output path"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
