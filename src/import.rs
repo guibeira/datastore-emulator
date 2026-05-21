@@ -10,6 +10,19 @@ use std::time::Instant;
 use tokio::{io::AsyncWriteExt, sync::RwLock, task};
 use tracing;
 
+fn download_temp_path_for_object(object: &str) -> std::path::PathBuf {
+    let file_name = object
+        .split('/')
+        .next_back()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("datastore_export.zip");
+    std::env::temp_dir().join(format!(
+        "datastore-emulator-download-{}-{}",
+        uuid::Uuid::new_v4(),
+        file_name
+    ))
+}
+
 async fn download_gcs_file(
     gcs_url: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -38,14 +51,8 @@ async fn download_gcs_file(
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
-    // Create a temporary file to store the download
-    let file_name = object
-        .split('/')
-        .next_back()
-        .unwrap_or("datastore_export.zip");
-    let mut temp_path = std::env::temp_dir();
-    temp_path.push(file_name);
-
+    // Create a unique temporary file to store the download.
+    let temp_path = download_temp_path_for_object(object);
     let local_path_str = temp_path.to_str().ok_or("Invalid temp path")?.to_string();
 
     let mut dest = tokio::fs::File::create(&temp_path).await?;
@@ -408,6 +415,42 @@ mod tests {
         .unwrap();
         zip.write_all(b"metadata").unwrap();
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn download_temp_path_for_object_is_unique_and_preserves_basename() {
+        let first = download_temp_path_for_object("exports/backup.zip");
+        let second = download_temp_path_for_object("exports/backup.zip");
+
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("datastore-emulator-download-")
+        );
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("backup.zip")
+        );
+    }
+
+    #[test]
+    fn download_temp_path_for_metadata_object_preserves_metadata_suffix() {
+        let path = download_temp_path_for_object(
+            "exports/all_namespaces_kind_Task.overall_export_metadata",
+        );
+
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".overall_export_metadata")
+        );
     }
 
     #[test]

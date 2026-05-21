@@ -782,6 +782,37 @@ fn rewrite_entity_project_id(entity: &mut Entity, project_id: &str) {
 
 type ImportReadResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn validate_export_relative_path(
+    raw_path: &str,
+    description: &str,
+) -> ImportReadResult<std::path::PathBuf> {
+    if raw_path.is_empty() {
+        return Err(format!("{} path is empty", description).into());
+    }
+    if raw_path.starts_with('/') || raw_path.starts_with('\\') || raw_path.contains('\\') {
+        return Err(format!(
+            "{} path must be a relative slash-separated path: {}",
+            description, raw_path
+        )
+        .into());
+    }
+
+    let path = std::path::Path::new(raw_path);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "{} path must not contain root, current, or parent components: {}",
+            description, raw_path
+        )
+        .into());
+    }
+
+    Ok(path.to_path_buf())
+}
+
 pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExportMetadata> {
     let mut metadata_file = None;
     let path_to_search = std::path::Path::new(export_dir).join("exports");
@@ -830,9 +861,11 @@ pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
             .as_ref()
             .map_or_else(String::new, |k| k.kind.clone());
         tracing::info!("Processing kind: {}", kind_name);
+        let metadata_relative_path =
+            validate_export_relative_path(&export_entry.path, "Export metadata")?;
         let metadata_path = std::path::PathBuf::from(export_dir)
             .join("exports")
-            .join(&export_entry.path);
+            .join(metadata_relative_path);
 
         if !metadata_path.exists() {
             return Err(format!(
@@ -853,14 +886,19 @@ pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
         let export_metadata = ExportMetadata::decode(&data[..])
             .map_err(|e| format!("Failed to decode ExportMetadata for {}: {}", kind_name, e))?;
 
-        let output_file_names = export_metadata.items.unwrap_or_default().outputs;
+        let output_file_names = export_metadata
+            .items
+            .ok_or_else(|| format!("ExportMetadata for kind {} is missing items", kind_name))?
+            .outputs;
         let parent_dir_for_output_files = metadata_path
             .parent()
             .ok_or_else(|| format!("Metadata path has no parent: {}", metadata_path.display()))?
             .to_path_buf();
 
         for output_file_name_str in output_file_names {
-            let output_file_path = parent_dir_for_output_files.join(output_file_name_str);
+            let output_relative_path =
+                validate_export_relative_path(&output_file_name_str, "Export output")?;
+            let output_file_path = parent_dir_for_output_files.join(output_relative_path);
             if !output_file_path.exists() {
                 return Err(
                     format!("Output file {} does not exist.", output_file_path.display()).into(),
@@ -2804,12 +2842,17 @@ mod tests {
         std::fs::write(path, record).unwrap();
     }
 
-    fn write_minimal_export(root: &Path, entity: EntityProto) {
+    fn write_minimal_export_with_paths(
+        root: &Path,
+        entity: EntityProto,
+        metadata_path: &str,
+        output_path: &str,
+        include_items: bool,
+    ) {
         let exports_dir = root.join("exports");
         let kind_dir = exports_dir.join("all_namespaces");
         std::fs::create_dir_all(&kind_dir).unwrap();
 
-        let metadata_path = "all_namespaces/kind_Task.export_metadata";
         let overall = OverallExportMetadata {
             exports: vec![ExportMetadataEntry {
                 kind: Some(ExportMetadataEntryKind {
@@ -2829,9 +2872,9 @@ mod tests {
 
         let export_metadata = ExportMetadata {
             operation: None,
-            items: Some(ExportMetadataItems {
+            items: include_items.then(|| ExportMetadataItems {
                 kind: "Task".to_string(),
-                outputs: vec!["output-0".to_string()],
+                outputs: vec![output_path.to_string()],
             }),
         };
         std::fs::write(
@@ -2841,6 +2884,16 @@ mod tests {
         .unwrap();
 
         write_leveldb_full_record(&kind_dir.join("output-0"), &entity.encode_to_vec());
+    }
+
+    fn write_minimal_export(root: &Path, entity: EntityProto) {
+        write_minimal_export_with_paths(
+            root,
+            entity,
+            "all_namespaces/kind_Task.export_metadata",
+            "output-0",
+            true,
+        );
     }
 
     #[test]
@@ -2904,6 +2957,72 @@ mod tests {
                 .message()
                 .contains("Could not find .overall_export_metadata")
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_fails_when_kind_metadata_items_are_missing() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "all_namespaces/kind_Task.export_metadata",
+            "output-0",
+            false,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("missing items"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_rejects_unsafe_export_metadata_path() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "../kind_Task.export_metadata",
+            "output-0",
+            true,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Export metadata path"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_rejects_unsafe_output_path() {
+        let root = temp_export_root();
+        write_minimal_export_with_paths(
+            &root,
+            legacy_entity(SOURCE_PROJECT, "Task", "one"),
+            "all_namespaces/kind_Task.export_metadata",
+            "../output-0",
+            true,
+        );
+
+        let mut storage = DatastoreStorage::default();
+        let status = storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Export output path"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
