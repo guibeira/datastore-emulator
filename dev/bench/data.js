@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779233175601,
+  "lastUpdate": 1779401814311,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -178,6 +178,66 @@ window.BENCHMARK_DATA = {
             "value": 1.973052,
             "unit": "s",
             "extra": "10 clients, 20 runs/client, total 19.7305s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "committer": {
+            "email": "github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "distinct": true,
+          "id": "e209fdde0944cea92c6740ac33df792deab426b9",
+          "message": "chore(release): v0.1.3",
+          "timestamp": "2026-05-21T22:12:20Z",
+          "tree_id": "08a741e45c9089623b4857255c163f24d209a857",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/e209fdde0944cea92c6740ac33df792deab426b9"
+        },
+        "date": 1779401813892,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Single Insert (Rust) - avg seconds per client",
+            "value": 0.153492,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 1.5349s"
+          },
+          {
+            "name": "Single Insert (Java) - avg seconds per client",
+            "value": 0.583007,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 5.8301s"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - avg seconds per client",
+            "value": 0.957246,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 9.5725s"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - avg seconds per client",
+            "value": 4.244921,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 42.4492s"
+          },
+          {
+            "name": "Simple Query (Rust) - avg seconds per client",
+            "value": 0.412959,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 4.1296s"
+          },
+          {
+            "name": "Simple Query (Java) - avg seconds per client",
+            "value": 1.688681,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, total 16.8868s"
           }
         ]
       }
