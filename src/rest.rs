@@ -144,9 +144,10 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     };
 
     let operation_id = Uuid::new_v4().to_string();
+    let operation_start_time = Utc::now();
     let operation_state = OperationState {
         status: OperationStatus::Processing,
-        start_time: Utc::now(),
+        start_time: operation_start_time.clone(),
         end_time: None,
         error: None,
     };
@@ -165,18 +166,20 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     )
     .await;
 
-    let final_state = state
+    let (final_state, start_time) = state
         .operations
         .read()
         .await
         .get(&operation_id)
-        .map(|s| match s.status {
-            OperationStatus::Successful => "SUCCESSFUL",
-            OperationStatus::Failed => "FAILED",
-            OperationStatus::Processing => "PROCESSING",
+        .map(|s| {
+            let state = match s.status {
+                OperationStatus::Successful => "SUCCESSFUL",
+                OperationStatus::Failed => "FAILED",
+                OperationStatus::Processing => "PROCESSING",
+            };
+            (state.to_string(), s.start_time.to_rfc3339())
         })
-        .unwrap_or("PROCESSING")
-        .to_string();
+        .unwrap_or_else(|| ("PROCESSING".to_string(), operation_start_time.to_rfc3339()));
 
     let response = ImportResponse {
         name: format!("projects/{}/operations/{}", project_id, operation_id),
@@ -184,7 +187,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
             type_url: "type.googleapis.com/google.datastore.admin.v1.ImportEntitiesMetadata"
                 .to_string(),
             common: CommonMetadata {
-                start_time: Utc::now().to_rfc3339(),
+                start_time,
                 operation_type: "IMPORT_ENTITIES".to_string(),
                 state: final_state,
             },
@@ -590,6 +593,10 @@ mod tests {
         let operations = state.operations.read().await;
         assert_eq!(operations.len(), 1);
         let operation = operations.values().next().unwrap();
+        assert_eq!(
+            v["metadata"]["common"]["startTime"],
+            operation.start_time.to_rfc3339()
+        );
         assert!(matches!(operation.status.clone(), OperationStatus::Failed));
         assert!(operation
             .error

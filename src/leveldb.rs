@@ -107,6 +107,14 @@ impl LogReader {
     fn read_physical_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CorruptionError> {
         loop {
             if self.block.is_empty() || self.block.len() - self.block_offset < HEADER_SIZE {
+                if !self.block.is_empty() && self.block_offset < self.block.len() {
+                    let trailer = &self.block[self.block_offset..];
+                    if trailer.iter().any(|&b| b != 0) {
+                        return Err(CorruptionError::TruncatedRecord(
+                            "Non-zero bytes found in block trailer",
+                        ));
+                    }
+                }
                 if !self.load_next_block()? {
                     return Ok(None);
                 }
@@ -247,6 +255,25 @@ mod tests {
         assert_eq!(reader.next().unwrap().unwrap(), first);
         assert_eq!(reader.next().unwrap().unwrap(), second);
         assert!(reader.next().is_none());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_zero_block_trailer() {
+        let path = temp_log_path();
+        let mut file = File::create(&path).unwrap();
+        let first = vec![b'a'; BLOCK_SIZE - HEADER_SIZE - 3];
+
+        write_full_record(&mut file, &first);
+        file.write_all(&[1, 2, 3]).unwrap();
+        drop(file);
+
+        let mut reader = LogReader::new(&path).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), first);
+        let error = reader.next().unwrap().unwrap_err();
+        assert!(matches!(error, CorruptionError::TruncatedRecord(_)));
+        assert!(error.to_string().contains("Non-zero bytes"));
 
         std::fs::remove_file(path).unwrap();
     }

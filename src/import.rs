@@ -104,6 +104,25 @@ pub async fn bg_import_data(
         input_url.clone()
     };
 
+    let cleanup_downloaded_file = |path: String| async move {
+        let cleanup_path = path.clone();
+        match task::spawn_blocking(move || std::fs::remove_file(&cleanup_path)).await {
+            Ok(Ok(())) => {
+                tracing::info!("Temporary downloaded file {} removed.", path);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to remove temporary downloaded file {}: {}", path, e);
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    "Cleanup task for temporary file {} failed: {}",
+                    path,
+                    join_err
+                );
+            }
+        }
+    };
+
     let prepare_result = task::spawn_blocking({
         let path = local_file_path.clone();
         move || prepare_export_dir(path)
@@ -135,6 +154,9 @@ pub async fn bg_import_data(
                     local_file_path, e
                 ));
             }
+            if downloaded_from_gcs {
+                cleanup_downloaded_file(local_file_path.clone()).await;
+            }
             return;
         }
         Err(join_err) => {
@@ -148,6 +170,9 @@ pub async fn bg_import_data(
                 state.status = OperationStatus::Failed;
                 state.end_time = Some(Utc::now());
                 state.error = Some("Background preparation task failed".to_string());
+            }
+            if downloaded_from_gcs {
+                cleanup_downloaded_file(local_file_path.clone()).await;
             }
             return;
         }
@@ -210,26 +235,7 @@ pub async fn bg_import_data(
     }
 
     if downloaded_from_gcs {
-        let cleanup_path = local_file_path.clone();
-        match task::spawn_blocking(move || std::fs::remove_file(&cleanup_path)).await {
-            Ok(Ok(())) => {
-                tracing::info!("Temporary downloaded file {} removed.", local_file_path);
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "Failed to remove temporary downloaded file {}: {}",
-                    local_file_path,
-                    e
-                );
-            }
-            Err(join_err) => {
-                tracing::warn!(
-                    "Cleanup task for temporary file {} failed: {}",
-                    local_file_path,
-                    join_err
-                );
-            }
-        }
+        cleanup_downloaded_file(local_file_path.clone()).await;
     }
 
     tracing::info!("Background import completed.");
@@ -240,8 +246,8 @@ pub async fn bg_import_data(
 /// `export_dir` is a path suitable for `DatastoreStorage::import_dump`, i.e. it
 /// satisfies `<export_dir>/exports/<name>.overall_export_metadata`.
 ///
-/// `extracted_dump` is `true` when this function extracted a zip archive into
-/// `./dump` and the caller is expected to clean it up.
+/// `extracted_dump` is `true` when this function extracted a zip archive into a
+/// temporary directory and the caller is expected to clean it up.
 ///
 /// Accepted input formats:
 ///   * A zip archive (`*.zip` or magic-byte detected) that contains an
@@ -271,8 +277,12 @@ fn prepare_export_dir(
         }
 
         if is_zip_file(path)? {
-            extract_zip_to_dump(path)?;
-            return Ok(("dump".to_string(), true));
+            let dump_path = unique_dump_dir();
+            if let Err(e) = extract_zip_to_dir(path, &dump_path) {
+                let _ = std::fs::remove_dir_all(&dump_path);
+                return Err(e);
+            }
+            return Ok((dump_path.to_string_lossy().into_owned(), true));
         }
 
         return Err(format!(
@@ -325,10 +335,14 @@ fn contains_overall_metadata(dir: &std::path::Path) -> Result<bool, std::io::Err
     Ok(false)
 }
 
-fn extract_zip_to_dump(
+fn unique_dump_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("datastore-emulator-dump-{}", uuid::Uuid::new_v4()))
+}
+
+fn extract_zip_to_dir(
     zip_path: &std::path::Path,
+    dump_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let dump_path = std::path::Path::new("dump");
     if dump_path.exists() {
         std::fs::remove_dir_all(dump_path)?;
     }
@@ -355,6 +369,7 @@ fn extract_zip_to_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     fn temp_export_root() -> PathBuf {
@@ -374,6 +389,25 @@ mod tests {
 
     fn assert_prepared_path_eq(actual: String, expected: &Path) {
         assert_eq!(PathBuf::from(actual), expected);
+    }
+
+    fn temp_zip_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "datastore-emulator-import-test-{}.zip",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn write_export_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "exports/all_namespaces_kind_Task.overall_export_metadata",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"metadata").unwrap();
+        zip.finish().unwrap();
     }
 
     #[test]
@@ -417,5 +451,39 @@ mod tests {
         assert!(!extracted_dump);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_export_dir_extracts_zip_to_unique_temp_directory() {
+        let zip_path = temp_zip_path();
+        write_export_zip(&zip_path);
+
+        let (first_dir, first_extracted) =
+            prepare_export_dir(zip_path.to_string_lossy().into_owned()).unwrap();
+        let (second_dir, second_extracted) =
+            prepare_export_dir(zip_path.to_string_lossy().into_owned()).unwrap();
+
+        let first_path = PathBuf::from(&first_dir);
+        let second_path = PathBuf::from(&second_dir);
+        assert!(first_extracted);
+        assert!(second_extracted);
+        assert_ne!(first_path, PathBuf::from("dump"));
+        assert_ne!(first_path, second_path);
+        assert!(
+            first_path
+                .join("exports")
+                .join("all_namespaces_kind_Task.overall_export_metadata")
+                .exists()
+        );
+        assert!(
+            second_path
+                .join("exports")
+                .join("all_namespaces_kind_Task.overall_export_metadata")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(first_path).unwrap();
+        std::fs::remove_dir_all(second_path).unwrap();
+        std::fs::remove_file(zip_path).unwrap();
     }
 }
