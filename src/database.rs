@@ -627,11 +627,22 @@ fn convert_reference_value_to_key(reference_value: &ReferenceValue) -> Key {
 
     Key {
         partition_id: Some(PartitionId {
-            project_id: reference_value.app.clone(),
+            project_id: normalize_app_id(&reference_value.app),
             namespace_id: reference_value.name_space.clone().unwrap_or_default(),
             database_id: "".to_string(),
         }),
         path,
+    }
+}
+
+/// Legacy GAE app IDs are prefixed with a partition specifier (`s~`, `e~`,
+/// `dev~`). Datastore v1 callers use the bare project_id, so strip the
+/// prefix when present.
+fn normalize_app_id(app: &str) -> String {
+    if let Some(idx) = app.find('~') {
+        app[idx + 1..].to_string()
+    } else {
+        app.to_string()
     }
 }
 
@@ -655,7 +666,7 @@ fn convert_reference_to_key(reference: &Reference) -> Key {
 
     Key {
         partition_id: Some(PartitionId {
-            project_id: reference.app.clone(),
+            project_id: normalize_app_id(&reference.app),
             namespace_id: reference.name_space.clone().unwrap_or_default(),
             database_id: "".to_string(),
         }),
@@ -739,6 +750,34 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
             }
         })
         .collect()
+}
+
+fn rewrite_key_project_id(key: &mut Key, project_id: &str) {
+    if let Some(partition) = key.partition_id.as_mut() {
+        partition.project_id = project_id.to_string();
+    }
+}
+
+fn rewrite_value_project_id(value: &mut Value, project_id: &str) {
+    match value.value_type.as_mut() {
+        Some(ValueType::KeyValue(key)) => rewrite_key_project_id(key, project_id),
+        Some(ValueType::ArrayValue(array)) => {
+            for value in array.values.iter_mut() {
+                rewrite_value_project_id(value, project_id);
+            }
+        }
+        Some(ValueType::EntityValue(entity)) => rewrite_entity_project_id(entity, project_id),
+        _ => {}
+    }
+}
+
+fn rewrite_entity_project_id(entity: &mut Entity, project_id: &str) {
+    if let Some(key) = entity.key.as_mut() {
+        rewrite_key_project_id(key, project_id);
+    }
+    for value in entity.properties.values_mut() {
+        rewrite_value_project_id(value, project_id);
+    }
 }
 
 pub fn read_overall_metadata(export_dir: &str) -> Option<OverallExportMetadata> {
@@ -1674,8 +1713,26 @@ impl DatastoreStorage {
     }
 
     pub fn import_dump(&mut self, path: &str) -> Result<(), tonic::Status> {
+        self.import_dump_for_project(path, None)
+    }
+
+    /// Import a Cloud Datastore export from `path`. If `target_project_id` is
+    /// `Some`, imported entity keys and key-valued properties are rewritten to
+    /// that value. This lets exports from prod be ingested into the local
+    /// emulator under a different project_id (the one the caller queries
+    /// with).
+    pub fn import_dump_for_project(
+        &mut self,
+        path: &str,
+        target_project_id: Option<&str>,
+    ) -> Result<(), tonic::Status> {
         let dump_entities = read_dump(path);
-        let entities_with_metadata = converter_dump(dump_entities);
+        let mut entities_with_metadata = converter_dump(dump_entities);
+        if let Some(project_id) = target_project_id {
+            for ewm in entities_with_metadata.iter_mut() {
+                rewrite_entity_project_id(&mut ewm.entity, project_id);
+            }
+        }
         tracing::info!(
             "Importing {} entities from dump at {}",
             entities_with_metadata.len(),
@@ -2686,5 +2743,201 @@ impl DatastoreStorage {
         self.remove_ancestor_indexes(&key_struct_to_delete);
         self.remove_scoped_entity(&key_struct_to_delete);
         Some(removed_entity_metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::google::datastore::import_export::datastore_v3::{
+        Path as LegacyPath, Property, PropertyValue, path, property_value,
+        property_value::reference_value,
+    };
+    use crate::google::datastore::import_export::dsbackups::{
+        ExportMetadataEntry, ExportMetadataEntryKind, ExportMetadataItems,
+    };
+    use std::path::{Path, PathBuf};
+
+    const LOCAL_PROJECT: &str = "local-project";
+    const SOURCE_PROJECT: &str = "source-project";
+
+    fn legacy_path(kind: &str, name: &str) -> LegacyPath {
+        LegacyPath {
+            element: vec![path::Element {
+                r#type: kind.to_string(),
+                id: None,
+                name: Some(name.to_string()),
+            }],
+        }
+    }
+
+    fn legacy_reference(app: &str, kind: &str, name: &str) -> Reference {
+        Reference {
+            app: app.to_string(),
+            name_space: None,
+            path: legacy_path(kind, name),
+        }
+    }
+
+    fn legacy_entity(app: &str, kind: &str, name: &str) -> EntityProto {
+        EntityProto {
+            key: legacy_reference(app, kind, name),
+            entity_group: LegacyPath { element: vec![] },
+            owner: None,
+            kind: None,
+            kind_uri: None,
+            property: vec![],
+            raw_property: vec![],
+            rank: None,
+        }
+    }
+
+    fn reference_property(name: &str, app: &str, kind: &str, entity_name: &str) -> Property {
+        Property {
+            meaning: None,
+            meaning_uri: None,
+            name: name.to_string(),
+            value: PropertyValue {
+                int64_value: None,
+                boolean_value: None,
+                string_value: None,
+                double_value: None,
+                pointvalue: None,
+                uservalue: None,
+                referencevalue: Some(property_value::ReferenceValue {
+                    app: app.to_string(),
+                    name_space: None,
+                    pathelement: vec![reference_value::PathElement {
+                        r#type: kind.to_string(),
+                        id: None,
+                        name: Some(entity_name.to_string()),
+                    }],
+                }),
+            },
+            multiple: false,
+            searchable: Some(true),
+            fts_tokenization_option: None,
+            locale: None,
+        }
+    }
+
+    fn key_project_id(entity: &Entity) -> &str {
+        &entity
+            .key
+            .as_ref()
+            .unwrap()
+            .partition_id
+            .as_ref()
+            .unwrap()
+            .project_id
+    }
+
+    fn key_property_project_id<'a>(entity: &'a Entity, name: &str) -> &'a str {
+        let Some(ValueType::KeyValue(key)) =
+            entity.properties.get(name).unwrap().value_type.as_ref()
+        else {
+            panic!("expected key-valued property {name}");
+        };
+        &key.partition_id.as_ref().unwrap().project_id
+    }
+
+    fn temp_export_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "datastore-emulator-import-project-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn write_leveldb_full_record(path: &Path, data: &[u8]) {
+        let mut record = Vec::with_capacity(7 + data.len());
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        record.push(1);
+        record.extend_from_slice(data);
+        std::fs::write(path, record).unwrap();
+    }
+
+    fn write_minimal_export(root: &Path, entity: EntityProto) {
+        let exports_dir = root.join("exports");
+        let kind_dir = exports_dir.join("all_namespaces");
+        std::fs::create_dir_all(&kind_dir).unwrap();
+
+        let metadata_path = "all_namespaces/kind_Task.export_metadata";
+        let overall = OverallExportMetadata {
+            exports: vec![ExportMetadataEntry {
+                kind: Some(ExportMetadataEntryKind {
+                    unknown1: 0,
+                    kind: "Task".to_string(),
+                    unknown2: 0,
+                }),
+                path: metadata_path.to_string(),
+                count: 1,
+                size: 0,
+            }],
+        };
+        write_leveldb_full_record(
+            &exports_dir.join("all_namespaces_kind_Task.overall_export_metadata"),
+            &overall.encode_to_vec(),
+        );
+
+        let export_metadata = ExportMetadata {
+            operation: None,
+            items: Some(ExportMetadataItems {
+                kind: "Task".to_string(),
+                outputs: vec!["output-0".to_string()],
+            }),
+        };
+        std::fs::write(
+            exports_dir.join(metadata_path),
+            export_metadata.encode_to_vec(),
+        )
+        .unwrap();
+
+        write_leveldb_full_record(&kind_dir.join("output-0"), &entity.encode_to_vec());
+    }
+
+    #[test]
+    fn converter_dump_normalizes_legacy_app_ids_for_keys_and_reference_properties() {
+        let mut entity = legacy_entity("s~source-project", "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            "s~source-project",
+            "Owner",
+            "owner-one",
+        ));
+
+        let converted = converter_dump(vec![entity]);
+        let entity = &converted[0].entity;
+
+        assert_eq!(key_project_id(entity), SOURCE_PROJECT);
+        assert_eq!(key_property_project_id(entity, "owner"), SOURCE_PROJECT);
+    }
+
+    #[test]
+    fn import_dump_for_project_rewrites_entity_and_reference_property_projects() {
+        let root = temp_export_root();
+        let mut entity = legacy_entity(SOURCE_PROJECT, "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            SOURCE_PROJECT,
+            "Owner",
+            "owner-one",
+        ));
+        write_minimal_export(&root, entity);
+
+        let mut storage = DatastoreStorage::default();
+        storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap();
+
+        let stored_entity = &storage.entities.values().next().unwrap().entity;
+        assert_eq!(storage.entities.len(), 1);
+        assert_eq!(key_project_id(stored_entity), LOCAL_PROJECT);
+        assert_eq!(
+            key_property_project_id(stored_entity, "owner"),
+            LOCAL_PROJECT
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -161,6 +161,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
         state.operations.clone(),
         operation_id.clone(),
         payload.input_url.clone(),
+        Some(project_id.clone()),
     )
     .await;
 

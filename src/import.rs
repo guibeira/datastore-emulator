@@ -68,6 +68,7 @@ pub async fn bg_import_data(
     operations: Operations,
     operation_id: String,
     input_url: String,
+    target_project_id: Option<String>,
 ) {
     tracing::info!("Importing data from {:?} in the background...", input_url);
 
@@ -155,7 +156,7 @@ pub async fn bg_import_data(
     let start = Instant::now();
     let import_result = {
         let mut storage_guard = storage.write().await;
-        storage_guard.import_dump(&export_dir)
+        storage_guard.import_dump_for_project(&export_dir, target_project_id.as_deref())
     };
 
     let duration = start.elapsed();
