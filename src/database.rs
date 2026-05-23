@@ -2401,13 +2401,12 @@ impl DatastoreStorage {
             if let Ok((cursor_key, _)) = decode_result {
                 let mut matched = false;
                 for (idx, candidate) in filtered_entities.iter().enumerate() {
-                    if let Some(key_struct) = candidate.key_struct.as_ref() {
-                        if key_struct == &cursor_key {
+                    if let Some(key_struct) = candidate.key_struct.as_ref()
+                        && key_struct == &cursor_key {
                             start_index = idx + 1;
                             matched = true;
                             break;
                         }
-                    }
                 }
                 if !matched {
                     let mut index = 0usize;
@@ -3018,7 +3017,10 @@ mod tests {
         let decoded = read_overall_metadata(root.to_str().unwrap()).unwrap();
 
         assert_eq!(decoded.exports.len(), 1);
-        assert_eq!(decoded.exports[0].path, "all_namespaces/kind_Task.export_metadata");
+        assert_eq!(
+            decoded.exports[0].path,
+            "all_namespaces/kind_Task.export_metadata"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

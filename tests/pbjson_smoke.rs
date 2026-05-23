@@ -1,5 +1,6 @@
 use datastore_emulator::google::datastore::v1::{
-    Key, PartitionId, key::{PathElement, path_element::IdType},
+    Key, PartitionId,
+    key::{PathElement, path_element::IdType},
 };
 
 #[test]

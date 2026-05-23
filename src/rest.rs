@@ -70,8 +70,14 @@ pub async fn datastore_method_handler(
 
     // Methods carrying a top-level projectId in their proto. Inject from URL when missing.
     let body = match method {
-        "lookup" | "runQuery" | "runAggregationQuery" | "commit" | "beginTransaction"
-        | "rollback" | "allocateIds" | "reserveIds" => match inject_project_id(&body, project_id) {
+        "lookup"
+        | "runQuery"
+        | "runAggregationQuery"
+        | "commit"
+        | "beginTransaction"
+        | "rollback"
+        | "allocateIds"
+        | "reserveIds" => match inject_project_id(&body, project_id) {
             Ok(b) => b,
             Err(e) => return bad_request(&e),
         },
@@ -86,7 +92,9 @@ pub async fn datastore_method_handler(
         "rollback" => json_call(body, |r| core::rollback(&state.storage, r)).await,
         "allocateIds" => json_call(body, |r| core::allocate_ids(&state.storage, r)).await,
         "reserveIds" => json_call(body, |r| core::reserve_ids(&state.storage, r)).await,
-        "runAggregationQuery" => json_call(body, |r| core::run_aggregation_query(&state.storage, r)).await,
+        "runAggregationQuery" => {
+            json_call(body, |r| core::run_aggregation_query(&state.storage, r)).await
+        }
         "import" => import_handler(state, project_id.to_string(), body).await,
         "export" => export_handler().await,
         other => not_found(&format!("unknown Datastore method: {other}")),
@@ -147,7 +155,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     let operation_start_time = Utc::now();
     let operation_state = OperationState {
         status: OperationStatus::Processing,
-        start_time: operation_start_time.clone(),
+        start_time: operation_start_time,
         end_time: None,
         error: None,
     };
@@ -204,8 +212,8 @@ mod tests {
     use super::*;
     use crate::api::create_router;
     use crate::database::{DatastoreStorage, EntityWithMetadata, KeyId, KeyStruct};
-    use crate::google::datastore::v1::key::path_element::IdType;
     use crate::google::datastore::v1::key::PathElement;
+    use crate::google::datastore::v1::key::path_element::IdType;
     use crate::google::datastore::v1::{Entity, Key, PartitionId};
     use axum::body::Body;
     use axum::http::Request;
@@ -279,10 +287,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must match URL project"));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must match URL project")
+        );
     }
 
     #[tokio::test]
@@ -468,7 +478,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(v["keys"][0]["path"][0]["id"].as_str().unwrap().parse::<i64>().is_ok());
+        assert!(
+            v["keys"][0]["path"][0]["id"]
+                .as_str()
+                .unwrap()
+                .parse::<i64>()
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -598,11 +614,13 @@ mod tests {
             operation.start_time.to_rfc3339()
         );
         assert!(matches!(operation.status.clone(), OperationStatus::Failed));
-        assert!(operation
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("File not found"));
+        assert!(
+            operation
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("File not found")
+        );
     }
 
     #[tokio::test]
