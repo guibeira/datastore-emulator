@@ -1,5 +1,5 @@
 use crate::google::datastore::import_export::datastore_v3::{
-    EntityProto, PropertyValue, Reference, property_value::ReferenceValue,
+    EntityProto, Property, Reference, property_value::ReferenceValue,
 };
 use crate::google::datastore::v1::key::PathElement;
 use tracing;
@@ -580,7 +580,20 @@ fn values_match_filter<'a>(
     }
 }
 
-fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
+fn convert_legacy_bytes_value(meaning: Option<i32>, bytes: &[u8]) -> ValueType {
+    match meaning {
+        // Legacy BLOB and BYTESTRING values are stored in stringValue in
+        // Datastore export protos, but the bytes are not guaranteed to be UTF-8.
+        Some(14 | 16) => ValueType::BlobValue(bytes.to_vec()),
+        _ => match String::from_utf8(bytes.to_vec()) {
+            Ok(value) => ValueType::StringValue(value),
+            Err(_) => ValueType::BlobValue(bytes.to_vec()),
+        },
+    }
+}
+
+fn convert_property_value(prop: &Property) -> Option<ValueType> {
+    let prop_val = &prop.value;
     if let Some(v) = prop_val.int64_value {
         return Some(ValueType::IntegerValue(v));
     }
@@ -588,7 +601,7 @@ fn convert_property_value(prop_val: &PropertyValue) -> Option<ValueType> {
         return Some(ValueType::BooleanValue(v));
     }
     if let Some(v) = &prop_val.string_value {
-        return Some(ValueType::StringValue(v.clone()));
+        return Some(convert_legacy_bytes_value(prop.meaning, v));
     }
     if let Some(v) = prop_val.double_value {
         return Some(ValueType::DoubleValue(v));
@@ -684,8 +697,7 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
             let mut grouped_props: HashMap<String, (Vec<Value>, bool)> = HashMap::new();
 
             for prop in &entity_proto.property {
-                let prop_val = &prop.value;
-                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                if let Some(v1_value_type) = convert_property_value(prop) {
                     let entry = grouped_props
                         .entry(prop.name.clone())
                         .or_insert((vec![], false));
@@ -697,8 +709,7 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
             }
 
             for prop in &entity_proto.raw_property {
-                let prop_val = &prop.value;
-                if let Some(v1_value_type) = convert_property_value(prop_val) {
+                if let Some(v1_value_type) = convert_property_value(prop) {
                     let entry = grouped_props
                         .entry(prop.name.clone())
                         .or_insert((vec![], true));
@@ -837,10 +848,49 @@ pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExport
     tracing::debug!("Found metadata file: {}", metadata_file.display());
 
     let reader = LogReader::new(&metadata_file)?;
+    let mut records_read = 0usize;
+    let mut empty_metadata = None;
+    let mut last_decode_error = None;
     for record_result in reader {
+        records_read += 1;
         let record = record_result?;
-        return OverallExportMetadata::decode(&record[..])
-            .map_err(|e| format!("Failed to decode OverallExportMetadata: {}", e).into());
+        match OverallExportMetadata::decode(&record[..]) {
+            Ok(metadata) if !metadata.exports.is_empty() => return Ok(metadata),
+            Ok(metadata) => {
+                tracing::debug!(
+                    "Skipping empty OverallExportMetadata record {} in {}",
+                    records_read,
+                    metadata_file.display()
+                );
+                empty_metadata.get_or_insert(metadata);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Skipping non-metadata record {} in {}: {}",
+                    records_read,
+                    metadata_file.display(),
+                    e
+                );
+                last_decode_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(metadata) = empty_metadata {
+        return Ok(metadata);
+    }
+
+    if records_read > 0 {
+        let detail = last_decode_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no decodable metadata records".to_string());
+        return Err(format!(
+            "Failed to decode OverallExportMetadata from {} after reading {} records: {}",
+            metadata_file.display(),
+            records_read,
+            detail
+        )
+        .into());
     }
 
     Err(format!(
@@ -854,6 +904,8 @@ pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
     tracing::info!("Reading datastore export from: {}", export_dir);
     let metadata = read_overall_metadata(export_dir)?;
     let mut entity_protos = Vec::new();
+    let mut processed_metadata_files = 0usize;
+    let mut skipped_metadata_files = 0usize;
 
     for export_entry in metadata.exports {
         let kind_name = export_entry
@@ -868,13 +920,15 @@ pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
             .join(metadata_relative_path);
 
         if !metadata_path.exists() {
-            return Err(format!(
-                "Metadata file for kind {} not found at: {}",
+            skipped_metadata_files += 1;
+            tracing::warn!(
+                "Skipping kind {} because its metadata file was not found at: {}",
                 kind_name,
                 metadata_path.display()
-            )
-            .into());
+            );
+            continue;
         }
+        processed_metadata_files += 1;
 
         let data = std::fs::read(&metadata_path).map_err(|e| {
             format!(
@@ -926,6 +980,14 @@ pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
                 entity_protos.push(entity_proto);
             }
         }
+    }
+
+    if processed_metadata_files == 0 && skipped_metadata_files > 0 {
+        return Err(format!(
+            "No importable kind metadata files found in {}; skipped {} missing metadata files",
+            export_dir, skipped_metadata_files
+        )
+        .into());
     }
 
     tracing::info!("Finished reading datastore export.");
@@ -2806,6 +2868,27 @@ mod tests {
         }
     }
 
+    fn legacy_string_property(name: &str, meaning: Option<i32>, value: &[u8]) -> Property {
+        Property {
+            meaning,
+            meaning_uri: None,
+            name: name.to_string(),
+            value: PropertyValue {
+                int64_value: None,
+                boolean_value: None,
+                string_value: Some(value.to_vec()),
+                double_value: None,
+                pointvalue: None,
+                uservalue: None,
+                referencevalue: None,
+            },
+            multiple: false,
+            searchable: Some(true),
+            fts_tokenization_option: None,
+            locale: None,
+        }
+    }
+
     fn key_project_id(entity: &Entity) -> &str {
         &entity
             .key
@@ -2833,12 +2916,24 @@ mod tests {
         ))
     }
 
-    fn write_leveldb_full_record(path: &Path, data: &[u8]) {
-        let mut record = Vec::with_capacity(7 + data.len());
+    fn append_leveldb_full_record(record: &mut Vec<u8>, data: &[u8]) {
         record.extend_from_slice(&0u32.to_le_bytes());
         record.extend_from_slice(&(data.len() as u16).to_le_bytes());
         record.push(1);
         record.extend_from_slice(data);
+    }
+
+    fn write_leveldb_full_record(path: &Path, data: &[u8]) {
+        let mut record = Vec::with_capacity(7 + data.len());
+        append_leveldb_full_record(&mut record, data);
+        std::fs::write(path, record).unwrap();
+    }
+
+    fn write_leveldb_full_records(path: &Path, records: &[&[u8]]) {
+        let mut record = Vec::new();
+        for data in records {
+            append_leveldb_full_record(&mut record, data);
+        }
         std::fs::write(path, record).unwrap();
     }
 
@@ -2897,6 +2992,62 @@ mod tests {
     }
 
     #[test]
+    fn read_overall_metadata_skips_leading_non_metadata_record() {
+        let root = temp_export_root();
+        let exports_dir = root.join("exports");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        let overall = OverallExportMetadata {
+            exports: vec![ExportMetadataEntry {
+                kind: Some(ExportMetadataEntryKind {
+                    unknown1: 0,
+                    kind: "Task".to_string(),
+                    unknown2: 0,
+                }),
+                path: "all_namespaces/kind_Task.export_metadata".to_string(),
+                count: 1,
+                size: 0,
+            }],
+        };
+        let metadata = overall.encode_to_vec();
+
+        write_leveldb_full_records(
+            &exports_dir.join("all_namespaces_kind_Task.overall_export_metadata"),
+            &[b"3".as_slice(), metadata.as_slice()],
+        );
+
+        let decoded = read_overall_metadata(root.to_str().unwrap()).unwrap();
+
+        assert_eq!(decoded.exports.len(), 1);
+        assert_eq!(decoded.exports[0].path, "all_namespaces/kind_Task.export_metadata");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn convert_property_value_preserves_utf8_legacy_string_values() {
+        let prop = legacy_string_property("title", None, b"hello");
+
+        let value = convert_property_value(&prop).unwrap();
+
+        match value {
+            ValueType::StringValue(value) => assert_eq!(value, "hello"),
+            other => panic!("expected string value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_property_value_treats_binary_legacy_string_values_as_blob() {
+        let prop = legacy_string_property("payload", Some(14), &[0xff, 0x00, 0x61]);
+
+        let value = convert_property_value(&prop).unwrap();
+
+        match value {
+            ValueType::BlobValue(value) => assert_eq!(value, vec![0xff, 0x00, 0x61]),
+            other => panic!("expected blob value, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn converter_dump_normalizes_legacy_app_ids_for_keys_and_reference_properties() {
         let mut entity = legacy_entity("s~source-project", "Task", "one");
         entity.property.push(reference_property(
@@ -2937,6 +3088,69 @@ mod tests {
             key_property_project_id(stored_entity, "owner"),
             LOCAL_PROJECT
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_dump_for_project_skips_entries_with_missing_kind_metadata() {
+        let root = temp_export_root();
+        let exports_dir = root.join("exports");
+        let kind_dir = exports_dir.join("all_namespaces");
+        std::fs::create_dir_all(&kind_dir).unwrap();
+
+        let overall = OverallExportMetadata {
+            exports: vec![
+                ExportMetadataEntry {
+                    kind: Some(ExportMetadataEntryKind {
+                        unknown1: 0,
+                        kind: "ExcludedTask".to_string(),
+                        unknown2: 0,
+                    }),
+                    path: "all_namespaces/kind_ExcludedTask.export_metadata".to_string(),
+                    count: 1,
+                    size: 0,
+                },
+                ExportMetadataEntry {
+                    kind: Some(ExportMetadataEntryKind {
+                        unknown1: 0,
+                        kind: "Task".to_string(),
+                        unknown2: 0,
+                    }),
+                    path: "all_namespaces/kind_Task.export_metadata".to_string(),
+                    count: 1,
+                    size: 0,
+                },
+            ],
+        };
+        write_leveldb_full_record(
+            &exports_dir.join("all_namespaces_kind_Task.overall_export_metadata"),
+            &overall.encode_to_vec(),
+        );
+
+        let export_metadata = ExportMetadata {
+            operation: None,
+            items: Some(ExportMetadataItems {
+                kind: "Task".to_string(),
+                outputs: vec!["output-0".to_string()],
+            }),
+        };
+        std::fs::write(
+            exports_dir.join("all_namespaces/kind_Task.export_metadata"),
+            export_metadata.encode_to_vec(),
+        )
+        .unwrap();
+        write_leveldb_full_record(
+            &kind_dir.join("output-0"),
+            &legacy_entity(SOURCE_PROJECT, "Task", "one").encode_to_vec(),
+        );
+
+        let mut storage = DatastoreStorage::default();
+        storage
+            .import_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT))
+            .unwrap();
+
+        assert_eq!(storage.entities.len(), 1);
 
         std::fs::remove_dir_all(root).unwrap();
     }
