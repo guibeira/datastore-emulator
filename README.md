@@ -111,7 +111,7 @@ Open `http://localhost:8080` once both containers report ready. The emulator per
 ## Building from source
 
 Make sure you have the following prerequisites installed on your system:
- * Rust toolchain (using `rustup`)
+ * Rust toolchain 1.88 or later (using `rustup`)
  * protobuf compiler (`protoc`)
 
 ### Run the Rust Emulator
