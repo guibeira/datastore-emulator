@@ -186,11 +186,16 @@ pub async fn run_query(
         || order
             .iter()
             .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
+    let namespace = req
+        .partition_id
+        .as_ref()
+        .map_or("", |p| p.namespace_id.as_str());
     let (candidates, candidates_prefiltered) = {
         let storage = storage.read().await;
         storage.query_candidates(
             &req.project_id,
             &kind_name,
+            namespace,
             filter_type.as_ref(),
             retain_key_struct,
         )
@@ -289,6 +294,14 @@ pub async fn commit(
             match mutation {
                 Operation::Insert(entity) => {
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
+                    if !allocates_key
+                        && let Some(key) = entity.key.as_ref()
+                        && storage
+                            .entities
+                            .contains_key(&KeyStruct::from_datastore_key(key))
+                    {
+                        return Err(Status::already_exists("entity already exists"));
+                    }
                     match storage.insert_owned_entity_at(entity, commit_time.clone()) {
                         Ok((final_key, metadata)) => {
                             mutation_results.push(commit_mutation_result(
@@ -518,6 +531,10 @@ pub async fn run_aggregation_query(
 ) -> Result<RunAggregationQueryResponse, Status> {
     let explain_requested = req.explain_options.is_some();
     let start = explain_requested.then(Instant::now);
+    let namespace = req
+        .partition_id
+        .as_ref()
+        .map_or("", |p| p.namespace_id.as_str());
     let storage = storage.read().await;
 
     // Extract the aggregation query from the request
@@ -560,7 +577,7 @@ pub async fn run_aggregation_query(
         if query.kind.len() == 1 {
             let kind_name = query.kind[0].name.as_str();
             let (candidates, _) =
-                storage.query_candidates(&req.project_id, kind_name, filter_type, false);
+                storage.query_candidates(&req.project_id, kind_name, namespace, filter_type, false);
             matching_entities = candidates
                 .into_iter()
                 .filter(|c| c.entity_metadata.entity.key.is_some())
@@ -568,7 +585,7 @@ pub async fn run_aggregation_query(
                 .collect();
         } else {
             for (key_struct, entity_metadata) in storage.entities.iter() {
-                if key_struct.project_id != req.project_id {
+                if key_struct.project_id != req.project_id || key_struct.namespace != namespace {
                     continue;
                 }
 

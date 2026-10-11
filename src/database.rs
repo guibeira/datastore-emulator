@@ -238,69 +238,45 @@ fn resolve_property_path_recursive<'a>(
     }
 }
 
-fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
-    let capacity = match &value.value_type {
-        Some(ValueType::ArrayValue(array)) => array.values.len(),
-        _ => 1,
-    };
-    let mut values = Vec::with_capacity(capacity);
-    if let Some(value_type) = &value.value_type {
-        let mut process_value = |v_type: &ValueType| match v_type {
-            ValueType::StringValue(s) => values.push(s.clone()),
-            ValueType::IntegerValue(i) => values.push(i.to_string()),
-            ValueType::DoubleValue(d) => values.push(d.to_string()),
-            ValueType::BooleanValue(b) => values.push(b.to_string()),
-            ValueType::TimestampValue(t) => {
-                if let Some(dt) = DateTime::from_timestamp(t.seconds, t.nanos as u32) {
-                    values.push(dt.to_rfc3339())
-                }
-            }
-            ValueType::KeyValue(k) => {
-                values.push(format!("{:?}", KeyStruct::from_datastore_key(k)))
-            }
-            _ => {} // Other types not indexed
-        };
-
-        match value_type {
-            ValueType::ArrayValue(array_value) => {
-                for v in &array_value.values {
-                    if let Some(inner_value_type) = &v.value_type {
-                        process_value(inner_value_type);
-                    }
-                }
-            }
-            other => process_value(other),
+/// Property-index key for a scalar value. The type tag keeps values of
+/// different types apart (int `1`, double `1.0` and string `"1"` must not
+/// collide). Arrays and nulls are not indexed.
+fn indexable_string(value_type: &ValueType) -> Option<String> {
+    Some(match value_type {
+        ValueType::StringValue(s) => format!("s:{s}"),
+        ValueType::IntegerValue(i) => format!("i:{i}"),
+        ValueType::DoubleValue(d) => format!("d:{d}"),
+        ValueType::BooleanValue(b) => format!("b:{b}"),
+        ValueType::TimestampValue(t) => {
+            let dt = DateTime::from_timestamp(t.seconds, t.nanos as u32)?;
+            format!("t:{}", dt.to_rfc3339())
         }
-    }
+        ValueType::KeyValue(k) => format!("k:{:?}", KeyStruct::from_datastore_key(k)),
+        _ => return None,
+    })
+}
+
+fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
+    let mut values = Vec::new();
+    for_each_indexable_string_for_value(value, |s| values.push(s));
     values
 }
 
 fn for_each_indexable_string_for_value(value: &Value, mut visitor: impl FnMut(String)) {
-    if let Some(value_type) = &value.value_type {
-        let mut process_value = |v_type: &ValueType| match v_type {
-            ValueType::StringValue(s) => visitor(s.clone()),
-            ValueType::IntegerValue(i) => visitor(i.to_string()),
-            ValueType::DoubleValue(d) => visitor(d.to_string()),
-            ValueType::BooleanValue(b) => visitor(b.to_string()),
-            ValueType::TimestampValue(t) => {
-                if let Some(dt) = DateTime::from_timestamp(t.seconds, t.nanos as u32) {
-                    visitor(dt.to_rfc3339())
+    match &value.value_type {
+        Some(ValueType::ArrayValue(array_value)) => {
+            for item in &array_value.values {
+                if let Some(s) = item.value_type.as_ref().and_then(indexable_string) {
+                    visitor(s);
                 }
             }
-            ValueType::KeyValue(k) => visitor(format!("{:?}", KeyStruct::from_datastore_key(k))),
-            _ => {}
-        };
-
-        match value_type {
-            ValueType::ArrayValue(array_value) => {
-                for v in &array_value.values {
-                    if let Some(inner_value_type) = &v.value_type {
-                        process_value(inner_value_type);
-                    }
-                }
-            }
-            other => process_value(other),
         }
+        Some(other) => {
+            if let Some(s) = indexable_string(other) {
+                visitor(s);
+            }
+        }
+        None => {}
     }
 }
 
@@ -1436,6 +1412,7 @@ impl DatastoreStorage {
         &self,
         project_id_filter: &str,
         kind_name: &str,
+        namespace: &str,
         retain_key_struct: bool,
         keys: impl IntoIterator<Item = &'a KeyStruct>,
     ) -> Vec<QueryCandidate> {
@@ -1445,6 +1422,7 @@ impl DatastoreStorage {
         keys.into_iter()
             .filter(|key_struct| {
                 key_struct.project_id == project_id_filter
+                    && key_struct.namespace == namespace
                     && key_struct
                         .path_elements
                         .last()
@@ -1466,6 +1444,7 @@ impl DatastoreStorage {
         &self,
         project_id_filter: &str,
         kind_name: &str,
+        namespace: &str,
         filter_type: &FilterType,
         retain_key_struct: bool,
     ) -> Option<Vec<QueryCandidate>> {
@@ -1507,6 +1486,7 @@ impl DatastoreStorage {
             return Some(self.candidates_from_index_keys(
                 project_id_filter,
                 kind_name,
+                namespace,
                 retain_key_struct,
                 keys.iter(),
             ));
@@ -1530,6 +1510,7 @@ impl DatastoreStorage {
                 Some(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    namespace,
                     retain_key_struct,
                     keys.iter(),
                 ))
@@ -1551,6 +1532,7 @@ impl DatastoreStorage {
                 Some(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    namespace,
                     retain_key_struct,
                     unique_keys,
                 ))
@@ -2161,15 +2143,20 @@ impl DatastoreStorage {
         let key_struct = KeyStruct::from_datastore_key(key);
         self.entities.get(&key_struct).cloned()
     }
-    fn get_metadata(&self, metadata_key: &str, project_id: &str) -> Vec<EntityWithMetadata> {
+    fn get_metadata(
+        &self,
+        metadata_key: &str,
+        project_id: &str,
+        namespace: &str,
+    ) -> Vec<EntityWithMetadata> {
         let mut results = Vec::new();
 
         match metadata_key {
             "__kind__" => {
                 let mut unique_kinds = HashSet::new();
                 for key_struct in self.entities.keys() {
-                    // TODO: This should also filter by namespace from the query
                     if key_struct.project_id == project_id
+                        && key_struct.namespace == namespace
                         && let Some((kind, _)) = key_struct.path_elements.last()
                     {
                         unique_kinds.insert((
@@ -2247,10 +2234,9 @@ impl DatastoreStorage {
                     HashMap::new();
 
                 for (key_struct, entity_meta) in &self.entities {
-                    if key_struct.project_id != project_id {
+                    if key_struct.project_id != project_id || key_struct.namespace != namespace {
                         continue;
                     }
-                    // TODO: This should be filtered by the query's namespace.
                     if let Some((kind, _)) = key_struct.path_elements.last() {
                         for (prop_name, prop_value) in &entity_meta.entity.properties {
                             if !prop_value.exclude_from_indexes {
@@ -2330,12 +2316,13 @@ impl DatastoreStorage {
         &self,
         project_id_filter: &str,
         kind_name: &str,
+        namespace: &str,
         filter_type: Option<&FilterType>,
         retain_key_struct: bool,
     ) -> (Vec<QueryCandidate>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             let mut candidates: Vec<QueryCandidate> = self
-                .get_metadata(kind_name, project_id_filter)
+                .get_metadata(kind_name, project_id_filter, namespace)
                 .into_iter()
                 .map(|metadata| QueryCandidate::from_metadata(Arc::new(metadata)))
                 .collect();
@@ -2348,6 +2335,7 @@ impl DatastoreStorage {
             && let Some(candidates) = self.query_simple_index_candidates(
                 project_id_filter,
                 kind_name,
+                namespace,
                 filter_type,
                 retain_key_struct,
             )
@@ -2367,6 +2355,7 @@ impl DatastoreStorage {
                     .into_iter()
                     .filter(|key_struct| {
                         key_struct.project_id == project_id_filter
+                            && key_struct.namespace == namespace
                             && key_struct
                                 .path_elements
                                 .last()
@@ -2395,6 +2384,7 @@ impl DatastoreStorage {
         let candidates = if let Some(scoped_entities) = self.scoped_entities.get(&scope_key) {
             scoped_entities
                 .iter()
+                .filter(|(key_struct, _)| key_struct.namespace == namespace)
                 .filter(|(key_struct, entity_metadata)| {
                     if let Some(ref pkf) = prepared_key_filter {
                         match_prepared_key_filter(key_struct, pkf)
@@ -2419,6 +2409,7 @@ impl DatastoreStorage {
                 .iter()
                 .filter(|(key_struct, _)| {
                     key_struct.project_id == project_id_filter
+                        && key_struct.namespace == namespace
                         && key_struct
                             .path_elements
                             .last()
@@ -2479,11 +2470,33 @@ impl DatastoreStorage {
             }
         };
 
-        let limit = limit.filter(|value| *value > 0);
+        let limit = limit.filter(|value| *value >= 0);
+
+        // Order by a property is an index scan: drop entities without an indexed
+        // value for any ordered property (`__key__` is always indexed).
+        let has_indexed_order_values = |candidate: &QueryCandidate| -> bool {
+            order.iter().all(|order_by| {
+                let Some(name) = order_by.property.as_ref().map(|p| p.name.as_str()) else {
+                    return true;
+                };
+                if name == "__key__" {
+                    return true;
+                }
+                let descending = order_by.direction == property_order::Direction::Descending as i32;
+                candidate
+                    .entity_metadata
+                    .entity
+                    .properties
+                    .get(name)
+                    .and_then(|v| sort_value(v, descending))
+                    .is_some()
+            })
+        };
 
         let mut filtered_entities: Vec<QueryCandidate> = candidates
             .into_iter()
             .filter(|candidate| matches_filter(candidate))
+            .filter(|candidate| has_indexed_order_values(candidate))
             .collect();
 
         let mut cut_by_end_cursor = false;
@@ -2692,6 +2705,7 @@ impl DatastoreStorage {
         &self,
         project_id_filter: String,
         kind_name: String,
+        namespace: String,
         filter: Option<Filter>,
         limit: Option<i32>,
         offset: i32,
@@ -2702,8 +2716,13 @@ impl DatastoreStorage {
         order: Vec<PropertyOrder>,
     ) -> Result<crate::google::datastore::v1::QueryResultBatch, tonic::Status> {
         let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
-        let (candidates, candidates_prefiltered) =
-            self.query_candidates(&project_id_filter, &kind_name, filter_type.as_ref(), true);
+        let (candidates, candidates_prefiltered) = self.query_candidates(
+            &project_id_filter,
+            &kind_name,
+            &namespace,
+            filter_type.as_ref(),
+            true,
+        );
         Self::get_entities_from_candidates(
             candidates,
             filter_type,

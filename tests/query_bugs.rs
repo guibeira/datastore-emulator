@@ -388,8 +388,8 @@ async fn order_by_skips_excluded_array_values() {
     let names = run(storage, query).await;
     assert_eq!(
         names,
-        vec!["all_excluded", "array_indexed", "scalar"],
-        "sort order must ignore excluded array members and treat arrays with no indexed members as missing"
+        vec!["array_indexed", "scalar"],
+        "sort order must ignore excluded array members and drop arrays with no indexed members, like Datastore"
     );
 }
 
@@ -560,7 +560,7 @@ async fn update_purges_stale_index_entries() {
     let stale =
         storage_guard
             .indexes
-            .get(&(KIND.to_string(), "tag".to_string(), "old".to_string()));
+            .get(&(KIND.to_string(), "tag".to_string(), "s:old".to_string()));
     let stale_keys: Vec<&KeyStruct> = stale.map(|set| set.iter().collect()).unwrap_or_default();
     assert!(
         stale_keys.is_empty(),
@@ -656,4 +656,420 @@ async fn update_missing_entity_returns_not_found() {
         .expect_err("updating a missing entity must fail");
     assert_eq!(err.code(), Code::NotFound);
     assert_eq!(err.message(), "Entity not found for update");
+}
+
+#[tokio::test]
+async fn insert_existing_key_returns_already_exists() {
+    let storage = Arc::new(RwLock::new(DatastoreStorage::default()));
+    let first = Entity {
+        key: Some(key("dup")),
+        properties: HashMap::from([(
+            "tag".to_string(),
+            val(ValueType::StringValue("first".to_string())),
+        )]),
+    };
+    let first_req = CommitRequest {
+        project_id: PROJECT.to_string(),
+        mode: Mode::NonTransactional as i32,
+        mutations: vec![Mutation {
+            operation: Some(Operation::Insert(first)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    core::commit(&storage, first_req)
+        .await
+        .expect("first insert");
+
+    let second = Entity {
+        key: Some(key("dup")),
+        properties: HashMap::from([(
+            "tag".to_string(),
+            val(ValueType::StringValue("second".to_string())),
+        )]),
+    };
+    let second_req = CommitRequest {
+        project_id: PROJECT.to_string(),
+        mode: Mode::NonTransactional as i32,
+        mutations: vec![Mutation {
+            operation: Some(Operation::Insert(second)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let err = core::commit(&storage, second_req)
+        .await
+        .expect_err("inserting an existing key must fail");
+    assert_eq!(err.code(), Code::AlreadyExists);
+
+    let guard = storage.read().await;
+    let stored = guard.get_entity(&key("dup")).expect("entity still stored");
+    assert_eq!(
+        stored.entity.properties.get("tag"),
+        Some(&val(ValueType::StringValue("first".to_string())))
+    );
+}
+
+#[tokio::test]
+async fn insert_incomplete_key_twice_allocates_two_entities() {
+    let storage = Arc::new(RwLock::new(DatastoreStorage::default()));
+    let incomplete_key = Key {
+        partition_id: Some(PartitionId {
+            project_id: PROJECT.to_string(),
+            database_id: String::new(),
+            namespace_id: String::new(),
+        }),
+        path: vec![PathElement {
+            kind: KIND.to_string(),
+            id_type: None,
+        }],
+    };
+    let mut allocated = Vec::new();
+    for _ in 0..2 {
+        let req = CommitRequest {
+            project_id: PROJECT.to_string(),
+            mode: Mode::NonTransactional as i32,
+            mutations: vec![Mutation {
+                operation: Some(Operation::Insert(Entity {
+                    key: Some(incomplete_key.clone()),
+                    properties: HashMap::new(),
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resp = core::commit(&storage, req)
+            .await
+            .expect("insert incomplete key");
+        allocated.push(resp.mutation_results[0].key.clone().expect("allocated key"));
+    }
+    assert_eq!(allocated.len(), 2);
+    assert_ne!(allocated[0], allocated[1]);
+}
+
+/// Bug 6: equality filters must match only the value's own type. Int `1`,
+/// double `1.0` and string `"1"` must not collide in the property index.
+#[tokio::test]
+async fn equality_filter_does_not_match_other_numeric_types() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "i1",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(
+        &mut storage,
+        "d1",
+        HashMap::from([("score".to_string(), val(ValueType::DoubleValue(1.0)))]),
+    );
+    insert(
+        &mut storage,
+        "s1",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::StringValue("1".to_string())),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "i2",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let equal_to = |value: ValueType| Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter: Some(prop_filter(
+            "score",
+            property_filter::Operator::Equal,
+            val(value),
+        )),
+        ..Default::default()
+    };
+
+    let names = run(storage.clone(), equal_to(ValueType::IntegerValue(1))).await;
+    assert_eq!(names, vec!["i1"], "score = 1 must match only the integer");
+
+    let names = run(storage.clone(), equal_to(ValueType::DoubleValue(1.0))).await;
+    assert_eq!(names, vec!["d1"], "score = 1.0 must match only the double");
+
+    let names = run(storage, equal_to(ValueType::StringValue("1".to_string()))).await;
+    assert_eq!(
+        names,
+        vec!["s1"],
+        "score = \"1\" must match only the string"
+    );
+}
+
+/// Bug 6: a boolean `true` must not match the string `"true"`.
+#[tokio::test]
+async fn equality_filter_bool_does_not_match_string() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([("flag".to_string(), val(ValueType::BooleanValue(true)))]),
+    );
+    insert(
+        &mut storage,
+        "s",
+        HashMap::from([(
+            "flag".to_string(),
+            val(ValueType::StringValue("true".to_string())),
+        )]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let equal_to = |value: ValueType| Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter: Some(prop_filter(
+            "flag",
+            property_filter::Operator::Equal,
+            val(value),
+        )),
+        ..Default::default()
+    };
+
+    let names = run(storage.clone(), equal_to(ValueType::BooleanValue(true))).await;
+    assert_eq!(names, vec!["b"], "flag = true must match only the boolean");
+
+    let names = run(
+        storage,
+        equal_to(ValueType::StringValue("true".to_string())),
+    )
+    .await;
+    assert_eq!(
+        names,
+        vec!["s"],
+        "flag = \"true\" must match only the string"
+    );
+}
+
+/// Bug 6: `IN` must be type-strict like `=`.
+#[tokio::test]
+async fn in_filter_is_type_strict() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "i1",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(
+        &mut storage,
+        "d1",
+        HashMap::from([("score".to_string(), val(ValueType::DoubleValue(1.0)))]),
+    );
+    insert(
+        &mut storage,
+        "s1",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::StringValue("1".to_string())),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "i2",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let query = Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter: Some(prop_filter(
+            "score",
+            property_filter::Operator::In,
+            val_array(vec![
+                val(ValueType::DoubleValue(1.0)),
+                val(ValueType::IntegerValue(2)),
+            ]),
+        )),
+        ..Default::default()
+    };
+
+    let names = run(storage, query).await;
+    assert_eq!(
+        names,
+        vec!["d1", "i2"],
+        "score IN [1.0, 2] must match the double and the integer only"
+    );
+}
+
+fn order_by_desc(prop: &str) -> PropertyOrder {
+    PropertyOrder {
+        property: Some(PropertyReference {
+            name: prop.to_string(),
+        }),
+        direction: property_order::Direction::Descending as i32,
+    }
+}
+
+fn kind_query(order: Vec<PropertyOrder>) -> Query {
+    Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        order,
+        ..Default::default()
+    }
+}
+
+/// Order by a property is an index scan: entities without the property are excluded.
+#[tokio::test]
+async fn order_by_excludes_entities_without_the_property() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(&mut storage, "c", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let names = run(storage.clone(), kind_query(vec![order_by_asc("score")])).await;
+    assert_eq!(
+        names,
+        vec!["b", "a"],
+        "ascending must skip entity without score"
+    );
+
+    let names = run(storage, kind_query(vec![order_by_desc("score")])).await;
+    assert_eq!(
+        names,
+        vec!["a", "b"],
+        "descending must skip entity without score"
+    );
+}
+
+/// Excluded-from-indexes values are not in the index, so the entity is excluded from order results.
+#[tokio::test]
+async fn order_by_excludes_unindexed_property() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([(
+            "score".to_string(),
+            val_excluded(ValueType::IntegerValue(1)),
+        )]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let names = run(storage, kind_query(vec![order_by_asc("score")])).await;
+    assert_eq!(
+        names,
+        vec!["a"],
+        "excluded-from-indexes value must not be ordered"
+    );
+}
+
+/// An explicit null is indexed and sorts first ascending; a missing property is excluded.
+#[tokio::test]
+async fn order_by_keeps_explicit_null_first() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([("score".to_string(), val(ValueType::NullValue(0)))]),
+    );
+    insert(&mut storage, "c", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let names = run(storage, kind_query(vec![order_by_asc("score")])).await;
+    assert_eq!(
+        names,
+        vec!["b", "a"],
+        "explicit null must be kept and sort first"
+    );
+}
+
+/// With a limit, the lowest indexed entity must be returned, not the entity missing the property.
+#[tokio::test]
+async fn order_by_with_limit_returns_lowest_indexed_entity() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(5)))]),
+    );
+    insert(&mut storage, "b", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let mut query = kind_query(vec![order_by_asc("score")]);
+    query.limit = Some(pbjson_types::Int32Value { value: 1 });
+    let names = run(storage, query).await;
+    assert_eq!(
+        names,
+        vec!["a"],
+        "limit 1 must return the entity that has the property"
+    );
+}
+
+/// Every order property must be present and indexed, not just one of them.
+#[tokio::test]
+async fn order_by_two_properties_requires_both() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([
+            (
+                "cat".to_string(),
+                val(ValueType::StringValue("x".to_string())),
+            ),
+            ("score".to_string(), val(ValueType::IntegerValue(2))),
+        ]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([(
+            "cat".to_string(),
+            val(ValueType::StringValue("x".to_string())),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "c",
+        HashMap::from([
+            (
+                "cat".to_string(),
+                val(ValueType::StringValue("y".to_string())),
+            ),
+            ("score".to_string(), val(ValueType::IntegerValue(1))),
+        ]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let names = run(
+        storage,
+        kind_query(vec![order_by_asc("cat"), order_by_asc("score")]),
+    )
+    .await;
+    assert_eq!(
+        names,
+        vec!["a", "c"],
+        "entity missing the second order property must be excluded"
+    );
 }
