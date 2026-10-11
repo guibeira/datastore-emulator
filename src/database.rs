@@ -32,7 +32,6 @@ use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
-const OFFSET_CURSOR_BYTE_LEN: usize = 4;
 const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
 
 fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
@@ -1113,6 +1112,44 @@ impl QueryCandidate {
     }
 }
 
+/// Same order as `KeyStruct`'s `Ord`, without building a `KeyStruct`.
+fn compare_keys(a: &Key, b: &Key) -> Ordering {
+    fn partition(key: &Key) -> (&str, &str) {
+        key.partition_id.as_ref().map_or(("", ""), |p| {
+            (p.project_id.as_str(), p.namespace_id.as_str())
+        })
+    }
+    // `Ok` (integer id) sorts before `Err` (name), like `KeyId`.
+    fn path(key: &Key) -> impl Iterator<Item = (&str, Result<i64, &str>)> {
+        key.path.iter().filter_map(|element| {
+            let id = match element.id_type.as_ref()? {
+                IdType::Id(id) => Ok(*id),
+                IdType::Name(name) => Err(name.as_str()),
+            };
+            Some((element.kind.as_str(), id))
+        })
+    }
+
+    partition(a)
+        .cmp(&partition(b))
+        .then_with(|| path(a).cmp(path(b)))
+}
+
+fn compare_candidate_keys(a: &QueryCandidate, b: &QueryCandidate) -> Ordering {
+    if let (Some(a), Some(b)) = (a.key_struct.as_ref(), b.key_struct.as_ref()) {
+        return a.cmp(b);
+    }
+    match (
+        a.entity_metadata.entity.key.as_ref(),
+        b.entity_metadata.entity.key.as_ref(),
+    ) {
+        (Some(a), Some(b)) => compare_keys(a, b),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn compare_query_candidates(
     a: &QueryCandidate,
     b: &QueryCandidate,
@@ -1131,12 +1168,7 @@ fn compare_query_candidates(
         let descending = order_by.direction == property_order::Direction::Descending as i32;
 
         if prop_name == "__key__" {
-            let ordering = match (a.key_struct.as_ref(), b.key_struct.as_ref()) {
-                (Some(a), Some(b)) => a.cmp(b),
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
-            };
+            let ordering = compare_candidate_keys(a, b);
 
             final_ordering = if descending {
                 ordering.reverse()
@@ -1173,6 +1205,115 @@ fn compare_query_candidates(
         };
     }
     final_ordering
+}
+
+/// Orders candidates by `order`, then by key, like Datastore. The key
+/// tie-break makes the order total, so a cursor names one exact position.
+fn compare_query_position(
+    a: &QueryCandidate,
+    b: &QueryCandidate,
+    order: &[PropertyOrder],
+) -> Ordering {
+    compare_query_candidates(a, b, order).then_with(|| compare_candidate_keys(a, b))
+}
+
+/// Query cursors are `CURSOR_MAGIC` followed by an `Entity` proto that holds
+/// the key and the sort values of the last consumed result. A query resumes
+/// after that position, so inserts and deletes between pages do not shift it.
+/// An entity without a key points to the start of the results.
+const CURSOR_MAGIC: [u8; 2] = [0xDC, 0x01];
+
+fn encode_cursor(position: Option<&QueryCandidate>, order: &[PropertyOrder]) -> Vec<u8> {
+    use prost::encoding::{self, WireType};
+
+    let Some(candidate) = position else {
+        return CURSOR_MAGIC.to_vec();
+    };
+    let entity = &candidate.entity_metadata.entity;
+    let sort_values = || {
+        order.iter().filter_map(|order_by| {
+            let property = order_by.property.as_ref()?;
+            if property.name == "__key__" {
+                return None;
+            }
+            let descending = order_by.direction == property_order::Direction::Descending as i32;
+            let value = sort_value(entity.properties.get(&property.name)?, descending)?;
+            Some((&property.name, value))
+        })
+    };
+    let entry_len = |name: &String, value: &Value| {
+        encoding::string::encoded_len(1, name) + encoding::message::encoded_len(2, value)
+    };
+
+    // Write the `Entity` fields directly, so the key and values are not cloned.
+    let key_len = entity
+        .key
+        .as_ref()
+        .map_or(0, |key| encoding::message::encoded_len(1, key));
+    let values_len: usize = sort_values()
+        .map(|(name, value)| {
+            let len = entry_len(name, value);
+            encoding::key_len(3) + encoding::encoded_len_varint(len as u64) + len
+        })
+        .sum();
+    let mut buf = Vec::with_capacity(CURSOR_MAGIC.len() + key_len + values_len);
+    buf.extend_from_slice(&CURSOR_MAGIC);
+    if let Some(key) = entity.key.as_ref() {
+        encoding::message::encode(1, key, &mut buf);
+    }
+    for (name, value) in sort_values() {
+        encoding::encode_key(3, WireType::LengthDelimited, &mut buf);
+        encoding::encode_varint(entry_len(name, value) as u64, &mut buf);
+        encoding::string::encode(1, name, &mut buf);
+        encoding::message::encode(2, value, &mut buf);
+    }
+    buf
+}
+
+/// Returns the position stored in a cursor. `None` means the start of the
+/// results (empty cursor, or a cursor from an empty batch).
+fn decode_cursor(cursor: &[u8]) -> Result<Option<QueryCandidate>, tonic::Status> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || tonic::Status::invalid_argument("Invalid query cursor");
+    let payload = cursor.strip_prefix(&CURSOR_MAGIC[..]).ok_or_else(invalid)?;
+    let entity = Entity::decode(payload).map_err(|_| invalid())?;
+    let Some(key) = entity.key.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(QueryCandidate {
+        key_struct: Some(KeyStruct::from_datastore_key(key)),
+        entity_metadata: Arc::new(EntityWithMetadata {
+            entity,
+            ..Default::default()
+        }),
+    }))
+}
+
+/// Keeps the candidates after `start` and up to `end`, both cursor positions.
+/// Returns true when `end` removed candidates.
+fn retain_between_cursors(
+    candidates: &mut Vec<QueryCandidate>,
+    start: Option<&QueryCandidate>,
+    end: Option<&QueryCandidate>,
+    order: &[PropertyOrder],
+) -> bool {
+    if start.is_none() && end.is_none() {
+        return false;
+    }
+    let mut cut_by_end = false;
+    candidates.retain(|candidate| {
+        if start.is_some_and(|start| compare_query_position(candidate, start, order).is_le()) {
+            return false;
+        }
+        if end.is_some_and(|end| compare_query_position(candidate, end, order).is_gt()) {
+            cut_by_end = true;
+            return false;
+        }
+        true
+    });
+    cut_by_end
 }
 
 fn hash_distinct_value<H: Hasher>(hasher: &mut H, value: &Value, scratch: &mut Vec<u8>) {
@@ -1285,8 +1426,9 @@ pub struct DatastoreStorage {
     pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
     // Active transactions
     pub transactions: HashMap<String, TransactionState>,
-    // Per-(project, namespace, kind) counters for auto ID allocation
-    pub entity_id_counters: HashMap<(String, String, String), AtomicI64>,
+    // Per-project counters for auto ID allocation. One sequence for all kinds
+    // and namespaces, like the Google emulator, so IDs do not repeat across kinds.
+    pub entity_id_counters: HashMap<String, AtomicI64>,
 }
 
 impl DatastoreStorage {
@@ -1597,23 +1739,23 @@ impl DatastoreStorage {
         }
     }
 
-    fn counter_scope_from_key(key: &Key) -> Option<(String, String, String)> {
-        let partition = key.partition_id.as_ref();
-        let project = partition.map(|p| p.project_id.clone()).unwrap_or_default();
-        let namespace = partition
-            .map(|p| p.namespace_id.clone())
-            .unwrap_or_default();
-        let kind = key.path.last()?.kind.clone();
-        Some((project, namespace, kind))
+    fn counter_scope_from_key(key: &Key) -> Option<String> {
+        key.path.last()?;
+        Some(
+            key.partition_id
+                .as_ref()
+                .map(|p| p.project_id.clone())
+                .unwrap_or_default(),
+        )
     }
 
     pub(crate) fn observe_key_id(&mut self, key: &Key) {
-        if let Some((project, namespace, kind)) = Self::counter_scope_from_key(key)
+        if let Some(project) = Self::counter_scope_from_key(key)
             && let Some(path_element) = key.path.last()
             && let Some(IdType::Id(id)) = path_element.id_type
         {
             self.entity_id_counters
-                .entry((project, namespace, kind))
+                .entry(project)
                 .and_modify(|counter| {
                     let current = counter.load(std::sync::atomic::Ordering::SeqCst);
                     if current < id {
@@ -1926,6 +2068,30 @@ impl DatastoreStorage {
                                 } else {
                                     false
                                 }
+                            } else if let Some(value) =
+                                entity_metadata.entity.properties.get(&property.name)
+                            {
+                                // Simple property lookup. Also covers dotted names stored
+                                // as one property, like a legacy StructuredProperty.
+                                if value.exclude_from_indexes {
+                                    false
+                                } else {
+                                    match &value.value_type {
+                                        Some(ValueType::ArrayValue(array)) => values_match_filter(
+                                            array
+                                                .values
+                                                .iter()
+                                                .filter(|inner| !inner.exclude_from_indexes),
+                                            filter_value,
+                                            property_filter.op,
+                                        ),
+                                        _ => values_match_filter(
+                                            std::iter::once(value),
+                                            filter_value,
+                                            property_filter.op,
+                                        ),
+                                    }
+                                }
                             } else if property.name.contains('.') {
                                 // Nested property path - use recursive resolution
                                 let entity_values = resolve_nested_property(
@@ -1940,33 +2106,7 @@ impl DatastoreStorage {
                                     property_filter.op,
                                 )
                             } else {
-                                // Simple property lookup
-                                if let Some(value) =
-                                    entity_metadata.entity.properties.get(&property.name)
-                                {
-                                    if value.exclude_from_indexes {
-                                        false
-                                    } else {
-                                        match &value.value_type {
-                                            Some(ValueType::ArrayValue(array)) => {
-                                                values_match_filter(
-                                                    array.values.iter().filter(|inner| {
-                                                        !inner.exclude_from_indexes
-                                                    }),
-                                                    filter_value,
-                                                    property_filter.op,
-                                                )
-                                            }
-                                            _ => values_match_filter(
-                                                std::iter::once(value),
-                                                filter_value,
-                                                property_filter.op,
-                                            ),
-                                        }
-                                    }
-                                } else {
-                                    false
-                                }
+                                false
                             }
                         }
                     } else {
@@ -2194,13 +2334,14 @@ impl DatastoreStorage {
         retain_key_struct: bool,
     ) -> (Vec<QueryCandidate>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
-            return (
-                self.get_metadata(kind_name, project_id_filter)
-                    .into_iter()
-                    .map(|metadata| QueryCandidate::from_metadata(Arc::new(metadata)))
-                    .collect(),
-                false,
-            );
+            let mut candidates: Vec<QueryCandidate> = self
+                .get_metadata(kind_name, project_id_filter)
+                .into_iter()
+                .map(|metadata| QueryCandidate::from_metadata(Arc::new(metadata)))
+                .collect();
+            // Other candidate sources are in key order; cursors rely on it.
+            candidates.sort_by(compare_candidate_keys);
+            return (candidates, false);
         }
 
         if let Some(filter_type) = filter_type
@@ -2312,10 +2453,13 @@ impl DatastoreStorage {
         limit: Option<i32>,
         offset: i32,
         start_cursor: Vec<u8>,
+        end_cursor: Vec<u8>,
         projection: Vec<Projection>,
         distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
-    ) -> crate::google::datastore::v1::QueryResultBatch {
+    ) -> Result<crate::google::datastore::v1::QueryResultBatch, tonic::Status> {
+        let start_position = decode_cursor(&start_cursor)?;
+        let end_position = decode_cursor(&end_cursor)?;
         let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
 
         let matches_filter = |candidate: &QueryCandidate| -> bool {
@@ -2342,9 +2486,21 @@ impl DatastoreStorage {
             .filter(|candidate| matches_filter(candidate))
             .collect();
 
+        let mut cut_by_end_cursor = false;
+        if distinct_on.is_empty() {
+            // Drop the candidates outside the cursors before the sort, so the
+            // bounded sort below also works for later pages.
+            cut_by_end_cursor = retain_between_cursors(
+                &mut filtered_entities,
+                start_position.as_ref(),
+                end_position.as_ref(),
+                &order,
+            );
+        }
+
         // 2. Sort entities
         if !order.is_empty() {
-            let bounded_sort_len = if start_cursor.is_empty() && distinct_on.is_empty() {
+            let bounded_sort_len = if distinct_on.is_empty() {
                 limit.map(|limit_value| {
                     (offset.max(0) as usize)
                         .saturating_add(limit_value as usize)
@@ -2358,12 +2514,18 @@ impl DatastoreStorage {
                 && filtered_entities.len() > bounded_sort_len
             {
                 filtered_entities.select_nth_unstable_by(bounded_sort_len - 1, |a, b| {
-                    compare_query_candidates(a, b, &order)
+                    compare_query_position(a, b, &order)
                 });
                 filtered_entities.truncate(bounded_sort_len);
+                filtered_entities.sort_unstable_by(|a, b| compare_query_position(a, b, &order));
+            } else {
+                // Candidates come in key order, so a stable sort breaks ties by
+                // key without comparing keys.
+                debug_assert!(
+                    filtered_entities.is_sorted_by(|a, b| compare_candidate_keys(a, b).is_le())
+                );
+                filtered_entities.sort_by(|a, b| compare_query_candidates(a, b, &order));
             }
-
-            filtered_entities.sort_unstable_by(|a, b| compare_query_candidates(a, b, &order));
         }
 
         if !distinct_on.is_empty() {
@@ -2388,59 +2550,26 @@ impl DatastoreStorage {
             }
 
             filtered_entities = distinct_entities;
+            // Cursors apply after dedup, so a group that a previous page
+            // returned does not come back.
+            cut_by_end_cursor = retain_between_cursors(
+                &mut filtered_entities,
+                start_position.as_ref(),
+                end_position.as_ref(),
+                &order,
+            );
         }
 
         // 3. Paginate and apply projections
+        let skipped = (offset.max(0) as usize).min(filtered_entities.len());
+        let skipped_cursor = skipped
+            .checked_sub(1)
+            .map(|last| encode_cursor(Some(&filtered_entities[last]), &order))
+            .unwrap_or_default();
+
         let mut results = Vec::new();
-        let mut start_index = 0usize;
-        if !start_cursor.is_empty() {
-            let decode_result = bincode::serde::decode_from_slice::<KeyStruct, _>(
-                &start_cursor,
-                bincode::config::standard(),
-            );
-            if let Ok((cursor_key, _)) = decode_result {
-                let mut matched = false;
-                for (idx, candidate) in filtered_entities.iter().enumerate() {
-                    if let Some(key_struct) = candidate.key_struct.as_ref()
-                        && key_struct == &cursor_key {
-                            start_index = idx + 1;
-                            matched = true;
-                            break;
-                        }
-                }
-                if !matched {
-                    let mut index = 0usize;
-                    for candidate in &filtered_entities {
-                        match candidate.key_struct.as_ref() {
-                            Some(key_struct) if key_struct <= &cursor_key => index += 1,
-                            _ => break,
-                        }
-                    }
-                    start_index = index;
-                }
-            } else if start_cursor.len() >= OFFSET_CURSOR_BYTE_LEN {
-                start_index = u32::from_be_bytes(
-                    start_cursor
-                        .get(0..OFFSET_CURSOR_BYTE_LEN)
-                        .and_then(|bytes| bytes.try_into().ok())
-                        .unwrap_or([0, 0, 0, 0]),
-                ) as usize;
-            }
-        }
-
-        // Apply Query.offset on top of any cursor-derived start_index.
-        if offset > 0 {
-            start_index = start_index.saturating_add(offset as usize);
-            if start_index > filtered_entities.len() {
-                start_index = filtered_entities.len();
-            }
-        }
-
-        let db_entities_count = filtered_entities.len();
         let mut current_entities_payload_size: usize = 0;
         let mut new_more_results_state = MoreResultsType::NoMoreResults;
-        let mut next_offset = start_index;
-        let mut last_cursor_key: Option<&KeyStruct> = None;
 
         let is_keys_only = !projection.is_empty()
             && projection
@@ -2454,7 +2583,7 @@ impl DatastoreStorage {
             1 // FULL
         };
 
-        for candidate in filtered_entities.iter().skip(start_index) {
+        for candidate in filtered_entities.iter().skip(skipped) {
             let entity_metadata = candidate.entity_metadata.as_ref();
             // Apply limit and payload size checks
             if let Some(limit_value) = limit
@@ -2473,8 +2602,10 @@ impl DatastoreStorage {
             } else {
                 entity_metadata.entity.encoded_len()
             };
+            let cursor = encode_cursor(Some(candidate), &order);
+            let result_size_bytes = entity_size_bytes + cursor.len();
             if !results.is_empty()
-                && (current_entities_payload_size + entity_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
+                && (current_entities_payload_size + result_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
             {
                 new_more_results_state = MoreResultsType::NotFinished;
                 break;
@@ -2517,55 +2648,44 @@ impl DatastoreStorage {
                 entity: Some(result_entity),
                 create_time,
                 update_time,
-                cursor: Vec::new(),
+                cursor,
                 version,
             });
-            current_entities_payload_size += entity_size_bytes;
-            next_offset += 1;
-            last_cursor_key = candidate.key_struct.as_ref();
+            current_entities_payload_size += result_size_bytes;
         }
 
-        let final_cursor_offset = next_offset;
+        if new_more_results_state == MoreResultsType::NoMoreResults && cut_by_end_cursor {
+            new_more_results_state = MoreResultsType::MoreResultsAfterCursor;
+        }
 
-        let end_cursor = {
-            if let Some(key_struct) = last_cursor_key {
-                bincode::serde::encode_to_vec(key_struct, bincode::config::standard())
-                    .unwrap_or_else(|_| (final_cursor_offset as u32).to_be_bytes().to_vec())
-            } else if !results.is_empty() {
-                (final_cursor_offset as u32).to_be_bytes().to_vec()
-            } else if final_cursor_offset >= db_entities_count {
-                vec![]
-            } else {
-                (final_cursor_offset as u32).to_be_bytes().to_vec()
-            }
+        // Points after the last consumed result. An empty batch keeps the
+        // position where it started.
+        let end_cursor = match results.last() {
+            Some(last) => last.cursor.clone(),
+            None if skipped > 0 => skipped_cursor.clone(),
+            None if !start_cursor.is_empty() => start_cursor,
+            None => encode_cursor(None, &order),
         };
 
-        if new_more_results_state == MoreResultsType::NoMoreResults
-            && final_cursor_offset < db_entities_count
-        {
-            new_more_results_state = MoreResultsType::NotFinished;
-        }
-
         tracing::debug!(
-            "QueryResultBatch: start={} returned={} more_results={:?} final_offset={} total={} end_cursor_len={}",
-            start_index,
+            "QueryResultBatch: skipped={} returned={} more_results={:?} total={} end_cursor_len={}",
+            skipped,
             results.len(),
             new_more_results_state,
-            final_cursor_offset,
-            db_entities_count,
+            filtered_entities.len(),
             end_cursor.len()
         );
 
-        crate::google::datastore::v1::QueryResultBatch {
+        Ok(crate::google::datastore::v1::QueryResultBatch {
             entity_result_type,
-            skipped_results: start_index as i32,
+            skipped_results: skipped as i32,
             read_time: None,
-            skipped_cursor: vec![],
+            skipped_cursor,
             snapshot_version: 0,
             entity_results: results,
             more_results: new_more_results_state as i32,
             end_cursor,
-        }
+        })
     }
 
     pub fn get_entities(
@@ -2576,10 +2696,11 @@ impl DatastoreStorage {
         limit: Option<i32>,
         offset: i32,
         start_cursor: Vec<u8>,
+        end_cursor: Vec<u8>,
         projection: Vec<Projection>,
         distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
-    ) -> crate::google::datastore::v1::QueryResultBatch {
+    ) -> Result<crate::google::datastore::v1::QueryResultBatch, tonic::Status> {
         let filter_type = filter.as_ref().and_then(|f| f.filter_type.clone());
         let (candidates, candidates_prefiltered) =
             self.query_candidates(&project_id_filter, &kind_name, filter_type.as_ref(), true);
@@ -2590,6 +2711,7 @@ impl DatastoreStorage {
             limit,
             offset,
             start_cursor,
+            end_cursor,
             projection,
             distinct_on,
             order,

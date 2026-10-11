@@ -19,9 +19,6 @@ use tokio::sync::RwLock;
 use tonic::Status;
 
 static TRANSACTION_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
-/// Offset cursors are stored as a big-endian u32. Longer cursors are encoded
-/// KeyStruct values and need key retention to resume ordered scans correctly.
-const OFFSET_CURSOR_BYTE_LEN: usize = 4;
 
 fn to_pbjson_duration(std_duration: std::time::Duration) -> Duration {
     Duration {
@@ -185,8 +182,7 @@ pub async fn run_query(
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
-    let retain_key_struct = query_obj.start_cursor.len() > OFFSET_CURSOR_BYTE_LEN
-        || query_obj.distinct_on.iter().any(|p| p.name == "__key__")
+    let retain_key_struct = query_obj.distinct_on.iter().any(|p| p.name == "__key__")
         || order
             .iter()
             .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
@@ -207,10 +203,11 @@ pub async fn run_query(
         query_obj.limit.as_ref().map(|v| v.value),
         query_obj.offset,
         query_obj.start_cursor.clone(),
+        query_obj.end_cursor.clone(),
         query_obj.projection.clone(),
         query_obj.distinct_on.clone(),
         order,
-    );
+    )?;
     let explain_metrics = if let Some(start) = start {
         let mut fields = HashMap::new();
         let amount_results = batch.entity_results.len() as i64;
