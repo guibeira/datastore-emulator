@@ -116,9 +116,7 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
                     .partial_cmp(&bv.longitude)
                     .unwrap_or(Ordering::Equal)
             }),
-        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => {
-            KeyStruct::from_datastore_key(av).cmp(&KeyStruct::from_datastore_key(bv))
-        }
+        (Some(ValueType::KeyValue(av)), Some(ValueType::KeyValue(bv))) => compare_keys(av, bv),
         // Same-rank but unsupported deeper compare (e.g. entity/array): treat as equal.
         _ => Ordering::Equal,
     }
@@ -1113,6 +1111,124 @@ fn compare_query_candidates(
     final_ordering
 }
 
+enum SortComponent {
+    Key { descending: bool },
+    Value { index: usize, descending: bool },
+}
+
+/// The sort values of every candidate, looked up once, so a comparison does
+/// no property lookups. Orders by `order`, then by key, like
+/// `compare_query_position`.
+struct SortView<'a> {
+    components: Vec<SortComponent>,
+    value_count: usize,
+    values: Vec<Option<&'a Value>>,
+    candidates: &'a [QueryCandidate],
+}
+
+impl<'a> SortView<'a> {
+    fn new(candidates: &'a [QueryCandidate], order: &[PropertyOrder]) -> Self {
+        let mut components = Vec::with_capacity(order.len());
+        let mut names: Vec<(&str, bool)> = Vec::new();
+        for order_by in order {
+            let Some(property) = order_by.property.as_ref() else {
+                continue;
+            };
+            let descending = order_by.direction == property_order::Direction::Descending as i32;
+            if property.name == "__key__" {
+                components.push(SortComponent::Key { descending });
+            } else {
+                components.push(SortComponent::Value {
+                    index: names.len(),
+                    descending,
+                });
+                names.push((property.name.as_str(), descending));
+            }
+        }
+
+        let mut values = Vec::with_capacity(candidates.len() * names.len());
+        for candidate in candidates {
+            let properties = &candidate.entity_metadata.entity.properties;
+            values.extend(names.iter().map(|(name, descending)| {
+                properties
+                    .get(*name)
+                    .and_then(|value| sort_value(value, *descending))
+            }));
+        }
+
+        Self {
+            components,
+            value_count: names.len(),
+            values,
+            candidates,
+        }
+    }
+
+    fn compare(&self, a: usize, b: usize) -> Ordering {
+        for component in &self.components {
+            let (ordering, descending) = match *component {
+                SortComponent::Key { descending } => (
+                    compare_candidate_keys(&self.candidates[a], &self.candidates[b]),
+                    descending,
+                ),
+                SortComponent::Value { index, descending } => {
+                    let a_value = self.values[a * self.value_count + index];
+                    let b_value = self.values[b * self.value_count + index];
+                    let ordering = match (a_value, b_value) {
+                        (Some(a), Some(b)) => compare_values(a, b),
+                        (Some(_), None) => Ordering::Greater,
+                        (None, Some(_)) => Ordering::Less,
+                        (None, None) => Ordering::Equal,
+                    };
+                    (ordering, descending)
+                }
+            };
+            let ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        compare_candidate_keys(&self.candidates[a], &self.candidates[b])
+    }
+}
+
+/// The candidates at `indices`, in that order, moved out without cloning.
+fn take_in_order(candidates: Vec<QueryCandidate>, indices: &[usize]) -> Vec<QueryCandidate> {
+    let mut slots: Vec<Option<QueryCandidate>> = candidates.into_iter().map(Some).collect();
+    indices
+        .iter()
+        .map(|&index| slots[index].take().expect("each index at most once"))
+        .collect()
+}
+
+/// Sorts by `order`, then by key. With `keep`, only the first `keep`
+/// candidates come back, found with a partial sort.
+fn sort_candidates(
+    candidates: Vec<QueryCandidate>,
+    order: &[PropertyOrder],
+    keep: Option<usize>,
+) -> Vec<QueryCandidate> {
+    let view = SortView::new(&candidates, order);
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    if let Some(keep) = keep
+        && keep < indices.len()
+    {
+        if keep == 0 {
+            indices.clear();
+        } else {
+            indices.select_nth_unstable_by(keep - 1, |&a, &b| view.compare(a, b));
+            indices.truncate(keep);
+        }
+    }
+    indices.sort_unstable_by(|&a, &b| view.compare(a, b));
+    drop(view);
+    take_in_order(candidates, &indices)
+}
+
 /// Orders candidates by `order`, then by key, like Datastore. The key
 /// tie-break makes the order total, so a cursor names one exact position.
 fn compare_query_position(
@@ -1501,29 +1617,43 @@ fn expand_projection_rows(candidate: QueryCandidate, names: &[&str]) -> Vec<Quer
 }
 
 /// Keeps the first candidate of each distinct-on signature, preserving order.
+/// One candidate per `distinct_on` signature: the first in query order, as
+/// if the candidates had been sorted. Comes back in input order, so the
+/// caller sorts only the representatives.
 fn dedup_distinct_candidates(
     candidates: Vec<QueryCandidate>,
     distinct_on: &[PropertyReference],
+    order: &[PropertyOrder],
 ) -> Vec<QueryCandidate> {
-    let mut seen_signatures: HashMap<u64, Vec<Vec<DistinctComponent>>> = HashMap::new();
-    let mut distinct_entities = Vec::new();
+    let view = SortView::new(&candidates, order);
+    // Signature hash -> (signature, index of its first candidate so far).
+    let mut groups: HashMap<u64, Vec<(Vec<DistinctComponent>, usize)>> = HashMap::new();
     let mut scratch: Vec<u8> = Vec::new();
 
-    for candidate in candidates {
-        let signature_hash = hash_distinct_signature(&candidate, distinct_on, &mut scratch);
-
-        let matching_signatures = seen_signatures.entry(signature_hash).or_default();
-        if matching_signatures
-            .iter()
-            .any(|existing| distinct_signature_matches(existing, &candidate, distinct_on))
+    for (index, candidate) in candidates.iter().enumerate() {
+        let signature_hash = hash_distinct_signature(candidate, distinct_on, &mut scratch);
+        let same_hash = groups.entry(signature_hash).or_default();
+        match same_hash
+            .iter_mut()
+            .find(|(signature, _)| distinct_signature_matches(signature, candidate, distinct_on))
         {
-            continue;
+            Some((_, first)) => {
+                if view.compare(index, *first).is_lt() {
+                    *first = index;
+                }
+            }
+            None => same_hash.push((build_distinct_signature(candidate, distinct_on), index)),
         }
-
-        matching_signatures.push(build_distinct_signature(&candidate, distinct_on));
-        distinct_entities.push(candidate);
     }
-    distinct_entities
+
+    let mut kept: Vec<usize> = groups
+        .into_values()
+        .flatten()
+        .map(|(_, first)| first)
+        .collect();
+    kept.sort_unstable();
+    drop(view);
+    take_in_order(candidates, &kept)
 }
 
 #[derive(Default, Debug)]
@@ -2645,16 +2775,19 @@ impl DatastoreStorage {
             }
             filtered_entities.retain(|candidate| has_indexed_order_values(candidate, &order));
 
-            if distinct_on.is_empty() {
-                // Drop the candidates outside the cursors before the sort, so
-                // the bounded sort below also works for later pages.
-                cut_by_end_cursor = retain_between_cursors(
-                    &mut filtered_entities,
-                    start_position.as_ref(),
-                    end_position.as_ref(),
-                    &order,
-                );
+            if !distinct_on.is_empty() {
+                filtered_entities =
+                    dedup_distinct_candidates(filtered_entities, &distinct_on, &order);
             }
+            // Drop the candidates outside the cursors before the sort, so the
+            // bounded sort below also works for later pages. After the dedup,
+            // a group that a previous page returned does not come back.
+            cut_by_end_cursor = retain_between_cursors(
+                &mut filtered_entities,
+                start_position.as_ref(),
+                end_position.as_ref(),
+                &order,
+            );
         }
 
         // 2. Sort entities. Candidates arrive in ascending key order, so a
@@ -2664,44 +2797,12 @@ impl DatastoreStorage {
                 filtered_entities.reverse();
             }
         } else {
-            let bounded_sort_len = if distinct_on.is_empty() {
-                limit.map(|limit_value| {
-                    (offset.max(0) as usize)
-                        .saturating_add(limit_value as usize)
-                        .saturating_add(1)
-                })
-            } else {
-                None
-            };
-
-            if let Some(bounded_sort_len) = bounded_sort_len
-                && filtered_entities.len() > bounded_sort_len
-            {
-                filtered_entities.select_nth_unstable_by(bounded_sort_len - 1, |a, b| {
-                    compare_query_position(a, b, &order)
-                });
-                filtered_entities.truncate(bounded_sort_len);
-                filtered_entities.sort_unstable_by(|a, b| compare_query_position(a, b, &order));
-            } else {
-                // Candidates come in key order, so a stable sort breaks ties by
-                // key without comparing keys.
-                debug_assert!(
-                    filtered_entities.is_sorted_by(|a, b| compare_candidate_keys(a, b).is_le())
-                );
-                filtered_entities.sort_by(|a, b| compare_query_candidates(a, b, &order));
-            }
-        }
-
-        if !distinct_on.is_empty() {
-            filtered_entities = dedup_distinct_candidates(filtered_entities, &distinct_on);
-            // Cursors apply after dedup, so a group that a previous page
-            // returned does not come back.
-            cut_by_end_cursor = retain_between_cursors(
-                &mut filtered_entities,
-                start_position.as_ref(),
-                end_position.as_ref(),
-                &order,
-            );
+            let keep = limit.map(|limit_value| {
+                (offset.max(0) as usize)
+                    .saturating_add(limit_value as usize)
+                    .saturating_add(1)
+            });
+            filtered_entities = sort_candidates(filtered_entities, &order, keep);
         }
 
         // 3. Paginate and apply projections
@@ -2864,13 +2965,18 @@ impl DatastoreStorage {
             _ => matching.collect(),
         };
 
+        if !distinct_on.is_empty() {
+            matching = dedup_distinct_candidates(matching, &distinct_on, &order);
+        }
         match key_only_order(&order) {
             Some(false) => {}
             Some(true) => matching.reverse(),
-            None => matching.sort_unstable_by(|a, b| compare_query_position(a, b, &order)),
-        }
-        if !distinct_on.is_empty() {
-            matching = dedup_distinct_candidates(matching, &distinct_on);
+            None => {
+                let keep = limit.map(|limit_value| {
+                    (offset.max(0) as usize).saturating_add(limit_value as usize)
+                });
+                matching = sort_candidates(matching, &order, keep);
+            }
         }
 
         let skipped = (offset.max(0) as usize).min(matching.len());
@@ -3135,6 +3241,131 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn int_value(value: i64) -> Value {
+        Value {
+            value_type: Some(ValueType::IntegerValue(value)),
+            ..Default::default()
+        }
+    }
+
+    fn str_value(value: &str) -> Value {
+        Value {
+            value_type: Some(ValueType::StringValue(value.to_string())),
+            ..Default::default()
+        }
+    }
+
+    fn array_value(values: Vec<Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
+            ..Default::default()
+        }
+    }
+
+    fn candidate_with(id: i64, properties: Vec<(&str, Value)>) -> QueryCandidate {
+        let candidate = key_only_candidate(id);
+        let mut entity = candidate.entity_metadata.entity.clone();
+        entity.properties = properties
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect();
+        QueryCandidate {
+            entity_metadata: Arc::new(EntityWithMetadata {
+                entity,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn order_by(name: &str, descending: bool) -> PropertyOrder {
+        PropertyOrder {
+            property: Some(PropertyReference {
+                name: name.to_string(),
+            }),
+            direction: if descending {
+                property_order::Direction::Descending as i32
+            } else {
+                property_order::Direction::Ascending as i32
+            },
+        }
+    }
+
+    fn ids(candidates: &[QueryCandidate]) -> Vec<i64> {
+        candidates
+            .iter()
+            .map(
+                |candidate| match candidate.entity_key().unwrap().path[0].id_type {
+                    Some(IdType::Id(id)) => id,
+                    _ => panic!("numeric id"),
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn sort_candidates_orders_by_property_then_key() {
+        let candidates = vec![
+            candidate_with(1, vec![("score", int_value(5))]),
+            candidate_with(2, vec![("score", int_value(9))]),
+            candidate_with(3, vec![("score", int_value(5))]),
+            candidate_with(4, vec![("score", int_value(7))]),
+        ];
+
+        let sorted = sort_candidates(candidates.clone(), &[order_by("score", true)], None);
+        assert_eq!(ids(&sorted), vec![2, 4, 1, 3]);
+
+        let sorted = sort_candidates(
+            candidates.clone(),
+            &[order_by("score", false), order_by("__key__", true)],
+            None,
+        );
+        assert_eq!(ids(&sorted), vec![3, 1, 4, 2]);
+
+        let first_two = sort_candidates(candidates, &[order_by("score", true)], Some(2));
+        assert_eq!(ids(&first_two), vec![2, 4]);
+    }
+
+    #[test]
+    fn sort_candidates_uses_min_or_max_array_element_by_direction() {
+        let candidates = vec![
+            candidate_with(
+                1,
+                vec![("tags", array_value(vec![int_value(1), int_value(9)]))],
+            ),
+            candidate_with(
+                2,
+                vec![("tags", array_value(vec![int_value(4), int_value(5)]))],
+            ),
+        ];
+
+        let ascending = sort_candidates(candidates.clone(), &[order_by("tags", false)], None);
+        assert_eq!(ids(&ascending), vec![1, 2]);
+
+        let descending = sort_candidates(candidates, &[order_by("tags", true)], None);
+        assert_eq!(ids(&descending), vec![1, 2]);
+    }
+
+    #[test]
+    fn dedup_distinct_keeps_the_first_candidate_in_query_order_per_group() {
+        let candidates = vec![
+            candidate_with(1, vec![("group", str_value("a")), ("score", int_value(5))]),
+            candidate_with(2, vec![("group", str_value("b")), ("score", int_value(9))]),
+            candidate_with(3, vec![("group", str_value("a")), ("score", int_value(7))]),
+            candidate_with(4, vec![("group", str_value("b")), ("score", int_value(1))]),
+        ];
+        let distinct_on = vec![PropertyReference {
+            name: "group".to_string(),
+        }];
+
+        let highest =
+            dedup_distinct_candidates(candidates.clone(), &distinct_on, &[order_by("score", true)]);
+        assert_eq!(ids(&highest), vec![2, 3]);
+
+        let lowest =
+            dedup_distinct_candidates(candidates, &distinct_on, &[order_by("score", false)]);
+        assert_eq!(ids(&lowest), vec![1, 4]);
     }
 
     #[test]
