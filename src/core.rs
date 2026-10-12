@@ -5,12 +5,17 @@ use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
     EntityResult, ExecutionStats, ExplainMetrics, Filter, Key, LookupRequest, LookupResponse,
-    MutationResult, PlanSummary, PropertyOrder, PropertyReference, Query, ReserveIdsRequest,
-    ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
-    RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse, Value,
+    Mutation, MutationResult, PlanSummary, PropertyOrder, PropertyReference, Query,
+    ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
+    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
+    Value,
     aggregation_query::aggregation::Operator as AggregationOperator,
-    commit_request::TransactionSelector, filter::FilterType, key::path_element::IdType,
-    mutation::Operation, property_order, value::ValueType,
+    commit_request::{Mode, TransactionSelector},
+    filter::FilterType,
+    key::path_element::IdType,
+    mutation::Operation,
+    property_order,
+    value::ValueType,
 };
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::{HashMap, HashSet};
@@ -52,6 +57,104 @@ fn key_is_incomplete(key: &Key) -> bool {
     key.path
         .iter()
         .any(|path_element| path_element.id_type.is_none())
+}
+
+fn invalid_transaction() -> Status {
+    Status::invalid_argument("Invalid transaction.")
+}
+
+fn validate_mutation_key(key: &Key) -> Result<(), Status> {
+    if key.path.is_empty() {
+        return Err(Status::invalid_argument("Key path is empty."));
+    }
+    if key.path.iter().any(|element| element.kind.is_empty()) {
+        return Err(Status::invalid_argument("The kind is the empty string."));
+    }
+    Ok(())
+}
+
+/// Names matching `^__.*__$` are reserved by Datastore.
+fn is_reserved_property_name(name: &str) -> bool {
+    name.len() >= 4 && name.starts_with("__") && name.ends_with("__")
+}
+
+fn validate_entity_property_names(entity: &Entity) -> Result<(), Status> {
+    for (name, value) in &entity.properties {
+        if is_reserved_property_name(name) {
+            return Err(Status::invalid_argument(format!(
+                "The property.name \"{name}\" is reserved."
+            )));
+        }
+        validate_value_property_names(value)?;
+    }
+    Ok(())
+}
+
+fn validate_value_property_names(value: &Value) -> Result<(), Status> {
+    match value.value_type.as_ref() {
+        Some(ValueType::EntityValue(entity)) => validate_entity_property_names(entity),
+        Some(ValueType::ArrayValue(array)) => array
+            .values
+            .iter()
+            .try_for_each(validate_value_property_names),
+        _ => Ok(()),
+    }
+}
+
+fn mutation_key(operation: &Operation) -> Option<&Key> {
+    match operation {
+        Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
+            entity.key.as_ref()
+        }
+        Operation::Delete(key) => Some(key),
+    }
+}
+
+fn validate_mutation(operation: &Operation) -> Result<(), Status> {
+    if let Some(key) = mutation_key(operation) {
+        validate_mutation_key(key)?;
+    }
+    match operation {
+        Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
+            validate_entity_property_names(entity)
+        }
+        Operation::Delete(_) => Ok(()),
+    }
+}
+
+fn has_duplicate_complete_key(mutations: &[Mutation]) -> bool {
+    let mut seen = HashSet::new();
+    mutations
+        .iter()
+        .filter_map(|mutation| mutation.operation.as_ref().and_then(mutation_key))
+        .filter(|key| !key_is_incomplete(key))
+        .any(|key| !seen.insert(KeyStruct::from_datastore_key(key)))
+}
+
+fn validate_allocate_ids_path(key: &Key) -> Result<(), Status> {
+    let last_index = key.path.len().saturating_sub(1);
+    for (index, element) in key.path.iter().enumerate() {
+        match (&element.id_type, index == last_index) {
+            (Some(id_type), true) => {
+                let id = match id_type {
+                    IdType::Id(id) => id.to_string(),
+                    IdType::Name(name) => name.clone(),
+                };
+                return Err(Status::invalid_argument(format!(
+                    "Key path element must not be complete: [{}: {}]",
+                    element.kind, id
+                )));
+            }
+            (None, false) => {
+                return Err(Status::invalid_argument(format!(
+                    "Key path element must not be incomplete: [{}]",
+                    element.kind
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn commit_mutation_result(key: Option<Key>, version: i64) -> MutationResult {
@@ -302,6 +405,24 @@ pub async fn commit(
     let mut mutation_results = Vec::with_capacity(mutation_count);
     let commit_time = system_time_to_timestamp(SystemTime::now());
 
+    let is_transactional = req.mode == Mode::Transactional as i32;
+    let is_non_transactional = req.mode == Mode::NonTransactional as i32;
+    let has_transaction = matches!(
+        req.transaction_selector,
+        Some(TransactionSelector::Transaction(_))
+    );
+    // A single-use transaction selector also satisfies TRANSACTIONAL mode.
+    if is_transactional && req.transaction_selector.is_none() {
+        return Err(Status::invalid_argument(
+            "transactional commit requires a transaction",
+        ));
+    }
+    if is_non_transactional && has_transaction {
+        return Err(Status::invalid_argument(
+            "non-transaction commit cannot specify a transaction",
+        ));
+    }
+
     // Handle transaction if present
     let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
         match transaction_selector {
@@ -321,11 +442,19 @@ pub async fn commit(
         if storage.transactions.get(tx_id).is_some() {
             tracing::info!("Committing transaction: {}", tx_id);
         } else {
-            return Err(Status::not_found(format!(
-                "Transaction {} not found",
-                tx_id
-            )));
+            return Err(invalid_transaction());
         }
+    }
+
+    for mutation in &req.mutations {
+        if let Some(operation) = mutation.operation.as_ref() {
+            validate_mutation(operation)?;
+        }
+    }
+    if is_non_transactional && has_duplicate_complete_key(&req.mutations) {
+        return Err(Status::invalid_argument(
+            "A non-transactional commit may not contain multiple mutations affecting the same entity.",
+        ));
     }
 
     for mutation in req.mutations {
@@ -444,15 +573,17 @@ pub async fn commit(
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if storage.delete_entity(&key_to_delete).is_some() {
-                        mutation_results.push(commit_mutation_result(None, 0));
-                    } else {
-                        tracing::warn!(
-                            "Entity not found for deletion with key: {:?}",
-                            key_to_delete.path
-                        );
-                        mutation_results.push(commit_mutation_result(None, 0));
-                    }
+                    let version = match storage.delete_entity(&key_to_delete) {
+                        Some(removed) => removed.version as i64 + 1,
+                        None => {
+                            tracing::warn!(
+                                "Entity not found for deletion with key: {:?}",
+                                key_to_delete.path
+                            );
+                            1
+                        }
+                    };
+                    mutation_results.push(commit_mutation_result(None, version));
                 }
             }
         }
@@ -505,14 +636,10 @@ pub async fn rollback(
     };
 
     let mut storage = storage.write().await;
-    if storage.transactions.remove(&transaction_id).is_some() {
-        tracing::debug!("Transaction {} rolled back successfully", transaction_id);
-    } else {
-        tracing::debug!(
-            "Attempted to rollback non-existent transaction: {}",
-            transaction_id
-        );
+    if storage.transactions.remove(&transaction_id).is_none() {
+        return Err(invalid_transaction());
     }
+    tracing::debug!("Transaction {} rolled back successfully", transaction_id);
 
     Ok(RollbackResponse {})
 }
@@ -528,6 +655,7 @@ pub async fn allocate_ids(
         if incomplete_key.path.is_empty() {
             return Err(Status::invalid_argument("Key path cannot be empty"));
         }
+        validate_allocate_ids_path(&incomplete_key)?;
 
         let mut new_key = incomplete_key.clone();
         let mut allocated_id: Option<i64> = None;
