@@ -1,4 +1,4 @@
-use crate::database::DatastoreStorage;
+use crate::database::{DatastoreStorage, prepare_dump_for_project};
 use crate::operation::{OperationStatus, Operations};
 use chrono::Utc;
 use futures::StreamExt;
@@ -194,9 +194,21 @@ pub async fn bg_import_data(
     };
 
     let start = Instant::now();
-    let import_result = {
-        let mut storage_guard = storage.write();
-        storage_guard.import_dump_for_project(&export_dir, target_project_id.as_deref())
+    let prepared = task::spawn_blocking({
+        let export_dir = export_dir.clone();
+        let target_project_id = target_project_id.clone();
+        move || prepare_dump_for_project(&export_dir, target_project_id.as_deref())
+    })
+    .await;
+    let import_result = match prepared {
+        Ok(Ok(entities)) => {
+            let storage = Arc::clone(&storage);
+            task::spawn_blocking(move || storage.write().insert_imported(entities))
+                .await
+                .unwrap_or_else(|join_err| Err(tonic::Status::internal(join_err.to_string())))
+        }
+        Ok(Err(status)) => Err(status),
+        Err(join_err) => Err(tonic::Status::internal(join_err.to_string())),
     };
 
     let duration = start.elapsed();

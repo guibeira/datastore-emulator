@@ -900,6 +900,29 @@ pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExport
     .into())
 }
 
+/// Read and convert the export at `path` without touching a storage, so the
+/// caller holds the storage lock only while `insert_imported` runs.
+pub fn prepare_dump_for_project(
+    path: &str,
+    target_project_id: Option<&str>,
+) -> Result<Vec<EntityWithMetadata>, tonic::Status> {
+    let dump_entities = read_dump(path).map_err(|e| {
+        tonic::Status::invalid_argument(format!("Failed to read datastore export: {}", e))
+    })?;
+    let mut entities_with_metadata = converter_dump(dump_entities);
+    if let Some(project_id) = target_project_id {
+        for ewm in entities_with_metadata.iter_mut() {
+            rewrite_entity_project_id(&mut ewm.entity, project_id);
+        }
+    }
+    tracing::info!(
+        "Importing {} entities from dump at {}",
+        entities_with_metadata.len(),
+        path
+    );
+    Ok(entities_with_metadata)
+}
+
 pub fn read_dump(export_dir: &str) -> ImportReadResult<Vec<EntityProto>> {
     tracing::info!("Reading datastore export from: {}", export_dir);
     let metadata = read_overall_metadata(export_dir)?;
@@ -2200,22 +2223,16 @@ impl DatastoreStorage {
         path: &str,
         target_project_id: Option<&str>,
     ) -> Result<(), tonic::Status> {
-        let dump_entities = read_dump(path).map_err(|e| {
-            tonic::Status::invalid_argument(format!("Failed to read datastore export: {}", e))
-        })?;
-        let mut entities_with_metadata = converter_dump(dump_entities);
-        if let Some(project_id) = target_project_id {
-            for ewm in entities_with_metadata.iter_mut() {
-                rewrite_entity_project_id(&mut ewm.entity, project_id);
-            }
-        }
-        tracing::info!(
-            "Importing {} entities from dump at {}",
-            entities_with_metadata.len(),
-            path
-        );
-        for entity_metadata in entities_with_metadata {
-            if let Some(_key) = &entity_metadata.entity.key {
+        self.insert_imported(prepare_dump_for_project(path, target_project_id)?)
+    }
+
+    /// Store entities prepared by `prepare_dump_for_project`.
+    pub fn insert_imported(
+        &mut self,
+        entities: Vec<EntityWithMetadata>,
+    ) -> Result<(), tonic::Status> {
+        for entity_metadata in entities {
+            if entity_metadata.entity.key.is_some() {
                 self.insert_entity(&entity_metadata.entity)?;
             } else {
                 return Err(tonic::Status::invalid_argument(
@@ -3835,6 +3852,63 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepare_dump_for_project_rewrites_projects_without_a_storage() {
+        let root = temp_export_root();
+        let mut entity = legacy_entity(SOURCE_PROJECT, "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            SOURCE_PROJECT,
+            "Owner",
+            "owner-one",
+        ));
+        write_minimal_export(&root, entity);
+
+        let prepared =
+            prepare_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT)).unwrap();
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(key_project_id(&prepared[0].entity), LOCAL_PROJECT);
+        assert_eq!(
+            key_property_project_id(&prepared[0].entity, "owner"),
+            LOCAL_PROJECT
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn insert_imported_stores_prepared_entities() {
+        let root = temp_export_root();
+        write_minimal_export(&root, legacy_entity(SOURCE_PROJECT, "Task", "one"));
+        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None).unwrap();
+
+        let mut storage = DatastoreStorage::default();
+        storage.insert_imported(prepared).unwrap();
+
+        assert_eq!(storage.entities.len(), 1);
+        let stored = &storage.entities.values().next().unwrap().entity;
+        assert_eq!(key_project_id(stored), SOURCE_PROJECT);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn insert_imported_rejects_an_entity_without_a_key() {
+        let mut storage = DatastoreStorage::default();
+        let entity = EntityWithMetadata {
+            entity: Entity::default(),
+            version: 1,
+            create_time: pbjson_types::Timestamp::default(),
+            update_time: pbjson_types::Timestamp::default(),
+        };
+
+        let err = storage.insert_imported(vec![entity]).unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(storage.entities.is_empty());
     }
 
     #[test]
