@@ -18,16 +18,21 @@ pub struct RpcStatus {
     pub message: String,
 }
 
+/// The HTTP status for a gRPC code, as `google/rpc/code.proto` maps them.
 fn http_status(code: Code) -> StatusCode {
     let http = match code {
-        Code::InvalidArgument => 400,
+        Code::Ok => 200,
+        Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => 400,
         Code::Unauthenticated => 401,
         Code::PermissionDenied => 403,
         Code::NotFound => 404,
         Code::AlreadyExists | Code::Aborted => 409,
-        Code::FailedPrecondition => 412,
+        Code::ResourceExhausted => 429,
+        Code::Cancelled => 499,
+        Code::Unknown | Code::Internal | Code::DataLoss => 500,
         Code::Unimplemented => 501,
-        _ => 500,
+        Code::Unavailable => 503,
+        Code::DeadlineExceeded => 504,
     };
     StatusCode::from_u16(http).unwrap()
 }
@@ -118,5 +123,32 @@ mod tests {
     async fn unimplemented_maps_to_501() {
         let resp = status_to_response(Status::unimplemented("soon"));
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn failed_precondition_maps_to_400_like_the_real_api() {
+        let resp = status_to_response(Status::failed_precondition("no matching index"));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["error"]["code"], 400);
+        assert_eq!(v["error"]["status"], "FAILED_PRECONDITION");
+    }
+
+    #[tokio::test]
+    async fn http_status_follows_google_rpc_code_proto() {
+        let cases = [
+            (Status::resource_exhausted("slow down"), 429),
+            (Status::unavailable("later"), 503),
+            (Status::deadline_exceeded("too slow"), 504),
+            (Status::out_of_range("past the end"), 400),
+            (Status::cancelled("stop"), 499),
+            (Status::internal("boom"), 500),
+            (Status::data_loss("gone"), 500),
+        ];
+        for (status, expected) in cases {
+            let code = status.code();
+            let resp = status_to_protobuf_response(status);
+            assert_eq!(resp.status().as_u16(), expected, "{code:?}");
+        }
     }
 }
