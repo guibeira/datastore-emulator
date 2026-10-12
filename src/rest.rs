@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_returns_ok_for_unknown_tx() {
+    async fn rollback_returns_bad_request_for_unknown_tx() {
         use base64::Engine;
         let state = AppState {
             storage: Arc::new(RwLock::new(DatastoreStorage::default())),
@@ -446,7 +446,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

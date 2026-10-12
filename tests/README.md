@@ -58,3 +58,15 @@ To run the tests against your real database, set the following environment varia
 ```bash
 USE_REAL_DB=1 DATASTORE_DATABASE_NAME=<your-database-name> DATASTORE_PROJECT_ID=<your-project-id> poetry run pytest -vv
 ```
+
+## Parity Tests
+
+The `tests/test_parity_*.py` files run one scenario at a time against the Rust emulator and a reference, then assert both produce the same outcome (results, or the same gRPC error code). The reference is the official emulator by default, or the real database when `USE_REAL_DB` is set. Shared fixtures and helpers live in `tests/parity_common.py`.
+
+A scenario is skipped, with the reason, when the reference cannot run it: the official emulator has no aggregation support and rejects `!=`, `NOT_IN`, multi-value `IN` and composite `OR`; a real database rejects queries that need a composite index missing from `tests/index.yaml`.
+
+```bash
+poetry run pytest tests/test_parity_*.py -v -rs
+```
+
+Add `-s` to print both sides of every comparison.

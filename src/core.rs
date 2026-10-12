@@ -1,17 +1,24 @@
-use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, TransactionState};
+use crate::database::{
+    DatastoreStorage, EntityWithMetadata, KeyStruct, QueryCandidate, TransactionState,
+};
 use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
     EntityResult, ExecutionStats, ExplainMetrics, Filter, Key, LookupRequest, LookupResponse,
-    MutationResult, PlanSummary, PropertyOrder, PropertyReference, ReserveIdsRequest,
-    ReserveIdsResponse, RollbackRequest, RollbackResponse, RunAggregationQueryRequest,
-    RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse, Value,
+    Mutation, MutationResult, PlanSummary, PropertyOrder, PropertyReference, Query,
+    ReserveIdsRequest, ReserveIdsResponse, RollbackRequest, RollbackResponse,
+    RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest, RunQueryResponse,
+    Value,
     aggregation_query::aggregation::Operator as AggregationOperator,
-    commit_request::TransactionSelector, filter::FilterType, key::path_element::IdType,
-    mutation::Operation, property_order, value::ValueType,
+    commit_request::{Mode, TransactionSelector},
+    filter::FilterType,
+    key::path_element::IdType,
+    mutation::Operation,
+    property_order,
+    value::ValueType,
 };
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -50,6 +57,143 @@ fn key_is_incomplete(key: &Key) -> bool {
     key.path
         .iter()
         .any(|path_element| path_element.id_type.is_none())
+}
+
+fn invalid_transaction() -> Status {
+    Status::invalid_argument("Invalid transaction.")
+}
+
+fn validate_mutation_key(key: &Key) -> Result<(), Status> {
+    if key.path.is_empty() {
+        return Err(Status::invalid_argument("Key path is empty."));
+    }
+    if key.path.iter().any(|element| element.kind.is_empty()) {
+        return Err(Status::invalid_argument("The kind is the empty string."));
+    }
+    Ok(())
+}
+
+/// Names matching `^__.*__$` are reserved by Datastore.
+fn is_reserved_property_name(name: &str) -> bool {
+    name.len() >= 4 && name.starts_with("__") && name.ends_with("__")
+}
+
+fn validate_entity_property_names(entity: &Entity) -> Result<(), Status> {
+    for (name, value) in &entity.properties {
+        if is_reserved_property_name(name) {
+            return Err(Status::invalid_argument(format!(
+                "The property.name \"{name}\" is reserved."
+            )));
+        }
+        validate_value_property_names(value)?;
+    }
+    Ok(())
+}
+
+fn validate_value_property_names(value: &Value) -> Result<(), Status> {
+    match value.value_type.as_ref() {
+        Some(ValueType::EntityValue(entity)) => validate_entity_property_names(entity),
+        Some(ValueType::ArrayValue(array)) => array
+            .values
+            .iter()
+            .try_for_each(validate_value_property_names),
+        _ => Ok(()),
+    }
+}
+
+fn mutation_key(operation: &Operation) -> Option<&Key> {
+    match operation {
+        Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
+            entity.key.as_ref()
+        }
+        Operation::Delete(key) => Some(key),
+    }
+}
+
+fn validate_mutation(operation: &Operation) -> Result<(), Status> {
+    if let Some(key) = mutation_key(operation) {
+        validate_mutation_key(key)?;
+    }
+    match operation {
+        Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
+            validate_entity_property_names(entity)
+        }
+        Operation::Delete(_) => Ok(()),
+    }
+}
+
+/// Transactional commits are all-or-nothing, so the preconditions the apply
+/// loop would hit (insert of an existing key, update of a missing key) are
+/// checked up front. Earlier mutations of the same request count: a key
+/// inserted or upserted exists afterwards, a deleted key does not.
+fn check_transactional_preconditions(
+    storage: &DatastoreStorage,
+    mutations: &[Mutation],
+) -> Result<(), Status> {
+    let mut exists_after: HashMap<KeyStruct, bool> = HashMap::new();
+    for operation in mutations.iter().filter_map(|m| m.operation.as_ref()) {
+        let Some(key) = mutation_key(operation) else {
+            continue;
+        };
+        if key_is_incomplete(key) {
+            continue;
+        }
+        let key_struct = KeyStruct::from_datastore_key(key);
+        let exists = exists_after
+            .get(&key_struct)
+            .copied()
+            .unwrap_or_else(|| storage.entities.contains_key(&key_struct));
+        match operation {
+            Operation::Insert(_) if exists => {
+                return Err(Status::already_exists("entity already exists"));
+            }
+            Operation::Update(_) if !exists => {
+                return Err(Status::not_found("Entity not found for update"));
+            }
+            Operation::Insert(_) | Operation::Update(_) | Operation::Upsert(_) => {
+                exists_after.insert(key_struct, true);
+            }
+            Operation::Delete(_) => {
+                exists_after.insert(key_struct, false);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_duplicate_complete_key(mutations: &[Mutation]) -> bool {
+    let mut seen = HashSet::new();
+    mutations
+        .iter()
+        .filter_map(|mutation| mutation.operation.as_ref().and_then(mutation_key))
+        .filter(|key| !key_is_incomplete(key))
+        .any(|key| !seen.insert(KeyStruct::from_datastore_key(key)))
+}
+
+fn validate_allocate_ids_path(key: &Key) -> Result<(), Status> {
+    let last_index = key.path.len().saturating_sub(1);
+    for (index, element) in key.path.iter().enumerate() {
+        match (&element.id_type, index == last_index) {
+            (Some(id_type), true) => {
+                let id = match id_type {
+                    IdType::Id(id) => id.to_string(),
+                    IdType::Name(name) => name.clone(),
+                };
+                return Err(Status::invalid_argument(format!(
+                    "Key path element must not be complete: [{}: {}]",
+                    element.kind, id
+                )));
+            }
+            (None, false) => {
+                return Err(Status::invalid_argument(format!(
+                    "Key path element must not be incomplete: [{}]",
+                    element.kind
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn commit_mutation_result(key: Option<Key>, version: i64) -> MutationResult {
@@ -95,6 +239,25 @@ fn collect_inequality_properties(filter: &Filter) -> Vec<String> {
         walk(ft, &mut out);
     }
     out
+}
+
+/// The query's explicit order, or the implicit ascending order that
+/// inequality properties require when no order is supplied.
+fn effective_query_order(query: &Query) -> Vec<PropertyOrder> {
+    if !query.order.is_empty() {
+        return query.order.clone();
+    }
+    query
+        .filter
+        .as_ref()
+        .map(collect_inequality_properties)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|name| PropertyOrder {
+            property: Some(PropertyReference { name }),
+            direction: property_order::Direction::Ascending as i32,
+        })
+        .collect()
 }
 
 pub async fn lookup(
@@ -143,6 +306,34 @@ pub async fn lookup(
     })
 }
 
+/// Kindless queries may only order by ascending `__key__` and filter on `__key__`.
+fn validate_kindless_query(query: &Query) -> Result<(), Status> {
+    if query.order.iter().any(|order| {
+        order.property.as_ref().is_none_or(|p| p.name != "__key__")
+            || order.direction == property_order::Direction::Descending as i32
+    }) {
+        return Err(Status::invalid_argument(
+            "kind is required for all orders except __key__ ascending",
+        ));
+    }
+    if query.filter.as_ref().is_some_and(|f| !only_key_filters(f)) {
+        return Err(Status::invalid_argument(
+            "kind is required for non-__key__ filters",
+        ));
+    }
+    Ok(())
+}
+
+fn only_key_filters(filter: &Filter) -> bool {
+    match filter.filter_type.as_ref() {
+        Some(FilterType::PropertyFilter(pf)) => {
+            pf.property.as_ref().is_none_or(|p| p.name == "__key__")
+        }
+        Some(FilterType::CompositeFilter(cf)) => cf.filters.iter().all(only_key_filters),
+        None => true,
+    }
+}
+
 pub async fn run_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunQueryRequest,
@@ -153,47 +344,32 @@ pub async fn run_query(
         Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
         _ => return Err(Status::invalid_argument("Missing or invalid query")),
     };
-    let kind_name = query_obj
-        .kind
-        .first()
-        .map(|k| k.name.clone())
-        .ok_or_else(|| Status::invalid_argument("Query must specify a kind"))?;
-
     // Datastore requires inequality filters to sort by the inequality
     // property first. If the client did not supply an explicit order,
     // inject an ascending implicit order for each inequality property.
-    let order: Vec<PropertyOrder> = if query_obj.order.is_empty() {
-        query_obj
-            .filter
-            .as_ref()
-            .map(collect_inequality_properties)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|name| PropertyOrder {
-                property: Some(PropertyReference { name }),
-                direction: property_order::Direction::Ascending as i32,
-            })
-            .collect()
-    } else {
-        query_obj.order.clone()
-    };
+    let order = effective_query_order(&query_obj);
 
     let filter_type = query_obj
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
-    let retain_key_struct = query_obj.distinct_on.iter().any(|p| p.name == "__key__")
-        || order
-            .iter()
-            .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
-    let (candidates, candidates_prefiltered) = {
-        let storage = storage.read().await;
-        storage.query_candidates(
-            &req.project_id,
-            &kind_name,
-            filter_type.as_ref(),
-            retain_key_struct,
-        )
+    let namespace = req
+        .partition_id
+        .as_ref()
+        .map_or("", |p| p.namespace_id.as_str());
+    let (candidates, candidates_prefiltered) = match query_obj.kind.first() {
+        Some(kind) => {
+            let storage = storage.read().await;
+            storage.query_candidates(&req.project_id, &kind.name, namespace, filter_type.as_ref())
+        }
+        None => {
+            validate_kindless_query(&query_obj)?;
+            let storage = storage.read().await;
+            (
+                storage.kindless_candidates(&req.project_id, namespace),
+                false,
+            )
+        }
     };
 
     let batch = DatastoreStorage::get_entities_from_candidates(
@@ -258,6 +434,24 @@ pub async fn commit(
     let mut mutation_results = Vec::with_capacity(mutation_count);
     let commit_time = system_time_to_timestamp(SystemTime::now());
 
+    let is_transactional = req.mode == Mode::Transactional as i32;
+    let is_non_transactional = req.mode == Mode::NonTransactional as i32;
+    let has_transaction = matches!(
+        req.transaction_selector,
+        Some(TransactionSelector::Transaction(_))
+    );
+    // A single-use transaction selector also satisfies TRANSACTIONAL mode.
+    if is_transactional && req.transaction_selector.is_none() {
+        return Err(Status::invalid_argument(
+            "transactional commit requires a transaction",
+        ));
+    }
+    if is_non_transactional && has_transaction {
+        return Err(Status::invalid_argument(
+            "non-transaction commit cannot specify a transaction",
+        ));
+    }
+
     // Handle transaction if present
     let transaction_id = if let Some(transaction_selector) = req.transaction_selector {
         match transaction_selector {
@@ -277,11 +471,23 @@ pub async fn commit(
         if storage.transactions.get(tx_id).is_some() {
             tracing::info!("Committing transaction: {}", tx_id);
         } else {
-            return Err(Status::not_found(format!(
-                "Transaction {} not found",
-                tx_id
-            )));
+            return Err(invalid_transaction());
         }
+    }
+
+    for mutation in &req.mutations {
+        if let Some(operation) = mutation.operation.as_ref() {
+            validate_mutation(operation)?;
+        }
+    }
+    if is_non_transactional && has_duplicate_complete_key(&req.mutations) {
+        return Err(Status::invalid_argument(
+            "A non-transactional commit may not contain multiple mutations affecting the same entity.",
+        ));
+    }
+    // Non-transactional commits may apply partially, like Datastore.
+    if is_transactional || transaction_id.is_some() {
+        check_transactional_preconditions(&storage, &req.mutations)?;
     }
 
     for mutation in req.mutations {
@@ -289,6 +495,14 @@ pub async fn commit(
             match mutation {
                 Operation::Insert(entity) => {
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
+                    if !allocates_key
+                        && let Some(key) = entity.key.as_ref()
+                        && storage
+                            .entities
+                            .contains_key(&KeyStruct::from_datastore_key(key))
+                    {
+                        return Err(Status::already_exists("entity already exists"));
+                    }
                     match storage.insert_owned_entity_at(entity, commit_time.clone()) {
                         Ok((final_key, metadata)) => {
                             mutation_results.push(commit_mutation_result(
@@ -392,15 +606,17 @@ pub async fn commit(
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    if storage.delete_entity(&key_to_delete).is_some() {
-                        mutation_results.push(commit_mutation_result(None, 0));
-                    } else {
-                        tracing::warn!(
-                            "Entity not found for deletion with key: {:?}",
-                            key_to_delete.path
-                        );
-                        mutation_results.push(commit_mutation_result(None, 0));
-                    }
+                    let version = match storage.delete_entity(&key_to_delete) {
+                        Some(removed) => removed.version as i64 + 1,
+                        None => {
+                            tracing::warn!(
+                                "Entity not found for deletion with key: {:?}",
+                                key_to_delete.path
+                            );
+                            1
+                        }
+                    };
+                    mutation_results.push(commit_mutation_result(None, version));
                 }
             }
         }
@@ -453,14 +669,10 @@ pub async fn rollback(
     };
 
     let mut storage = storage.write().await;
-    if storage.transactions.remove(&transaction_id).is_some() {
-        tracing::debug!("Transaction {} rolled back successfully", transaction_id);
-    } else {
-        tracing::debug!(
-            "Attempted to rollback non-existent transaction: {}",
-            transaction_id
-        );
+    if storage.transactions.remove(&transaction_id).is_none() {
+        return Err(invalid_transaction());
     }
+    tracing::debug!("Transaction {} rolled back successfully", transaction_id);
 
     Ok(RollbackResponse {})
 }
@@ -476,6 +688,7 @@ pub async fn allocate_ids(
         if incomplete_key.path.is_empty() {
             return Err(Status::invalid_argument("Key path cannot be empty"));
         }
+        validate_allocate_ids_path(&incomplete_key)?;
 
         let mut new_key = incomplete_key.clone();
         let mut allocated_id: Option<i64> = None;
@@ -512,12 +725,69 @@ pub async fn reserve_ids(
     Ok(ReserveIdsResponse {})
 }
 
+#[derive(Clone, Copy)]
+enum Number {
+    Int(i64),
+    Double(f64),
+}
+
+impl Number {
+    fn as_f64(self) -> f64 {
+        match self {
+            Number::Int(i) => i as f64,
+            Number::Double(d) => d,
+        }
+    }
+}
+
+/// Indexed integer and double values of `prop`; array elements are expanded
+/// and entities without the property contribute nothing.
+fn indexed_numbers(entities: &[QueryCandidate], prop: &str) -> Vec<Number> {
+    let mut numbers = Vec::new();
+    for candidate in entities {
+        let Some(value) = candidate.entity_metadata.entity.properties.get(prop) else {
+            continue;
+        };
+        if value.exclude_from_indexes {
+            continue;
+        }
+        let elements = match &value.value_type {
+            Some(ValueType::ArrayValue(array)) => array.values.as_slice(),
+            _ => std::slice::from_ref(value),
+        };
+        for element in elements.iter().filter(|v| !v.exclude_from_indexes) {
+            match &element.value_type {
+                Some(ValueType::IntegerValue(i)) => numbers.push(Number::Int(*i)),
+                Some(ValueType::DoubleValue(d)) => numbers.push(Number::Double(*d)),
+                _ => {}
+            }
+        }
+    }
+    numbers
+}
+
+/// Integer when every value is an integer and the sum fits in i64, else double.
+fn sum_numbers(numbers: &[Number]) -> ValueType {
+    let exact = numbers.iter().try_fold(0i64, |acc, n| match n {
+        Number::Int(i) => acc.checked_add(*i),
+        Number::Double(_) => None,
+    });
+    match exact {
+        Some(total) => ValueType::IntegerValue(total),
+        None => ValueType::DoubleValue(numbers.iter().map(|n| n.as_f64()).sum()),
+    }
+}
+
 pub async fn run_aggregation_query(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: RunAggregationQueryRequest,
 ) -> Result<RunAggregationQueryResponse, Status> {
     let explain_requested = req.explain_options.is_some();
     let start = explain_requested.then(Instant::now);
+    let namespace = req
+        .partition_id
+        .as_ref()
+        .map_or("", |p| p.namespace_id.as_str());
     let storage = storage.read().await;
 
     // Extract the aggregation query from the request
@@ -534,167 +804,107 @@ pub async fn run_aggregation_query(
         }
     };
 
-    // Get the base query if it exists
-    let base_query = match aggregation_query.query_type.as_ref() {
-        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
-            Some(query)
+    // Empty aliases default to `property_N` (1-based position); duplicates are rejected.
+    let mut seen_aliases = HashSet::new();
+    let mut aliases = Vec::with_capacity(aggregation_query.aggregations.len());
+    for (index, aggregation) in aggregation_query.aggregations.iter().enumerate() {
+        let alias = if aggregation.alias.is_empty() {
+            format!("property_{}", index + 1)
+        } else {
+            aggregation.alias.clone()
+        };
+        if !seen_aliases.insert(alias.clone()) {
+            return Err(Status::invalid_argument(format!(
+                "Aggregation aliases contain duplicate alias: {alias}."
+            )));
         }
-        _ => {
-            // todo: Handle other query types if needed
-            None
-        }
-    };
+        aliases.push(alias);
+    }
 
     // Get current time for read_time
     let read_time = system_time_to_timestamp(SystemTime::now());
 
-    // Process each aggregation
-    let mut matching_entities: Vec<Arc<EntityWithMetadata>> = Vec::new();
+    let matching_entities: Vec<QueryCandidate> = match aggregation_query.query_type.as_ref() {
+        Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
+            let order = effective_query_order(query);
+            let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.clone());
 
-    if let Some(query) = base_query {
-        let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.as_ref());
+            let (mut candidates, candidates_prefiltered) = match query.kind.first() {
+                Some(kind) => storage.query_candidates(
+                    &req.project_id,
+                    &kind.name,
+                    namespace,
+                    filter_type.as_ref(),
+                ),
+                // An empty kind list is a kindless query over the whole namespace.
+                None => (
+                    storage.kindless_candidates(&req.project_id, namespace),
+                    false,
+                ),
+            };
+            candidates.retain(|c| c.entity_metadata.entity.key.is_some());
 
-        // Reuse the query candidate pipeline so index lookups apply to aggregation
-        // queries too. Multi-kind aggregations fall back to a scan because
-        // query_candidates is per-kind.
-        if query.kind.len() == 1 {
-            let kind_name = query.kind[0].name.as_str();
-            let (candidates, _) =
-                storage.query_candidates(&req.project_id, kind_name, filter_type, false);
-            matching_entities = candidates
-                .into_iter()
-                .filter(|c| c.entity_metadata.entity.key.is_some())
-                .map(|c| c.entity_metadata)
-                .collect();
-        } else {
-            for (key_struct, entity_metadata) in storage.entities.iter() {
-                if key_struct.project_id != req.project_id {
-                    continue;
-                }
-
-                let entity_kind = key_struct.path_elements.last().map(|(k, _)| k.as_str());
-                if entity_kind.is_none()
-                    || !query
-                        .kind
-                        .iter()
-                        .any(|k_filter| Some(k_filter.name.as_str()) == entity_kind)
-                {
-                    continue;
-                }
-
-                if entity_metadata.entity.key.is_none() {
-                    tracing::warn!("Entity found in storage without a key in its Entity struct.");
-                    continue;
-                }
-
-                if let Some(filter_type) = filter_type {
-                    if DatastoreStorage::apply_filter(entity_metadata, filter_type) {
-                        matching_entities.push(Arc::clone(entity_metadata));
-                    }
-                } else {
-                    matching_entities.push(Arc::clone(entity_metadata));
-                }
-            }
+            DatastoreStorage::aggregation_candidates(
+                candidates,
+                filter_type,
+                candidates_prefiltered,
+                query.limit.as_ref().map(|v| v.value),
+                query.offset,
+                query.distinct_on.clone(),
+                order,
+            )
         }
-    } else {
-        // todo: what we should do if there is no base query?
-    }
+        // todo: Handle other query types if needed
+        _ => Vec::new(),
+    };
 
     let mut aggregate_properties = HashMap::new();
 
-    for aggregation in &aggregation_query.aggregations {
-        if let Some(aggregation_operator) = &aggregation.operator {
-            // Check if the aggregation operator is supported
-            match aggregation_operator {
-                AggregationOperator::Count(_count) => {
-                    let count_value = matching_entities.len() as i64;
-                    // Create the aggregation result
-                    let result_value = Value {
-                        exclude_from_indexes: false,
-                        meaning: 0,
-                        value_type: Some(ValueType::IntegerValue(count_value)),
-                    };
-                    aggregate_properties.insert(aggregation.alias.clone(), result_value);
-                }
-                AggregationOperator::Sum(sum) => {
-                    // Implement SUM aggregation
-                    let mut sum_value = 0.0;
-
-                    let prop_name = match &sum.property {
-                        Some(p) => &p.name,
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Sum aggregation requires a property",
-                            ));
-                        }
-                    };
-
-                    // Calculate the sum for the specified property
-                    for entity_metadata in &matching_entities {
-                        if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
-                            if let Some(ValueType::IntegerValue(value)) = &property.value_type {
-                                sum_value += *value as f64;
-                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
-                            {
-                                sum_value += *value;
-                            }
-                        }
-                    }
-
-                    // Create the aggregation result
-                    let result_value = Value {
-                        exclude_from_indexes: false,
-                        meaning: 0,
-                        value_type: Some(ValueType::DoubleValue(sum_value)),
-                    };
-                    aggregate_properties.insert(aggregation.alias.clone(), result_value);
-                }
-                AggregationOperator::Avg(avg) => {
-                    // Implement AVERAGE aggregation
-                    let mut sum_value = 0.0;
-                    let mut count = 0;
-
-                    let prop_name = match &avg.property {
-                        Some(p) => &p.name,
-                        None => {
-                            return Err(Status::invalid_argument(
-                                "Avg aggregation requires a property",
-                            ));
-                        }
-                    };
-
-                    // Calculate the sum and count for the average
-                    for entity_metadata in &matching_entities {
-                        if let Some(property) = entity_metadata.entity.properties.get(prop_name) {
-                            if let Some(ValueType::IntegerValue(value)) = &property.value_type {
-                                sum_value += *value as f64;
-                                count += 1;
-                            } else if let Some(ValueType::DoubleValue(value)) = &property.value_type
-                            {
-                                sum_value += *value;
-                                count += 1;
-                            }
-                        }
-                    }
-
-                    // Calculate the average
-                    let average_value = if count > 0 {
-                        sum_value / count as f64
-                    } else {
-                        0.0
-                    };
-
-                    // Create the aggregation result
-                    let result_value = Value {
-                        exclude_from_indexes: false,
-                        meaning: 0,
-                        value_type: Some(ValueType::DoubleValue(average_value)),
-                    };
-                    aggregate_properties.insert(aggregation.alias.clone(), result_value);
+    for (aggregation, alias) in aggregation_query.aggregations.iter().zip(aliases) {
+        let Some(aggregation_operator) = &aggregation.operator else {
+            continue;
+        };
+        let value_type = match aggregation_operator {
+            AggregationOperator::Count(_count) => {
+                ValueType::IntegerValue(matching_entities.len() as i64)
+            }
+            AggregationOperator::Sum(sum) => {
+                let prop_name =
+                    sum.property
+                        .as_ref()
+                        .map(|p| p.name.as_str())
+                        .ok_or_else(|| {
+                            Status::invalid_argument("Sum aggregation requires a property")
+                        })?;
+                sum_numbers(&indexed_numbers(&matching_entities, prop_name))
+            }
+            AggregationOperator::Avg(avg) => {
+                let prop_name =
+                    avg.property
+                        .as_ref()
+                        .map(|p| p.name.as_str())
+                        .ok_or_else(|| {
+                            Status::invalid_argument("Avg aggregation requires a property")
+                        })?;
+                let numbers = indexed_numbers(&matching_entities, prop_name);
+                if numbers.is_empty() {
+                    ValueType::NullValue(0)
+                } else {
+                    let total: f64 = numbers.iter().map(|n| n.as_f64()).sum();
+                    ValueType::DoubleValue(total / numbers.len() as f64)
                 }
             }
-        }
+        };
+        aggregate_properties.insert(
+            alias,
+            Value {
+                exclude_from_indexes: false,
+                meaning: 0,
+                value_type: Some(value_type),
+            },
+        );
     }
+
     // Create a single AggregationResult with all properties
     let final_aggregation_result = AggregationResult {
         aggregate_properties,

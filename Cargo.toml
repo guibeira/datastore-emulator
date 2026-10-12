@@ -54,6 +54,7 @@ clap = { version = "4.5.40", features = ["derive"] }
 pbjson = "0.5"
 pbjson-types = "0.5"
 tower-http = { version = "0.4", features = ["cors"] }
+mimalloc = "0.1"
 
 [build-dependencies]
 tonic-build = "0.9"
@@ -67,3 +68,9 @@ criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 [[bench]]
 name = "query_baseline"
 harness = false
+
+# Whole-program optimization: measured 5-18% on commits, lookups and
+# index-backed queries (benchmark/query_baseline_after_release_profile.md).
+[profile.release]
+lto = "fat"
+codegen-units = 1

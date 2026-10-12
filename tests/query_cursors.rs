@@ -476,3 +476,22 @@ async fn inequality_on_dotted_property_name_matches() {
         );
     }
 }
+
+#[tokio::test]
+async fn limit_zero_returns_no_results() {
+    let storage = storage_with_things();
+    let batch = run(&storage, limited(query(), 0)).await.unwrap();
+    assert!(result_names(&batch).is_empty());
+    assert_eq!(more_results(&batch), MoreResultsType::MoreResultsAfterLimit);
+    assert!(!batch.end_cursor.is_empty());
+}
+
+#[tokio::test]
+async fn limit_zero_with_offset_skips_but_returns_nothing() {
+    let storage = storage_with_things();
+    let mut q = limited(query(), 0);
+    q.offset = 2;
+    let batch = run(&storage, q).await.unwrap();
+    assert!(result_names(&batch).is_empty());
+    assert_eq!(batch.skipped_results, 2);
+}
