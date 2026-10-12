@@ -1390,6 +1390,76 @@ fn distinct_signature_matches(
             })
 }
 
+fn candidate_matches_filter(
+    candidate: &QueryCandidate,
+    filter_type: Option<&FilterType>,
+    prepared_key_filter: Option<&PreparedKeyFilter>,
+    candidates_prefiltered: bool,
+) -> bool {
+    if candidates_prefiltered {
+        return true;
+    }
+    if let Some(pkf) = prepared_key_filter {
+        let Some(ks) = candidate.key_struct.as_ref() else {
+            return false;
+        };
+        return match_prepared_key_filter(ks, pkf);
+    }
+    match filter_type {
+        Some(filter_type) => {
+            DatastoreStorage::apply_filter(candidate.entity_metadata.as_ref(), filter_type)
+        }
+        None => true,
+    }
+}
+
+/// Index scans drop entities without an indexed value for any ordered
+/// property (`__key__` is always indexed).
+fn has_indexed_order_values(candidate: &QueryCandidate, order: &[PropertyOrder]) -> bool {
+    order.iter().all(|order_by| {
+        let Some(name) = order_by.property.as_ref().map(|p| p.name.as_str()) else {
+            return true;
+        };
+        if name == "__key__" {
+            return true;
+        }
+        let descending = order_by.direction == property_order::Direction::Descending as i32;
+        candidate
+            .entity_metadata
+            .entity
+            .properties
+            .get(name)
+            .and_then(|v| sort_value(v, descending))
+            .is_some()
+    })
+}
+
+/// Keeps the first candidate of each distinct-on signature, preserving order.
+fn dedup_distinct_candidates(
+    candidates: Vec<QueryCandidate>,
+    distinct_on: &[PropertyReference],
+) -> Vec<QueryCandidate> {
+    let mut seen_signatures: HashMap<u64, Vec<Vec<DistinctComponent>>> = HashMap::new();
+    let mut distinct_entities = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
+
+    for candidate in candidates {
+        let signature_hash = hash_distinct_signature(&candidate, distinct_on, &mut scratch);
+
+        let matching_signatures = seen_signatures.entry(signature_hash).or_default();
+        if matching_signatures
+            .iter()
+            .any(|existing| distinct_signature_matches(existing, &candidate, distinct_on))
+        {
+            continue;
+        }
+
+        matching_signatures.push(build_distinct_signature(&candidate, distinct_on));
+        distinct_entities.push(candidate);
+    }
+    distinct_entities
+}
+
 #[derive(Default, Debug)]
 pub struct DatastoreStorage {
     // Stores using BTreeMap for ordered storage, mapping a full KeyStruct to its EntityWithMetadata
@@ -1478,18 +1548,22 @@ impl DatastoreStorage {
             let index_key = (
                 project_id_filter.to_string(),
                 kind_name.to_string(),
-                ancestor_key_struct,
+                ancestor_key_struct.clone(),
             );
-            let Some(keys) = self.ancestor_index.get(&index_key) else {
-                return Some(Vec::new());
-            };
-            return Some(self.candidates_from_index_keys(
-                project_id_filter,
-                kind_name,
-                namespace,
-                retain_key_struct,
-                keys.iter(),
-            ));
+            // The ancestor sorts before its descendants.
+            let ancestor_itself = Some(&ancestor_key_struct);
+            let descendants = self.ancestor_index.get(&index_key);
+            return Some(
+                self.candidates_from_index_keys(
+                    project_id_filter,
+                    kind_name,
+                    namespace,
+                    retain_key_struct,
+                    ancestor_itself
+                        .into_iter()
+                        .chain(descendants.into_iter().flatten()),
+                ),
+            );
         }
 
         let indexed_values = get_indexable_strings_for_value(filter_value);
@@ -1606,16 +1680,23 @@ impl DatastoreStorage {
                                     return None;
                                 }
 
-                                return Some(
-                                    self.ancestor_index
-                                        .get(&(
-                                            project_id.to_string(),
-                                            kind_name.to_string(),
-                                            ancestor_key_struct,
-                                        ))
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                );
+                                let mut keys = self
+                                    .ancestor_index
+                                    .get(&(
+                                        project_id.to_string(),
+                                        kind_name.to_string(),
+                                        ancestor_key_struct.clone(),
+                                    ))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if ancestor_key_struct
+                                    .path_elements
+                                    .last()
+                                    .is_some_and(|(k, _)| k == kind_name)
+                                {
+                                    keys.insert(ancestor_key_struct);
+                                }
+                                return Some(keys);
                             }
                             None
                         }
@@ -2024,7 +2105,7 @@ impl DatastoreStorage {
                                     return false;
                                 }
 
-                                if entity_key.path.len() > ancestor_key_value.path.len() {
+                                if entity_key.path.len() >= ancestor_key_value.path.len() {
                                     for (i, ancestor_path_element) in
                                         ancestor_key_value.path.iter().enumerate()
                                     {
@@ -2312,6 +2393,24 @@ impl DatastoreStorage {
         }
         results
     }
+    /// Every entity in the project and namespace, in key order (kindless queries).
+    pub(crate) fn kindless_candidates(
+        &self,
+        project_id_filter: &str,
+        namespace: &str,
+    ) -> Vec<QueryCandidate> {
+        self.entities
+            .iter()
+            .filter(|(key_struct, _)| {
+                key_struct.project_id == project_id_filter && key_struct.namespace == namespace
+            })
+            .map(|(key_struct, entity_metadata)| QueryCandidate {
+                key_struct: Some(key_struct.clone()),
+                entity_metadata: Arc::clone(entity_metadata),
+            })
+            .collect()
+    }
+
     pub(crate) fn query_candidates(
         &self,
         project_id_filter: &str,
@@ -2453,50 +2552,19 @@ impl DatastoreStorage {
         let end_position = decode_cursor(&end_cursor)?;
         let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
 
-        let matches_filter = |candidate: &QueryCandidate| -> bool {
-            if candidates_prefiltered {
-                return true;
-            }
-            if let Some(ref pkf) = prepared_key_filter {
-                let Some(ks) = candidate.key_struct.as_ref() else {
-                    return false;
-                };
-                return match_prepared_key_filter(ks, pkf);
-            }
-            if let Some(ref filter_type) = filter_type {
-                DatastoreStorage::apply_filter(candidate.entity_metadata.as_ref(), filter_type)
-            } else {
-                true
-            }
-        };
-
         let limit = limit.filter(|value| *value >= 0);
-
-        // Order by a property is an index scan: drop entities without an indexed
-        // value for any ordered property (`__key__` is always indexed).
-        let has_indexed_order_values = |candidate: &QueryCandidate| -> bool {
-            order.iter().all(|order_by| {
-                let Some(name) = order_by.property.as_ref().map(|p| p.name.as_str()) else {
-                    return true;
-                };
-                if name == "__key__" {
-                    return true;
-                }
-                let descending = order_by.direction == property_order::Direction::Descending as i32;
-                candidate
-                    .entity_metadata
-                    .entity
-                    .properties
-                    .get(name)
-                    .and_then(|v| sort_value(v, descending))
-                    .is_some()
-            })
-        };
 
         let mut filtered_entities: Vec<QueryCandidate> = candidates
             .into_iter()
-            .filter(|candidate| matches_filter(candidate))
-            .filter(|candidate| has_indexed_order_values(candidate))
+            .filter(|candidate| {
+                candidate_matches_filter(
+                    candidate,
+                    filter_type.as_ref(),
+                    prepared_key_filter.as_ref(),
+                    candidates_prefiltered,
+                )
+            })
+            .filter(|candidate| has_indexed_order_values(candidate, &order))
             .collect();
 
         let mut cut_by_end_cursor = false;
@@ -2542,27 +2610,7 @@ impl DatastoreStorage {
         }
 
         if !distinct_on.is_empty() {
-            let mut seen_signatures: HashMap<u64, Vec<Vec<DistinctComponent>>> = HashMap::new();
-            let mut distinct_entities = Vec::new();
-            let mut scratch: Vec<u8> = Vec::new();
-
-            for candidate in filtered_entities.into_iter() {
-                let signature_hash =
-                    hash_distinct_signature(&candidate, &distinct_on, &mut scratch);
-
-                let matching_signatures = seen_signatures.entry(signature_hash).or_default();
-                if matching_signatures
-                    .iter()
-                    .any(|existing| distinct_signature_matches(existing, &candidate, &distinct_on))
-                {
-                    continue;
-                }
-
-                matching_signatures.push(build_distinct_signature(&candidate, &distinct_on));
-                distinct_entities.push(candidate);
-            }
-
-            filtered_entities = distinct_entities;
+            filtered_entities = dedup_distinct_candidates(filtered_entities, &distinct_on);
             // Cursors apply after dedup, so a group that a previous page
             // returned does not come back.
             cut_by_end_cursor = retain_between_cursors(
@@ -2699,6 +2747,48 @@ impl DatastoreStorage {
             more_results: new_more_results_state as i32,
             end_cursor,
         })
+    }
+
+    /// Filter, order, distinct and paginate candidates for an aggregation.
+    /// Unlike `get_entities_from_candidates` this neither clones entities nor
+    /// applies cursors or projections.
+    pub(crate) fn aggregation_candidates(
+        candidates: Vec<QueryCandidate>,
+        filter_type: Option<FilterType>,
+        candidates_prefiltered: bool,
+        limit: Option<i32>,
+        offset: i32,
+        distinct_on: Vec<PropertyReference>,
+        order: Vec<PropertyOrder>,
+    ) -> Vec<QueryCandidate> {
+        let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
+        let mut matching: Vec<QueryCandidate> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate_matches_filter(
+                    candidate,
+                    filter_type.as_ref(),
+                    prepared_key_filter.as_ref(),
+                    candidates_prefiltered,
+                )
+            })
+            .filter(|candidate| has_indexed_order_values(candidate, &order))
+            .collect();
+
+        let limit = limit.filter(|value| *value >= 0);
+        if !order.is_empty() || limit.is_some() || offset > 0 {
+            matching.sort_unstable_by(|a, b| compare_query_position(a, b, &order));
+        }
+        if !distinct_on.is_empty() {
+            matching = dedup_distinct_candidates(matching, &distinct_on);
+        }
+
+        let skipped = (offset.max(0) as usize).min(matching.len());
+        matching.drain(..skipped);
+        if let Some(limit) = limit {
+            matching.truncate(limit as usize);
+        }
+        matching
     }
 
     pub fn get_entities(
