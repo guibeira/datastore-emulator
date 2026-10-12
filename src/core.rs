@@ -122,6 +122,45 @@ fn validate_mutation(operation: &Operation) -> Result<(), Status> {
     }
 }
 
+/// Transactional commits are all-or-nothing, so the preconditions the apply
+/// loop would hit (insert of an existing key, update of a missing key) are
+/// checked up front. Earlier mutations of the same request count: a key
+/// inserted or upserted exists afterwards, a deleted key does not.
+fn check_transactional_preconditions(
+    storage: &DatastoreStorage,
+    mutations: &[Mutation],
+) -> Result<(), Status> {
+    let mut exists_after: HashMap<KeyStruct, bool> = HashMap::new();
+    for operation in mutations.iter().filter_map(|m| m.operation.as_ref()) {
+        let Some(key) = mutation_key(operation) else {
+            continue;
+        };
+        if key_is_incomplete(key) {
+            continue;
+        }
+        let key_struct = KeyStruct::from_datastore_key(key);
+        let exists = exists_after
+            .get(&key_struct)
+            .copied()
+            .unwrap_or_else(|| storage.entities.contains_key(&key_struct));
+        match operation {
+            Operation::Insert(_) if exists => {
+                return Err(Status::already_exists("entity already exists"));
+            }
+            Operation::Update(_) if !exists => {
+                return Err(Status::not_found("Entity not found for update"));
+            }
+            Operation::Insert(_) | Operation::Update(_) | Operation::Upsert(_) => {
+                exists_after.insert(key_struct, true);
+            }
+            Operation::Delete(_) => {
+                exists_after.insert(key_struct, false);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn has_duplicate_complete_key(mutations: &[Mutation]) -> bool {
     let mut seen = HashSet::new();
     mutations
@@ -455,6 +494,10 @@ pub async fn commit(
         return Err(Status::invalid_argument(
             "A non-transactional commit may not contain multiple mutations affecting the same entity.",
         ));
+    }
+    // Non-transactional commits may apply partially, like Datastore.
+    if is_transactional || transaction_id.is_some() {
+        check_transactional_preconditions(&storage, &req.mutations)?;
     }
 
     for mutation in req.mutations {

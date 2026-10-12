@@ -86,6 +86,136 @@ fn delete(key: Key) -> Mutation {
     }
 }
 
+fn update(entity: Entity) -> Mutation {
+    Mutation {
+        operation: Some(Operation::Update(entity)),
+        ..Default::default()
+    }
+}
+
+async fn commit_non_tx(storage: &Storage, mutations: Vec<Mutation>) -> Result<(), tonic::Status> {
+    core::commit(storage, commit_req(Mode::NonTransactional, None, mutations))
+        .await
+        .map(|_| ())
+}
+
+async fn commit_tx(storage: &Storage, mutations: Vec<Mutation>) -> Result<(), tonic::Status> {
+    let tx = begin(storage).await;
+    core::commit(
+        storage,
+        commit_req(
+            Mode::Transactional,
+            Some(TransactionSelector::Transaction(tx)),
+            mutations,
+        ),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn stored_value(storage: &Storage, k: &Key, prop: &str) -> Option<Value> {
+    storage
+        .read()
+        .await
+        .get_entity(k)
+        .and_then(|e| e.entity.properties.get(prop).cloned())
+}
+
+/// Transactional commits are all-or-nothing: a failing precondition must
+/// leave earlier mutations of the same request unapplied.
+#[tokio::test]
+async fn transactional_commit_applies_nothing_when_insert_hits_existing_key() {
+    let storage = new_storage();
+    let existing = key("existing");
+    commit_non_tx(&storage, vec![upsert(entity(existing.clone(), vec![]))])
+        .await
+        .expect("seed");
+
+    let a = key("a");
+    let err = commit_tx(
+        &storage,
+        vec![
+            upsert(entity(a.clone(), vec![("v", int_val(1))])),
+            insert(entity(existing.clone(), vec![])),
+        ],
+    )
+    .await
+    .expect_err("insert of an existing key must fail");
+    assert_eq!(err.code(), Code::AlreadyExists);
+    assert!(
+        storage.read().await.get_entity(&a).is_none(),
+        "earlier upsert must not be applied"
+    );
+}
+
+#[tokio::test]
+async fn transactional_commit_applies_nothing_when_update_misses() {
+    let storage = new_storage();
+    let a = key("a");
+    let err = commit_tx(
+        &storage,
+        vec![
+            upsert(entity(a.clone(), vec![("v", int_val(1))])),
+            update(entity(key("missing"), vec![])),
+        ],
+    )
+    .await
+    .expect_err("update of a missing key must fail");
+    assert_eq!(err.code(), Code::NotFound);
+    assert!(
+        storage.read().await.get_entity(&a).is_none(),
+        "earlier upsert must not be applied"
+    );
+}
+
+/// Inside one transaction a key may be inserted and then updated, or deleted
+/// and then inserted again.
+#[tokio::test]
+async fn transactional_commit_allows_insert_then_update_and_delete_then_insert() {
+    let storage = new_storage();
+    let k = key("k");
+    commit_tx(
+        &storage,
+        vec![
+            insert(entity(k.clone(), vec![("v", int_val(1))])),
+            update(entity(k.clone(), vec![("v", int_val(2))])),
+        ],
+    )
+    .await
+    .expect("insert then update");
+    assert_eq!(stored_value(&storage, &k, "v").await, Some(int_val(2)));
+
+    commit_tx(
+        &storage,
+        vec![
+            delete(k.clone()),
+            insert(entity(k.clone(), vec![("v", int_val(3))])),
+        ],
+    )
+    .await
+    .expect("delete then insert");
+    assert_eq!(stored_value(&storage, &k, "v").await, Some(int_val(3)));
+}
+
+/// Non-transactional commits are not atomic in Datastore ("the mutations may
+/// not apply as all or none"), so earlier mutations stay applied.
+#[tokio::test]
+async fn non_transactional_commit_keeps_earlier_mutations_on_failure() {
+    let storage = new_storage();
+    let a = key("a");
+    let err = commit_non_tx(
+        &storage,
+        vec![
+            upsert(entity(a.clone(), vec![("v", int_val(1))])),
+            update(entity(key("missing"), vec![])),
+        ],
+    )
+    .await
+    .expect_err("update of a missing key must fail");
+    assert_eq!(err.code(), Code::NotFound);
+    assert_eq!(stored_value(&storage, &a, "v").await, Some(int_val(1)));
+}
+
 fn commit_req(
     mode: Mode,
     selector: Option<TransactionSelector>,
