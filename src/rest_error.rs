@@ -1,13 +1,25 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
+use prost::Message;
 use serde_json::json;
 use tonic::{Code, Status};
 
-pub fn status_to_response(s: Status) -> Response {
-    let http = match s.code() {
+pub const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
+
+/// `google.rpc.Status`, the error body on the protobuf wire.
+#[derive(Clone, PartialEq, Message)]
+pub struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: String,
+}
+
+fn http_status(code: Code) -> StatusCode {
+    let http = match code {
         Code::InvalidArgument => 400,
         Code::Unauthenticated => 401,
         Code::PermissionDenied => 403,
@@ -17,6 +29,26 @@ pub fn status_to_response(s: Status) -> Response {
         Code::Unimplemented => 501,
         _ => 500,
     };
+    StatusCode::from_u16(http).unwrap()
+}
+
+/// The error as the Google clients expect it on the protobuf wire: the
+/// mapped HTTP status with a serialized `google.rpc.Status` body.
+pub fn status_to_protobuf_response(s: Status) -> Response {
+    let body = RpcStatus {
+        code: s.code() as i32,
+        message: s.message().to_string(),
+    };
+    (
+        http_status(s.code()),
+        [(CONTENT_TYPE, PROTOBUF_CONTENT_TYPE)],
+        body.encode_to_vec(),
+    )
+        .into_response()
+}
+
+pub fn status_to_response(s: Status) -> Response {
+    let http = http_status(s.code());
     let status_str = match s.code() {
         Code::Ok => "OK",
         Code::Cancelled => "CANCELLED",
@@ -37,10 +69,10 @@ pub fn status_to_response(s: Status) -> Response {
         Code::Unauthenticated => "UNAUTHENTICATED",
     };
     (
-        StatusCode::from_u16(http).unwrap(),
+        http,
         Json(json!({
             "error": {
-                "code": http,
+                "code": http.as_u16(),
                 "message": s.message(),
                 "status": status_str,
             }
