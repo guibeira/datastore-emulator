@@ -357,24 +357,27 @@ pub async fn run_query(
         .partition_id
         .as_ref()
         .map_or("", |p| p.namespace_id.as_str());
-    let (candidates, candidates_prefiltered) = match query_obj.kind.first() {
+    if query_obj.kind.is_empty() {
+        validate_kindless_query(&query_obj)?;
+    }
+
+    let storage = storage.read().await;
+    let (candidates, candidates_prefiltered): (
+        Box<dyn Iterator<Item = QueryCandidate> + '_>,
+        bool,
+    ) = match query_obj.kind.first() {
         Some(kind) => {
-            let storage = storage.read().await;
             storage.query_candidates(&req.project_id, &kind.name, namespace, filter_type.as_ref())
         }
-        None => {
-            validate_kindless_query(&query_obj)?;
-            let storage = storage.read().await;
-            (
-                storage.kindless_candidates(&req.project_id, namespace),
-                false,
-            )
-        }
+        None => (
+            Box::new(storage.kindless_candidates(&req.project_id, namespace)),
+            false,
+        ),
     };
 
     let batch = DatastoreStorage::get_entities_from_candidates(
         candidates,
-        filter_type,
+        filter_type.as_ref(),
         candidates_prefiltered,
         query_obj.limit.as_ref().map(|v| v.value),
         query_obj.offset,
@@ -384,6 +387,7 @@ pub async fn run_query(
         query_obj.distinct_on.clone(),
         order,
     )?;
+    drop(storage);
     let explain_metrics = if let Some(start) = start {
         let mut fields = HashMap::new();
         let amount_results = batch.entity_results.len() as i64;
@@ -829,7 +833,10 @@ pub async fn run_aggregation_query(
             let order = effective_query_order(query);
             let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.clone());
 
-            let (mut candidates, candidates_prefiltered) = match query.kind.first() {
+            let (candidates, candidates_prefiltered): (
+                Box<dyn Iterator<Item = QueryCandidate> + '_>,
+                bool,
+            ) = match query.kind.first() {
                 Some(kind) => storage.query_candidates(
                     &req.project_id,
                     &kind.name,
@@ -838,15 +845,15 @@ pub async fn run_aggregation_query(
                 ),
                 // An empty kind list is a kindless query over the whole namespace.
                 None => (
-                    storage.kindless_candidates(&req.project_id, namespace),
+                    Box::new(storage.kindless_candidates(&req.project_id, namespace)),
                     false,
                 ),
             };
-            candidates.retain(|c| c.entity_metadata.entity.key.is_some());
+            let candidates = candidates.filter(|c| c.entity_metadata.entity.key.is_some());
 
             DatastoreStorage::aggregation_candidates(
                 candidates,
-                filter_type,
+                filter_type.as_ref(),
                 candidates_prefiltered,
                 query.limit.as_ref().map(|v| v.value),
                 query.offset,

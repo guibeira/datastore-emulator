@@ -18,6 +18,7 @@ use chrono::DateTime;
 use prost::Message;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::*;
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::sync::{Arc, atomic::AtomicI64};
 
@@ -1543,18 +1544,19 @@ pub struct DatastoreStorage {
 }
 
 impl DatastoreStorage {
-    fn candidates_from_index_keys<'a>(
-        &self,
-        project_id_filter: &str,
-        kind_name: &str,
-        namespace: &str,
-        keys: impl IntoIterator<Item = &'a KeyStruct>,
-    ) -> Vec<QueryCandidate> {
+    fn candidates_from_index_keys<'a, K: Borrow<KeyStruct> + 'a>(
+        &'a self,
+        project_id_filter: &'a str,
+        kind_name: &'a str,
+        namespace: &'a str,
+        keys: impl IntoIterator<Item = K> + 'a,
+    ) -> impl Iterator<Item = QueryCandidate> + 'a {
         let scope_key = (project_id_filter.to_string(), kind_name.to_string());
         let scoped_entities = self.scoped_entities.get(&scope_key);
 
         keys.into_iter()
-            .filter(|key_struct| {
+            .filter(move |key| {
+                let key_struct = key.borrow();
                 key_struct.project_id == project_id_filter
                     && key_struct.namespace == namespace
                     && key_struct
@@ -1562,7 +1564,8 @@ impl DatastoreStorage {
                         .last()
                         .is_some_and(|(k, _)| k == kind_name)
             })
-            .filter_map(|key_struct| {
+            .filter_map(move |key| {
+                let key_struct = key.borrow();
                 scoped_entities
                     .and_then(|entities| entities.get(key_struct))
                     .or_else(|| self.entities.get(key_struct))
@@ -1570,16 +1573,15 @@ impl DatastoreStorage {
                         entity_metadata: Arc::clone(entity_metadata),
                     })
             })
-            .collect()
     }
 
-    fn query_simple_index_candidates(
-        &self,
-        project_id_filter: &str,
-        kind_name: &str,
-        namespace: &str,
-        filter_type: &FilterType,
-    ) -> Option<Vec<QueryCandidate>> {
+    fn query_simple_index_candidates<'a>(
+        &'a self,
+        project_id_filter: &'a str,
+        kind_name: &'a str,
+        namespace: &'a str,
+        filter_type: &'a FilterType,
+    ) -> Option<Box<dyn Iterator<Item = QueryCandidate> + 'a>> {
         let FilterType::PropertyFilter(property_filter) = filter_type else {
             return None;
         };
@@ -1598,7 +1600,7 @@ impl DatastoreStorage {
             if ancestor_key_struct.project_id != project_id_filter
                 || ancestor_key_struct.path_elements.is_empty()
             {
-                return Some(Vec::new());
+                return Some(Box::new(std::iter::empty()));
             }
             if self.ancestor_index.is_empty()
                 && self.scoped_entities.is_empty()
@@ -1612,19 +1614,20 @@ impl DatastoreStorage {
                 kind_name.to_string(),
                 ancestor_key_struct.clone(),
             );
-            // The ancestor sorts before its descendants.
-            let ancestor_itself = Some(&ancestor_key_struct);
-            let descendants = self.ancestor_index.get(&index_key);
-            return Some(
-                self.candidates_from_index_keys(
-                    project_id_filter,
-                    kind_name,
-                    namespace,
-                    ancestor_itself
-                        .into_iter()
-                        .chain(descendants.into_iter().flatten()),
-                ),
+            let descendants = self.candidates_from_index_keys(
+                project_id_filter,
+                kind_name,
+                namespace,
+                self.ancestor_index.get(&index_key).into_iter().flatten(),
             );
+            // The ancestor sorts before its descendants.
+            let ancestor_itself = self.candidates_from_index_keys(
+                project_id_filter,
+                kind_name,
+                namespace,
+                std::iter::once(ancestor_key_struct),
+            );
+            return Some(Box::new(ancestor_itself.chain(descendants)));
         }
 
         let indexed_values = get_indexable_strings_for_value(filter_value);
@@ -1640,14 +1643,14 @@ impl DatastoreStorage {
                     indexed_values.into_iter().next().unwrap(),
                 );
                 let Some(keys) = self.indexes.get(&index_key) else {
-                    return Some(Vec::new());
+                    return Some(Box::new(std::iter::empty()));
                 };
-                Some(self.candidates_from_index_keys(
+                Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
                     namespace,
                     keys.iter(),
-                ))
+                )))
             }
             6 if matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))) => {
                 let kind_key = kind_name.to_string();
@@ -1663,12 +1666,12 @@ impl DatastoreStorage {
                     }
                 }
 
-                Some(self.candidates_from_index_keys(
+                Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
                     namespace,
                     unique_keys,
-                ))
+                )))
             }
             _ => None,
         }
@@ -2453,29 +2456,31 @@ impl DatastoreStorage {
         results
     }
     /// Every entity in the project and namespace, in key order (kindless queries).
-    pub(crate) fn kindless_candidates(
-        &self,
-        project_id_filter: &str,
-        namespace: &str,
-    ) -> Vec<QueryCandidate> {
+    pub(crate) fn kindless_candidates<'a>(
+        &'a self,
+        project_id_filter: &'a str,
+        namespace: &'a str,
+    ) -> impl Iterator<Item = QueryCandidate> + 'a {
         self.entities
             .iter()
-            .filter(|(key_struct, _)| {
+            .filter(move |(key_struct, _)| {
                 key_struct.project_id == project_id_filter && key_struct.namespace == namespace
             })
             .map(|(_, entity_metadata)| QueryCandidate {
                 entity_metadata: Arc::clone(entity_metadata),
             })
-            .collect()
     }
 
-    pub(crate) fn query_candidates(
-        &self,
-        project_id_filter: &str,
-        kind_name: &str,
-        namespace: &str,
-        filter_type: Option<&FilterType>,
-    ) -> (Vec<QueryCandidate>, bool) {
+    /// Candidates in ascending key order; the flag says the filter was
+    /// already applied. The iterator borrows the storage, so callers hold
+    /// the lock while they consume it, and a limit stops the scan early.
+    pub(crate) fn query_candidates<'a>(
+        &'a self,
+        project_id_filter: &'a str,
+        kind_name: &'a str,
+        namespace: &'a str,
+        filter_type: Option<&'a FilterType>,
+    ) -> (Box<dyn Iterator<Item = QueryCandidate> + 'a>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             let mut candidates: Vec<QueryCandidate> = self
                 .get_metadata(kind_name, project_id_filter, namespace)
@@ -2486,7 +2491,7 @@ impl DatastoreStorage {
                 .collect();
             // Other candidate sources are in key order; cursors rely on it.
             candidates.sort_by(compare_candidate_keys);
-            return (candidates, false);
+            return (Box::new(candidates.into_iter()), false);
         }
 
         if let Some(filter_type) = filter_type
@@ -2505,94 +2510,71 @@ impl DatastoreStorage {
                 self.index_lookup_for_filter(project_id_filter, kind_name, filter_type)
         {
             let candidates_prefiltered = index_lookup_covers_filter(filter_type);
-            let scope_key = (project_id_filter.to_string(), kind_name.to_string());
-            let scoped_entities = self.scoped_entities.get(&scope_key);
             return (
-                candidate_keys
-                    .into_iter()
-                    .filter(|key_struct| {
-                        key_struct.project_id == project_id_filter
-                            && key_struct.namespace == namespace
-                            && key_struct
-                                .path_elements
-                                .last()
-                                .is_some_and(|(k, _)| k == kind_name)
-                    })
-                    .filter_map(|key_struct| {
-                        scoped_entities
-                            .and_then(|entities| entities.get(&key_struct))
-                            .or_else(|| self.entities.get(&key_struct))
-                            .map(|entity_metadata| QueryCandidate {
-                                entity_metadata: Arc::clone(entity_metadata),
-                            })
-                    })
-                    .collect(),
+                Box::new(self.candidates_from_index_keys(
+                    project_id_filter,
+                    kind_name,
+                    namespace,
+                    candidate_keys,
+                )),
                 candidates_prefiltered,
             );
         }
 
         let prepared_key_filter = filter_type.and_then(try_prepare_key_filter);
 
-        let scope_key = (project_id_filter.to_string(), kind_name.to_string());
-        let candidates = if let Some(scoped_entities) = self.scoped_entities.get(&scope_key) {
-            scoped_entities
-                .iter()
-                .filter(|(key_struct, _)| key_struct.namespace == namespace)
-                .filter(|(_, entity_metadata)| {
-                    if let Some(ref pkf) = prepared_key_filter {
-                        entity_metadata
-                            .entity
-                            .key
-                            .as_ref()
-                            .is_some_and(|key| match_prepared_key_filter(key, pkf))
-                    } else {
-                        filter_type.is_none_or(|filter_type| {
-                            DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
-                        })
-                    }
+        let matches = move |entity_metadata: &Arc<EntityWithMetadata>| {
+            if let Some(ref pkf) = prepared_key_filter {
+                entity_metadata
+                    .entity
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| match_prepared_key_filter(key, pkf))
+            } else {
+                filter_type.is_none_or(|filter_type| {
+                    DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
                 })
-                .map(|(_, entity_metadata)| QueryCandidate {
-                    entity_metadata: Arc::clone(entity_metadata),
-                })
-                .collect()
-        } else if !self.scoped_entities.is_empty() {
-            Vec::new()
-        } else {
-            self.entities
-                .iter()
-                .filter(|(key_struct, _)| {
-                    key_struct.project_id == project_id_filter
-                        && key_struct.namespace == namespace
-                        && key_struct
-                            .path_elements
-                            .last()
-                            .is_some_and(|(k, _)| k == kind_name)
-                })
-                .filter(|(_, entity_metadata)| {
-                    if let Some(ref pkf) = prepared_key_filter {
-                        entity_metadata
-                            .entity
-                            .key
-                            .as_ref()
-                            .is_some_and(|key| match_prepared_key_filter(key, pkf))
-                    } else {
-                        filter_type.is_none_or(|filter_type| {
-                            DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
-                        })
-                    }
-                })
-                .map(|(_, entity_metadata)| QueryCandidate {
-                    entity_metadata: Arc::clone(entity_metadata),
-                })
-                .collect()
+            }
         };
+        let to_candidate = |entity_metadata: &Arc<EntityWithMetadata>| QueryCandidate {
+            entity_metadata: Arc::clone(entity_metadata),
+        };
+
+        let scope_key = (project_id_filter.to_string(), kind_name.to_string());
+        let candidates: Box<dyn Iterator<Item = QueryCandidate> + 'a> =
+            if let Some(scoped_entities) = self.scoped_entities.get(&scope_key) {
+                Box::new(
+                    scoped_entities
+                        .iter()
+                        .filter(move |(key_struct, _)| key_struct.namespace == namespace)
+                        .filter(move |(_, entity_metadata)| matches(entity_metadata))
+                        .map(move |(_, entity_metadata)| to_candidate(entity_metadata)),
+                )
+            } else if !self.scoped_entities.is_empty() {
+                Box::new(std::iter::empty())
+            } else {
+                Box::new(
+                    self.entities
+                        .iter()
+                        .filter(move |(key_struct, _)| {
+                            key_struct.project_id == project_id_filter
+                                && key_struct.namespace == namespace
+                                && key_struct
+                                    .path_elements
+                                    .last()
+                                    .is_some_and(|(k, _)| k == kind_name)
+                        })
+                        .filter(move |(_, entity_metadata)| matches(entity_metadata))
+                        .map(move |(_, entity_metadata)| to_candidate(entity_metadata)),
+                )
+            };
 
         (candidates, filter_type.is_some())
     }
 
     pub(crate) fn get_entities_from_candidates(
-        candidates: Vec<QueryCandidate>,
-        filter_type: Option<FilterType>,
+        candidates: impl Iterator<Item = QueryCandidate>,
+        filter_type: Option<&FilterType>,
         candidates_prefiltered: bool,
         limit: Option<i32>,
         offset: i32,
@@ -2604,7 +2586,7 @@ impl DatastoreStorage {
     ) -> Result<crate::google::datastore::v1::QueryResultBatch, tonic::Status> {
         let start_position = decode_cursor(&start_cursor)?;
         let end_position = decode_cursor(&end_cursor)?;
-        let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
+        let prepared_key_filter = filter_type.and_then(try_prepare_key_filter);
 
         let limit = limit.filter(|value| *value >= 0);
 
@@ -2615,35 +2597,64 @@ impl DatastoreStorage {
         let projected_names = projected_property_names(&projection, is_keys_only);
         let order = projection_order(order, &projected_names);
 
-        let mut filtered_entities: Vec<QueryCandidate> = candidates
-            .into_iter()
-            .filter(|candidate| {
-                candidate_matches_filter(
-                    candidate,
-                    filter_type.as_ref(),
-                    prepared_key_filter.as_ref(),
-                    candidates_prefiltered,
-                )
-            })
-            .collect();
-        if !projected_names.is_empty() {
-            filtered_entities = filtered_entities
-                .into_iter()
-                .flat_map(|candidate| expand_projection_rows(candidate, &projected_names))
-                .collect();
-        }
-        filtered_entities.retain(|candidate| has_indexed_order_values(candidate, &order));
+        let matching = candidates.filter(|candidate| {
+            candidate_matches_filter(
+                candidate,
+                filter_type,
+                prepared_key_filter.as_ref(),
+                candidates_prefiltered,
+            )
+        });
 
         let mut cut_by_end_cursor = false;
-        if distinct_on.is_empty() {
-            // Drop the candidates outside the cursors before the sort, so the
-            // bounded sort below also works for later pages.
-            cut_by_end_cursor = retain_between_cursors(
-                &mut filtered_entities,
-                start_position.as_ref(),
-                end_position.as_ref(),
-                &order,
-            );
+        let mut filtered_entities: Vec<QueryCandidate>;
+        if distinct_on.is_empty() && key_only_order(&order) == Some(false) {
+            // Candidates already arrive in the result order, so the cursors
+            // cut a prefix and a suffix, and the scan stops after
+            // offset + limit (plus one, to learn whether more results exist).
+            debug_assert!(projected_names.is_empty());
+            let after_start = matching.skip_while(|candidate| {
+                start_position
+                    .as_ref()
+                    .is_some_and(|start| compare_query_position(candidate, start, &order).is_le())
+            });
+            let before_end = after_start.take_while(|candidate| {
+                let past_end = end_position
+                    .as_ref()
+                    .is_some_and(|end| compare_query_position(candidate, end, &order).is_gt());
+                cut_by_end_cursor |= past_end;
+                !past_end
+            });
+            filtered_entities = match limit {
+                Some(limit_value) => before_end
+                    .take(
+                        (offset.max(0) as usize)
+                            .saturating_add(limit_value as usize)
+                            .saturating_add(1),
+                    )
+                    .collect(),
+                None => before_end.collect(),
+            };
+        } else {
+            filtered_entities = matching.collect();
+            if !projected_names.is_empty() {
+                filtered_entities = filtered_entities
+                    .into_iter()
+                    .flat_map(|candidate| expand_projection_rows(candidate, &projected_names))
+                    .collect();
+            }
+            filtered_entities.retain(|candidate| has_indexed_order_values(candidate, &order));
+
+            if distinct_on.is_empty() {
+                // Drop the candidates outside the cursors before the sort, so
+                // the bounded sort below also works for later pages.
+                cut_by_end_cursor = retain_between_cursors(
+                    &mut filtered_entities,
+                    start_position.as_ref(),
+                    end_position.as_ref(),
+                    &order,
+                );
+            }
         }
 
         // 2. Sort entities. Candidates arrive in ascending key order, so a
@@ -2821,29 +2832,38 @@ impl DatastoreStorage {
     /// Unlike `get_entities_from_candidates` this neither clones entities nor
     /// applies cursors or projections.
     pub(crate) fn aggregation_candidates(
-        candidates: Vec<QueryCandidate>,
-        filter_type: Option<FilterType>,
+        candidates: impl Iterator<Item = QueryCandidate>,
+        filter_type: Option<&FilterType>,
         candidates_prefiltered: bool,
         limit: Option<i32>,
         offset: i32,
         distinct_on: Vec<PropertyReference>,
         order: Vec<PropertyOrder>,
     ) -> Vec<QueryCandidate> {
-        let prepared_key_filter = filter_type.as_ref().and_then(try_prepare_key_filter);
-        let mut matching: Vec<QueryCandidate> = candidates
-            .into_iter()
+        let prepared_key_filter = filter_type.and_then(try_prepare_key_filter);
+        let limit = limit.filter(|value| *value >= 0);
+        let matching = candidates
             .filter(|candidate| {
                 candidate_matches_filter(
                     candidate,
-                    filter_type.as_ref(),
+                    filter_type,
                     prepared_key_filter.as_ref(),
                     candidates_prefiltered,
                 )
             })
-            .filter(|candidate| has_indexed_order_values(candidate, &order))
-            .collect();
+            .filter(|candidate| has_indexed_order_values(candidate, &order));
+        // Candidates in result order with a limit: stop the scan early.
+        let mut matching: Vec<QueryCandidate> = match limit {
+            Some(limit_value)
+                if distinct_on.is_empty() && key_only_order(&order) == Some(false) =>
+            {
+                matching
+                    .take((offset.max(0) as usize).saturating_add(limit_value as usize))
+                    .collect()
+            }
+            _ => matching.collect(),
+        };
 
-        let limit = limit.filter(|value| *value >= 0);
         match key_only_order(&order) {
             Some(false) => {}
             Some(true) => matching.reverse(),
@@ -2884,7 +2904,7 @@ impl DatastoreStorage {
         );
         Self::get_entities_from_candidates(
             candidates,
-            filter_type,
+            filter_type.as_ref(),
             candidates_prefiltered,
             limit,
             offset,
@@ -3095,6 +3115,81 @@ impl DatastoreStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_only_candidate(id: i64) -> QueryCandidate {
+        QueryCandidate {
+            entity_metadata: Arc::new(EntityWithMetadata {
+                entity: Entity {
+                    key: Some(Key {
+                        partition_id: Some(PartitionId {
+                            project_id: "p".to_string(),
+                            ..Default::default()
+                        }),
+                        path: vec![PathElement {
+                            kind: "Kind".to_string(),
+                            id_type: Some(IdType::Id(id)),
+                        }],
+                    }),
+                    properties: HashMap::new(),
+                },
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn limit_without_order_stops_pulling_candidates_after_offset_plus_limit() {
+        let pulled = std::cell::Cell::new(0usize);
+        let candidates = (1..=1_000i64).map(|id| {
+            pulled.set(pulled.get() + 1);
+            key_only_candidate(id)
+        });
+
+        let batch = DatastoreStorage::get_entities_from_candidates(
+            candidates,
+            None,
+            false,
+            Some(10),
+            5,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(batch.skipped_results, 5);
+        assert_eq!(batch.entity_results.len(), 10);
+        assert_eq!(
+            batch.more_results,
+            MoreResultsType::MoreResultsAfterLimit as i32
+        );
+        // offset + limit, plus one to learn that more results exist.
+        assert_eq!(pulled.get(), 16);
+    }
+
+    #[test]
+    fn limit_without_order_reports_no_more_results_when_exhausted() {
+        let candidates = (1..=15i64).map(key_only_candidate);
+
+        let batch = DatastoreStorage::get_entities_from_candidates(
+            candidates,
+            None,
+            false,
+            Some(10),
+            5,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(batch.entity_results.len(), 10);
+        assert_eq!(batch.more_results, MoreResultsType::NoMoreResults as i32);
+    }
     use crate::google::datastore::import_export::datastore_v3::{
         Path as LegacyPath, Property, PropertyValue, path, property_value,
         property_value::reference_value,
