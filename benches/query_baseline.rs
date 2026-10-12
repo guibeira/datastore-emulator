@@ -30,6 +30,10 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
+// Same allocator as the binary (src/main.rs), so the numbers match it.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const PROJECT: &str = "bench-project";
 const KIND: &str = "BenchItem";
 const SIGNUP_KIND: &str = "SignUpModel";
