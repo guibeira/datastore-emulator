@@ -63,6 +63,8 @@ USE_REAL_DB=1 DATASTORE_DATABASE_NAME=<your-database-name> DATASTORE_PROJECT_ID=
 
 The `tests/test_parity_*.py` files run one scenario at a time against the Rust emulator and a reference, then assert both produce the same outcome (results, or the same gRPC error code). The reference is the official emulator by default, or the real database when `USE_REAL_DB` is set. Shared fixtures and helpers live in `tests/parity_common.py`.
 
+`tests/test_parity_http_client.py` runs `tests/http_client_probe.py` as a subprocess with `GOOGLE_CLOUD_DISABLE_GRPC=true`, so the client talks HTTP with protobuf bodies instead of gRPC, and compares what both servers answer.
+
 A scenario is skipped, with the reason, when the reference cannot run it: the official emulator has no aggregation support and rejects `!=`, `NOT_IN`, multi-value `IN` and composite `OR`; a real database rejects queries that need a composite index missing from `tests/index.yaml`.
 
 ```bash

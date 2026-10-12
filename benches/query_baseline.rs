@@ -22,13 +22,13 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use pbjson_types::Int32Value;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::RwLock;
 
 // Same allocator as the binary (src/main.rs), so the numbers match it.
 #[global_allocator]
@@ -153,7 +153,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let index_template = bench_entity_template();
-    let index_key = KeyStruct::from_datastore_key(index_template.key.as_ref().unwrap());
+    let index_key = Arc::new(KeyStruct::from_datastore_key(
+        index_template.key.as_ref().unwrap(),
+    ));
     group.bench_function("index_entity_with_nested", |b| {
         b.iter_batched(
             || DatastoreStorage::default(),

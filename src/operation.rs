@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Serialize, Clone)]
 pub enum OperationStatus {

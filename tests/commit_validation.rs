@@ -12,9 +12,9 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::Code;
 
 const PROJECT: &str = "p1";
@@ -116,7 +116,6 @@ async fn commit_tx(storage: &Storage, mutations: Vec<Mutation>) -> Result<(), to
 async fn stored_value(storage: &Storage, k: &Key, prop: &str) -> Option<Value> {
     storage
         .read()
-        .await
         .get_entity(k)
         .and_then(|e| e.entity.properties.get(prop).cloned())
 }
@@ -143,7 +142,7 @@ async fn transactional_commit_applies_nothing_when_insert_hits_existing_key() {
     .expect_err("insert of an existing key must fail");
     assert_eq!(err.code(), Code::AlreadyExists);
     assert!(
-        storage.read().await.get_entity(&a).is_none(),
+        storage.read().get_entity(&a).is_none(),
         "earlier upsert must not be applied"
     );
 }
@@ -163,7 +162,7 @@ async fn transactional_commit_applies_nothing_when_update_misses() {
     .expect_err("update of a missing key must fail");
     assert_eq!(err.code(), Code::NotFound);
     assert!(
-        storage.read().await.get_entity(&a).is_none(),
+        storage.read().get_entity(&a).is_none(),
         "earlier upsert must not be applied"
     );
 }
@@ -269,7 +268,7 @@ async fn non_transactional_duplicate_key_is_rejected_before_apply() {
         &err,
         "A non-transactional commit may not contain multiple mutations affecting the same entity.",
     );
-    assert!(storage.read().await.get_entity(&k).is_none());
+    assert!(storage.read().get_entity(&k).is_none());
 
     let storage = new_storage();
     let req = commit_req(
@@ -285,7 +284,7 @@ async fn non_transactional_duplicate_key_is_rejected_before_apply() {
         &err,
         "A non-transactional commit may not contain multiple mutations affecting the same entity.",
     );
-    assert!(storage.read().await.get_entity(&k).is_none());
+    assert!(storage.read().get_entity(&k).is_none());
 }
 
 #[tokio::test]
@@ -303,7 +302,7 @@ async fn transactional_duplicate_key_is_allowed() {
     );
     core::commit(&storage, req).await.expect("commit");
 
-    let stored = storage.read().await.get_entity(&k).expect("stored");
+    let stored = storage.read().get_entity(&k).expect("stored");
     assert_eq!(
         stored.entity.properties["v"],
         int_val(2),

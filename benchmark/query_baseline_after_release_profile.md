@@ -8,19 +8,21 @@ Two changes, measured one after the other on the same machine (Apple Silicon,
 2. `mimalloc` as the global allocator (`src/main.rs` and the bench, so both
    use the same allocator).
 
-Commands:
+Commands. The first two run on `11ece7d`, the last commit before the
+profile and mimalloc landed; the bench binary at that revision uses the
+system allocator. The third runs on `1519441`.
 
 ```sh
-# Baseline (default profile, system allocator)
+# Baseline (default profile, system allocator), at 11ece7d
 DATASTORE_QUERY_BENCH_SAMPLES=20 DATASTORE_QUERY_BENCH_MEASUREMENT_SECONDS=3 \
 cargo bench --bench query_baseline
 
-# Step 1, before the profile landed in Cargo.toml
+# Step 1, LTO only, at 11ece7d
 CARGO_PROFILE_BENCH_LTO=fat CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
 DATASTORE_QUERY_BENCH_SAMPLES=20 DATASTORE_QUERY_BENCH_MEASUREMENT_SECONDS=3 \
 cargo bench --bench query_baseline
 
-# Step 2, profile in Cargo.toml plus mimalloc
+# Step 2, profile in Cargo.toml plus mimalloc, at 1519441
 DATASTORE_QUERY_BENCH_SAMPLES=20 DATASTORE_QUERY_BENCH_MEASUREMENT_SECONDS=3 \
 cargo bench --bench query_baseline
 ```

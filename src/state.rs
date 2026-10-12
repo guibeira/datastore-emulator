@@ -1,7 +1,7 @@
 use crate::database::DatastoreStorage;
 use crate::operation::Operations;
+use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {

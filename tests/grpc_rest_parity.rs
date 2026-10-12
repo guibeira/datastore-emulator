@@ -9,9 +9,9 @@ use datastore_emulator::{
         key::{PathElement, path_element::IdType},
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 fn key(project: &str, kind: &str, name: &str) -> Key {
@@ -30,16 +30,10 @@ fn key(project: &str, kind: &str, name: &str) -> Key {
 
 #[tokio::test]
 async fn grpc_and_rest_lookup_return_same_data() {
-    use datastore_emulator::database::{EntityWithMetadata, KeyId, KeyStruct};
+    use datastore_emulator::database::EntityWithMetadata;
 
     let mut storage = DatastoreStorage::default();
-    let key_struct = KeyStruct {
-        project_id: "p1".to_string(),
-        namespace: String::new(),
-        path_elements: vec![("Task".to_string(), KeyId::StringId("abc".to_string()))],
-    };
-    storage.entities.insert(
-        key_struct,
+    storage.put_entity(
         EntityWithMetadata {
             entity: Entity {
                 key: Some(key("p1", "Task", "abc")),

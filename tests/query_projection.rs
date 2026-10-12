@@ -14,9 +14,9 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 const PROJECT: &str = "p1";
 const KIND: &str = "Thing";

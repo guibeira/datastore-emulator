@@ -8,10 +8,11 @@ use datastore_emulator::{
     google::datastore::v1::datastore_server::DatastoreServer,
 };
 use hyper::server::conn::AddrIncoming;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::{signal, sync::RwLock};
+use tokio::signal;
 use tonic::server::NamedService;
 use tracing_subscriber::EnvFilter;
 
@@ -99,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if store_on_disk {
                 tracing::info!("
     Shutdown signal received. Saving data to disk...");
-                let storage = storage_for_shutdown.read().await;
+                let storage = storage_for_shutdown.read();
                 if let Err(e) = storage.save_to_disk("datastore.bin") {
                     tracing::error!("Failed to save data to disk: {}", e);
                 }
