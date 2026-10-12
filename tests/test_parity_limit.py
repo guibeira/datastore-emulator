@@ -12,6 +12,7 @@ from google.cloud import datastore
 from google.cloud.datastore_v1 import types
 from google.protobuf import wrappers_pb2
 from parity_common import (  # noqa: F401
+    USE_REAL_DB,
     outcome,
     cleanup_kind,
     unique_kind,
@@ -21,6 +22,12 @@ from parity_common import (  # noqa: F401
     google_client,
 )
 
+# The official emulator reports MORE_RESULTS_AFTER_LIMIT even when a query is
+# exhausted; production reports NO_MORE_RESULTS, which the Rust emulator follows.
+more_results_quirk = pytest.mark.skipif(
+    not USE_REAL_DB,
+    reason="the official emulator always reports MORE_RESULTS_AFTER_LIMIT",
+)
 
 
 def _insert(client, kind, count=5):
@@ -93,6 +100,7 @@ def test_highlevel_fetch_limit_zero(rust_client, google_client):
 
 
 # 2
+@more_results_quirk
 def test_raw_limit_equals_count_then_cursor(rust_client, google_client):
     def scenario(c, k):
         b1 = _run(c, k, limit=5)
@@ -103,6 +111,7 @@ def test_raw_limit_equals_count_then_cursor(rust_client, google_client):
 
 
 # 3
+@more_results_quirk
 def test_raw_limit_above_count(rust_client, google_client):
     _compare(rust_client, google_client, lambda c, k: _summary(_run(c, k, limit=10)))
 
@@ -113,16 +122,19 @@ def test_raw_limit_below_count(rust_client, google_client):
 
 
 # 5
+@more_results_quirk
 def test_raw_offset_equals_count(rust_client, google_client):
     _compare(rust_client, google_client, lambda c, k: _summary(_run(c, k, offset=5)))
 
 
 # 6
+@more_results_quirk
 def test_raw_offset_above_count(rust_client, google_client):
     _compare(rust_client, google_client, lambda c, k: _summary(_run(c, k, offset=7)))
 
 
 # 7
+@more_results_quirk
 def test_raw_offset_and_limit_exhaust(rust_client, google_client):
     _compare(
         rust_client, google_client,
@@ -131,6 +143,7 @@ def test_raw_offset_and_limit_exhaust(rust_client, google_client):
 
 
 # 8
+@more_results_quirk
 @pytest.mark.parametrize("filt,order", [(True, False), (False, True), (True, True)])
 def test_raw_limit_equals_count_filter_order(rust_client, google_client, filt, order):
     def scenario(c, k):
@@ -142,6 +155,7 @@ def test_raw_limit_equals_count_filter_order(rust_client, google_client, filt, o
 
 
 # 9
+@more_results_quirk
 def test_highlevel_next_page_token_limit_equals_count(rust_client, google_client):
     def scenario(c, k):
         it = c.query(kind=k).fetch(limit=5)
@@ -167,6 +181,7 @@ def test_highlevel_pages_count(rust_client, google_client):
 
 
 # 11
+@more_results_quirk
 def test_raw_start_cursor_at_end(rust_client, google_client):
     def scenario(c, k):
         b1 = _run(c, k)

@@ -1387,6 +1387,114 @@ fn has_indexed_order_values(candidate: &QueryCandidate, order: &[PropertyOrder])
     })
 }
 
+/// Projected property names, without duplicates and without `__key__`.
+/// Keys-only projections return one row per entity and are not expanded.
+fn projected_property_names(projection: &[Projection], is_keys_only: bool) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    if is_keys_only {
+        return names;
+    }
+    for name in projection
+        .iter()
+        .filter_map(|p| p.property.as_ref().map(|pr| pr.name.as_str()))
+    {
+        if name != "__key__" && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Projection queries also sort by the projected properties, ascending, so
+/// each expanded row has a distinct position. The names go in alphabetical
+/// order, like the composite index Datastore recommends for the query.
+fn projection_order(mut order: Vec<PropertyOrder>, projected_names: &[&str]) -> Vec<PropertyOrder> {
+    let mut names = projected_names.to_vec();
+    names.sort_unstable();
+    for name in names {
+        let present = order
+            .iter()
+            .any(|order_by| order_by.property.as_ref().is_some_and(|p| p.name == name));
+        if !present {
+            order.push(PropertyOrder {
+                property: Some(PropertyReference {
+                    name: name.to_string(),
+                }),
+                direction: property_order::Direction::Ascending as i32,
+            });
+        }
+    }
+    order
+}
+
+/// Indexed values of a projected property. Arrays yield their indexed
+/// elements and dotted names resolve into embedded entities.
+fn projected_index_values<'a>(
+    properties: &'a HashMap<String, Value>,
+    name: &str,
+) -> Vec<&'a Value> {
+    let values = match properties.get(name) {
+        Some(value) if value.exclude_from_indexes => return Vec::new(),
+        Some(Value {
+            value_type: Some(ValueType::ArrayValue(array)),
+            ..
+        }) => array.values.iter().collect(),
+        Some(value) => vec![value],
+        None if name.contains('.') => resolve_nested_property(properties, name),
+        None => return Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter(|value| !value.exclude_from_indexes)
+        .collect()
+}
+
+/// Expands a candidate into one row per combination of the indexed values of
+/// the projected properties, like an index scan. A row holds one value per
+/// projected property. An entity without an indexed value for some projected
+/// property yields no rows.
+fn expand_projection_rows(candidate: QueryCandidate, names: &[&str]) -> Vec<QueryCandidate> {
+    let source = candidate.entity_metadata.as_ref();
+    let mut rows: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+    for &name in names {
+        let values: Vec<Value> = projected_index_values(&source.entity.properties, name)
+            .into_iter()
+            .map(|value| {
+                let mut value = value.clone();
+                value.exclude_from_indexes = false;
+                value
+            })
+            .collect();
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let mut next = Vec::with_capacity(rows.len() * values.len());
+        for row in &rows {
+            for value in &values {
+                let mut row = row.clone();
+                row.insert(name.to_string(), value.clone());
+                next.push(row);
+            }
+        }
+        rows = next;
+    }
+
+    rows.into_iter()
+        .map(|properties| QueryCandidate {
+            key_struct: candidate.key_struct.clone(),
+            entity_metadata: Arc::new(EntityWithMetadata {
+                entity: Entity {
+                    key: source.entity.key.clone(),
+                    properties,
+                },
+                version: source.version,
+                create_time: source.create_time.clone(),
+                update_time: source.update_time.clone(),
+            }),
+        })
+        .collect()
+}
+
 /// Keeps the first candidate of each distinct-on signature, preserving order.
 fn dedup_distinct_candidates(
     candidates: Vec<QueryCandidate>,
@@ -2507,6 +2615,13 @@ impl DatastoreStorage {
 
         let limit = limit.filter(|value| *value >= 0);
 
+        let is_keys_only = !projection.is_empty()
+            && projection
+                .iter()
+                .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
+        let projected_names = projected_property_names(&projection, is_keys_only);
+        let order = projection_order(order, &projected_names);
+
         let mut filtered_entities: Vec<QueryCandidate> = candidates
             .into_iter()
             .filter(|candidate| {
@@ -2517,8 +2632,14 @@ impl DatastoreStorage {
                     candidates_prefiltered,
                 )
             })
-            .filter(|candidate| has_indexed_order_values(candidate, &order))
             .collect();
+        if !projected_names.is_empty() {
+            filtered_entities = filtered_entities
+                .into_iter()
+                .flat_map(|candidate| expand_projection_rows(candidate, &projected_names))
+                .collect();
+        }
+        filtered_entities.retain(|candidate| has_indexed_order_values(candidate, &order));
 
         let mut cut_by_end_cursor = false;
         if distinct_on.is_empty() {
@@ -2585,10 +2706,6 @@ impl DatastoreStorage {
         let mut current_entities_payload_size: usize = 0;
         let mut new_more_results_state = MoreResultsType::NoMoreResults;
 
-        let is_keys_only = !projection.is_empty()
-            && projection
-                .iter()
-                .all(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
         let entity_result_type = if is_keys_only {
             3 // KEY_ONLY
         } else if !projection.is_empty() {
