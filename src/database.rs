@@ -523,30 +523,15 @@ fn values_match_filter<'a>(
                 false
             }
         }
-        9 => {
-            let mut saw_value = false;
-            for value in entity_values {
-                saw_value = true;
-                if value.value_type == filter_value.value_type {
-                    return false;
-                }
-            }
-            saw_value
-        }
+        9 => entity_values.any(|v| v.value_type != filter_value.value_type),
         13 => {
             if let Some(ValueType::ArrayValue(array_value)) = &filter_value.value_type {
-                let mut saw_value = false;
-                for value in entity_values {
-                    saw_value = true;
-                    if array_value
+                entity_values.any(|v| {
+                    !array_value
                         .values
                         .iter()
-                        .any(|candidate| candidate.value_type == value.value_type)
-                    {
-                        return false;
-                    }
-                }
-                saw_value
+                        .any(|candidate| candidate.value_type == v.value_type)
+                })
             } else {
                 entity_values.next().is_some()
             }

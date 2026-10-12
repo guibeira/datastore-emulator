@@ -1073,3 +1073,184 @@ async fn order_by_two_properties_requires_both() {
         "entity missing the second order property must be excluded"
     );
 }
+
+/// Array properties match `!=` and `NOT_IN` when ANY element satisfies the predicate.
+#[tokio::test]
+async fn not_equal_on_array_matches_when_any_element_differs() {
+    let mut storage = DatastoreStorage::default();
+    let tags = |items: &[&str]| {
+        val_array(
+            items
+                .iter()
+                .map(|s| val(ValueType::StringValue(s.to_string())))
+                .collect(),
+        )
+    };
+    insert(
+        &mut storage,
+        "ab",
+        HashMap::from([("tags".to_string(), tags(&["a", "b"]))]),
+    );
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("tags".to_string(), tags(&["a"]))]),
+    );
+    insert(
+        &mut storage,
+        "c",
+        HashMap::from([("tags".to_string(), tags(&["c"]))]),
+    );
+    insert(
+        &mut storage,
+        "empty",
+        HashMap::from([("tags".to_string(), tags(&[]))]),
+    );
+    insert(&mut storage, "missing", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let query = Query {
+        filter: Some(prop_filter(
+            "tags",
+            property_filter::Operator::NotEqual,
+            val(ValueType::StringValue("a".to_string())),
+        )),
+        ..kind_query(vec![order_by_asc("__key__")])
+    };
+    let names = run(storage, query).await;
+    assert_eq!(names, vec!["ab", "c"]);
+}
+
+#[tokio::test]
+async fn not_in_on_array_matches_when_any_element_is_outside_the_list() {
+    let mut storage = DatastoreStorage::default();
+    let tags = |items: &[&str]| {
+        val_array(
+            items
+                .iter()
+                .map(|s| val(ValueType::StringValue(s.to_string())))
+                .collect(),
+        )
+    };
+    insert(
+        &mut storage,
+        "ab",
+        HashMap::from([("tags".to_string(), tags(&["a", "b"]))]),
+    );
+    insert(
+        &mut storage,
+        "a",
+        HashMap::from([("tags".to_string(), tags(&["a"]))]),
+    );
+    insert(
+        &mut storage,
+        "c",
+        HashMap::from([("tags".to_string(), tags(&["c"]))]),
+    );
+    insert(
+        &mut storage,
+        "empty",
+        HashMap::from([("tags".to_string(), tags(&[]))]),
+    );
+    insert(&mut storage, "missing", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let list = |items: &[&str]| {
+        val_array(
+            items
+                .iter()
+                .map(|s| val(ValueType::StringValue(s.to_string())))
+                .collect(),
+        )
+    };
+    let run_with = |op: property_filter::Operator, value: Value| {
+        let storage = storage.clone();
+        async move {
+            let query = Query {
+                filter: Some(prop_filter("tags", op, value)),
+                ..kind_query(vec![order_by_asc("__key__")])
+            };
+            run(storage, query).await
+        }
+    };
+
+    assert_eq!(
+        run_with(property_filter::Operator::NotIn, list(&["a"])).await,
+        vec!["ab", "c"],
+        "NOT_IN [a]"
+    );
+    assert_eq!(
+        run_with(property_filter::Operator::NotIn, list(&["a", "b"])).await,
+        vec!["c"],
+        "NOT_IN [a, b]"
+    );
+    assert_eq!(
+        run_with(property_filter::Operator::In, list(&["b", "z"])).await,
+        vec!["ab"],
+        "IN [b, z]"
+    );
+}
+
+#[tokio::test]
+async fn not_equal_and_not_in_on_scalars_keep_null_and_drop_missing() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "i1",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(
+        &mut storage,
+        "i2",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "none",
+        HashMap::from([("score".to_string(), val(ValueType::NullValue(0)))]),
+    );
+    insert(&mut storage, "missing", HashMap::new());
+    let storage = Arc::new(RwLock::new(storage));
+
+    let run_with = |op: property_filter::Operator, value: Value| {
+        let storage = storage.clone();
+        async move {
+            let query = Query {
+                filter: Some(prop_filter("score", op, value)),
+                ..kind_query(vec![order_by_asc("__key__")])
+            };
+            run(storage, query).await
+        }
+    };
+
+    assert_eq!(
+        run_with(
+            property_filter::Operator::NotEqual,
+            val(ValueType::IntegerValue(1))
+        )
+        .await,
+        vec!["i2", "none"],
+        "score != 1"
+    );
+    assert_eq!(
+        run_with(
+            property_filter::Operator::NotEqual,
+            val(ValueType::NullValue(0))
+        )
+        .await,
+        vec!["i1", "i2"],
+        "score != None"
+    );
+    assert_eq!(
+        run_with(
+            property_filter::Operator::NotIn,
+            val_array(vec![
+                val(ValueType::IntegerValue(1)),
+                val(ValueType::IntegerValue(2)),
+            ]),
+        )
+        .await,
+        vec!["none"],
+        "score NOT_IN [1, 2]"
+    );
+}
