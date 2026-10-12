@@ -523,32 +523,18 @@ pub async fn commit(
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for update"));
                     };
-                    let key_struct = KeyStruct::from_datastore_key(key);
-
-                    let Some(existing_entity_metadata) = storage.entities.get(&key_struct).cloned()
-                    else {
+                    let Some(existing_entity_metadata) = storage.get_entity(key) else {
                         return Err(Status::not_found("Entity not found for update"));
                     };
 
                     let create_time = existing_entity_metadata.create_time.clone();
                     let version = existing_entity_metadata.version + 1;
-                    let updated_metadata = Arc::new(EntityWithMetadata {
+                    storage.put_entity(Arc::new(EntityWithMetadata {
                         entity,
                         version,
                         create_time,
                         update_time: commit_time.clone(),
-                    });
-
-                    storage
-                        .entities
-                        .insert(key_struct.clone(), Arc::clone(&updated_metadata));
-                    storage.upsert_scoped_entity(&key_struct, Arc::clone(&updated_metadata));
-
-                    storage.replace_indexes(
-                        &key_struct,
-                        &existing_entity_metadata.entity,
-                        &updated_metadata.entity,
-                    );
+                    }));
 
                     mutation_results.push(commit_mutation_result(None, version as i64));
                 }
@@ -567,44 +553,20 @@ pub async fn commit(
                             metadata.version as i64,
                         ));
                     } else {
-                        let key_struct = KeyStruct::from_datastore_key(key);
-
-                        let previous_metadata = storage.entities.get(&key_struct).cloned();
-                        let observe_key_counters = previous_metadata.is_none();
-
+                        let previous_metadata = storage.get_entity(key);
                         let version = previous_metadata
                             .as_ref()
                             .map_or(1, |previous| previous.version + 1);
-                        let create_time = previous_metadata.as_ref().map_or_else(
+                        let create_time = previous_metadata.map_or_else(
                             || commit_time.clone(),
                             |previous| previous.create_time.clone(),
                         );
-                        if observe_key_counters {
-                            storage.observe_key_id(key);
-                            storage.add_ancestor_indexes(&key_struct);
-                        }
-
-                        let metadata = Arc::new(EntityWithMetadata {
+                        storage.put_entity(Arc::new(EntityWithMetadata {
                             entity,
                             version,
                             create_time,
                             update_time: commit_time.clone(),
-                        });
-
-                        storage
-                            .entities
-                            .insert(key_struct.clone(), Arc::clone(&metadata));
-                        storage.upsert_scoped_entity(&key_struct, Arc::clone(&metadata));
-
-                        if let Some(previous_metadata) = previous_metadata {
-                            storage.replace_indexes(
-                                &key_struct,
-                                &previous_metadata.entity,
-                                &metadata.entity,
-                            );
-                        } else {
-                            storage.update_indexes(&key_struct, &metadata.entity);
-                        }
+                        }));
 
                         mutation_results.push(commit_mutation_result(None, version as i64));
                     }

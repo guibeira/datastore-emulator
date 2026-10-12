@@ -208,101 +208,130 @@ fn resolve_property_path_recursive<'a>(
 /// Property-index key for a scalar value. The type tag keeps values of
 /// different types apart (int `1`, double `1.0` and string `"1"` must not
 /// collide). Arrays and nulls are not indexed.
-fn indexable_string(value_type: &ValueType) -> Option<String> {
-    Some(match value_type {
-        ValueType::StringValue(s) => format!("s:{s}"),
-        ValueType::IntegerValue(i) => format!("i:{i}"),
-        ValueType::DoubleValue(d) => format!("d:{d}"),
-        ValueType::BooleanValue(b) => format!("b:{b}"),
-        ValueType::TimestampValue(t) => {
-            let dt = DateTime::from_timestamp(t.seconds, t.nanos as u32)?;
-            format!("t:{}", dt.to_rfc3339())
+/// Property index keys are `kind SEP path SEP tagged value` bytes. The
+/// separator is never part of UTF-8 text, so the parts cannot collide.
+const INDEX_KEY_SEPARATOR: u8 = 0xFF;
+
+pub type IndexKey = Vec<u8>;
+pub type PropertyIndex = HashMap<IndexKey, BTreeSet<Arc<KeyStruct>>>;
+
+fn push_index_key_prefix(buf: &mut Vec<u8>, kind: &str, path: &str) {
+    buf.extend_from_slice(kind.as_bytes());
+    buf.push(INDEX_KEY_SEPARATOR);
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(INDEX_KEY_SEPARATOR);
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, text: &str) {
+    write!(buf, "{}:", text.len()).expect("write to a Vec");
+    buf.extend_from_slice(text.as_bytes());
+}
+
+/// Appends the tagged index form of `value_type`. Returns false, with `buf`
+/// untouched, for the types that are not indexed.
+fn push_indexable_value(buf: &mut Vec<u8>, value_type: &ValueType) -> bool {
+    match value_type {
+        ValueType::StringValue(s) => {
+            buf.extend_from_slice(b"s:");
+            buf.extend_from_slice(s.as_bytes());
         }
-        ValueType::KeyValue(k) => format!("k:{:?}", KeyStruct::from_datastore_key(k)),
-        _ => return None,
-    })
-}
-
-fn get_indexable_strings_for_value(value: &Value) -> Vec<String> {
-    let mut values = Vec::new();
-    for_each_indexable_string_for_value(value, |s| values.push(s));
-    values
-}
-
-fn for_each_indexable_string_for_value(value: &Value, mut visitor: impl FnMut(String)) {
-    match &value.value_type {
-        Some(ValueType::ArrayValue(array_value)) => {
-            for item in &array_value.values {
-                if let Some(s) = item.value_type.as_ref().and_then(indexable_string) {
-                    visitor(s);
+        ValueType::IntegerValue(i) => write!(buf, "i:{i}").expect("write to a Vec"),
+        ValueType::DoubleValue(d) => write!(buf, "d:{d}").expect("write to a Vec"),
+        ValueType::BooleanValue(b) => write!(buf, "b:{b}").expect("write to a Vec"),
+        ValueType::TimestampValue(t) => {
+            if DateTime::from_timestamp(t.seconds, t.nanos as u32).is_none() {
+                return false;
+            }
+            write!(buf, "t:{}:{}", t.seconds, t.nanos).expect("write to a Vec");
+        }
+        ValueType::KeyValue(key) => {
+            buf.extend_from_slice(b"k:");
+            let (project_id, namespace) = key.partition_id.as_ref().map_or(("", ""), |p| {
+                (p.project_id.as_str(), p.namespace_id.as_str())
+            });
+            push_len_prefixed(buf, project_id);
+            push_len_prefixed(buf, namespace);
+            for element in &key.path {
+                match &element.id_type {
+                    Some(IdType::Id(id)) => {
+                        push_len_prefixed(buf, &element.kind);
+                        write!(buf, "#{id}").expect("write to a Vec");
+                    }
+                    Some(IdType::Name(name)) => {
+                        push_len_prefixed(buf, &element.kind);
+                        buf.push(b'=');
+                        push_len_prefixed(buf, name);
+                    }
+                    None => {}
                 }
             }
         }
-        Some(other) => {
-            if let Some(s) = indexable_string(other) {
-                visitor(s);
-            }
+        _ => return false,
+    }
+    true
+}
+
+/// Calls `visitor` with the index key of each indexed value in `value`,
+/// array elements one by one. `buf` holds the key prefix and comes back
+/// unchanged.
+fn for_each_index_key_of_value(buf: &mut Vec<u8>, value: &Value, visitor: &mut impl FnMut(&[u8])) {
+    let prefix_len = buf.len();
+    let mut visit = |item: &Value| {
+        if item.exclude_from_indexes {
+            return;
         }
+        if let Some(value_type) = item.value_type.as_ref()
+            && push_indexable_value(buf, value_type)
+        {
+            visitor(&buf[..]);
+            buf.truncate(prefix_len);
+        }
+    };
+    match &value.value_type {
+        Some(ValueType::ArrayValue(array)) => array.values.iter().for_each(visit),
+        Some(_) => visit(value),
         None => {}
     }
 }
 
-fn for_each_nested_indexable_path(
+/// Index keys of every indexed property in `properties`, nested entities
+/// included. `buf` holds `kind SEP path-so-far`, the path starting at
+/// `path_start`.
+fn for_each_index_key_of_properties(
+    buf: &mut Vec<u8>,
+    path_start: usize,
     properties: &HashMap<String, Value>,
-    prefix: &str,
-    visitor: &mut impl FnMut(&str, String),
+    visitor: &mut impl FnMut(&[u8]),
 ) {
-    for (prop_name, prop_value) in properties {
-        if prop_value.exclude_from_indexes {
-            continue;
+    for (name, value) in properties {
+        let path_len = buf.len();
+        if path_len > path_start {
+            buf.push(b'.');
         }
-
-        let full_path = if prefix.is_empty() {
-            prop_name.clone()
-        } else {
-            let mut s = String::with_capacity(prefix.len() + 1 + prop_name.len());
-            s.push_str(prefix);
-            s.push('.');
-            s.push_str(prop_name);
-            s
-        };
-
-        for_each_indexable_string_for_value(prop_value, |value_str| {
-            visitor(&full_path, value_str);
-        });
-
-        match &prop_value.value_type {
-            Some(ValueType::EntityValue(entity)) => {
-                for_each_nested_indexable_path(&entity.properties, &full_path, visitor);
-            }
-            Some(ValueType::ArrayValue(array)) => {
-                for item in &array.values {
-                    if let Some(ValueType::EntityValue(entity)) = &item.value_type {
-                        for_each_nested_indexable_path(&entity.properties, &full_path, visitor);
-                    }
-                }
-            }
-            _ => {}
-        }
+        buf.extend_from_slice(name.as_bytes());
+        for_each_index_key_of_property(buf, path_start, value, visitor);
+        buf.truncate(path_len);
     }
 }
 
-fn for_each_nested_indexable_value_path(
-    prop_path: &str,
+/// Index keys of one property value and of the entities nested in it.
+/// `buf` holds `kind SEP path` of the property.
+fn for_each_index_key_of_property(
+    buf: &mut Vec<u8>,
+    path_start: usize,
     value: &Value,
-    visitor: &mut impl FnMut(&str, String),
+    visitor: &mut impl FnMut(&[u8]),
 ) {
     if value.exclude_from_indexes {
         return;
     }
-
-    for_each_indexable_string_for_value(value, |value_str| {
-        visitor(prop_path, value_str);
-    });
+    buf.push(INDEX_KEY_SEPARATOR);
+    for_each_index_key_of_value(buf, value, visitor);
+    buf.pop();
 
     match &value.value_type {
         Some(ValueType::EntityValue(entity)) => {
-            for_each_nested_indexable_path(&entity.properties, prop_path, visitor);
+            for_each_index_key_of_properties(buf, path_start, &entity.properties, visitor);
         }
         Some(ValueType::ArrayValue(array)) => {
             for item in &array.values {
@@ -310,11 +339,66 @@ fn for_each_nested_indexable_value_path(
                     continue;
                 }
                 if let Some(ValueType::EntityValue(entity)) = &item.value_type {
-                    for_each_nested_indexable_path(&entity.properties, prop_path, visitor);
+                    for_each_index_key_of_properties(buf, path_start, &entity.properties, visitor);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Calls `visitor` with every index key of `entity`, an entity of `kind`.
+fn for_each_index_key_of_entity(kind: &str, entity: &Entity, visitor: &mut impl FnMut(&[u8])) {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(kind.as_bytes());
+    buf.push(INDEX_KEY_SEPARATOR);
+    let path_start = buf.len();
+    for_each_index_key_of_properties(&mut buf, path_start, &entity.properties, visitor);
+}
+
+/// Calls `visitor` with every index key of the property `name` of an
+/// entity of `kind`.
+fn for_each_index_key_of_named_property(
+    kind: &str,
+    name: &str,
+    value: &Value,
+    visitor: &mut impl FnMut(&[u8]),
+) {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(kind.as_bytes());
+    buf.push(INDEX_KEY_SEPARATOR);
+    let path_start = buf.len();
+    buf.extend_from_slice(name.as_bytes());
+    for_each_index_key_of_property(&mut buf, path_start, value, visitor);
+}
+
+/// The index keys an equality filter on `value` looks up for the property
+/// `path` of `kind`: one per indexed value, array elements one by one.
+pub fn index_keys_for_value(kind: &str, path: &str, value: &Value) -> Vec<IndexKey> {
+    let mut buf = Vec::with_capacity(64);
+    push_index_key_prefix(&mut buf, kind, path);
+    let mut keys = Vec::new();
+    for_each_index_key_of_value(&mut buf, value, &mut |key| keys.push(key.to_vec()));
+    keys
+}
+
+fn insert_index_entry(indexes: &mut PropertyIndex, index_key: &[u8], key: &Arc<KeyStruct>) {
+    match indexes.get_mut(index_key) {
+        Some(keys) => {
+            keys.insert(Arc::clone(key));
+        }
+        None => {
+            indexes.insert(index_key.to_vec(), BTreeSet::from([Arc::clone(key)]));
+        }
+    }
+}
+
+fn remove_index_entry(indexes: &mut PropertyIndex, index_key: &[u8], key: &KeyStruct) {
+    if let Some(keys) = indexes.get_mut(index_key) {
+        keys.remove(key);
+        if keys.is_empty() {
+            indexes.remove(index_key);
+        }
     }
 }
 
@@ -1659,13 +1743,15 @@ fn dedup_distinct_candidates(
 #[derive(Default, Debug)]
 pub struct DatastoreStorage {
     // Stores using BTreeMap for ordered storage, mapping a full KeyStruct to its EntityWithMetadata
-    pub entities: BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
+    // The key allocation is shared with every index entry of the entity.
+    pub entities: BTreeMap<Arc<KeyStruct>, Arc<EntityWithMetadata>>,
     // Secondary view used to avoid full-store scans when a query targets one project/kind.
-    pub scoped_entities: HashMap<(String, String), BTreeMap<KeyStruct, Arc<EntityWithMetadata>>>,
+    pub scoped_entities:
+        HashMap<(String, String), BTreeMap<Arc<KeyStruct>, Arc<EntityWithMetadata>>>,
     // Secondary view for ancestor queries, keyed by (project, descendant kind, ancestor key).
-    pub ancestor_index: HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>>,
-    // Indexes for efficient queries
-    pub indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>>,
+    pub ancestor_index: HashMap<(String, String, KeyStruct), BTreeSet<Arc<KeyStruct>>>,
+    // Equality index: (kind, property path, value) -> entity keys.
+    pub indexes: PropertyIndex,
     // Active transactions
     pub transactions: HashMap<String, TransactionState>,
     // Per-project counters for auto ID allocation. One sequence for all kinds
@@ -1748,7 +1834,11 @@ impl DatastoreStorage {
                 project_id_filter,
                 kind_name,
                 namespace,
-                self.ancestor_index.get(&index_key).into_iter().flatten(),
+                self.ancestor_index
+                    .get(&index_key)
+                    .into_iter()
+                    .flatten()
+                    .map(Arc::as_ref),
             );
             // The ancestor sorts before its descendants.
             let ancestor_itself = self.candidates_from_index_keys(
@@ -1760,42 +1850,30 @@ impl DatastoreStorage {
             return Some(Box::new(ancestor_itself.chain(descendants)));
         }
 
-        let indexed_values = get_indexable_strings_for_value(filter_value);
-        if indexed_values.is_empty() {
+        let index_keys = index_keys_for_value(kind_name, &property.name, filter_value);
+        if index_keys.is_empty() {
             return None;
         }
 
         match property_filter.op {
             5 if !matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))) => {
-                let index_key = (
-                    kind_name.to_string(),
-                    property.name.clone(),
-                    indexed_values.into_iter().next().unwrap(),
-                );
-                let Some(keys) = self.indexes.get(&index_key) else {
+                let Some(keys) = self.indexes.get(&index_keys[0]) else {
                     return Some(Box::new(std::iter::empty()));
                 };
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
                     namespace,
-                    keys.iter(),
+                    keys.iter().map(Arc::as_ref),
                 )))
             }
             6 if matches!(filter_value.value_type, Some(ValueType::ArrayValue(_))) => {
-                let kind_key = kind_name.to_string();
-                let property_key = property.name.clone();
                 let mut unique_keys = BTreeSet::new();
-
-                for value_str in indexed_values {
-                    if let Some(keys) =
-                        self.indexes
-                            .get(&(kind_key.clone(), property_key.clone(), value_str))
-                    {
-                        unique_keys.extend(keys.iter());
+                for index_key in &index_keys {
+                    if let Some(keys) = self.indexes.get(index_key) {
+                        unique_keys.extend(keys.iter().cloned());
                     }
                 }
-
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
@@ -1812,7 +1890,7 @@ impl DatastoreStorage {
         project_id: &str,
         kind_name: &str,
         filter_type: &FilterType,
-    ) -> Option<BTreeSet<KeyStruct>> {
+    ) -> Option<BTreeSet<Arc<KeyStruct>>> {
         match filter_type {
             FilterType::PropertyFilter(property_filter) => {
                 let property = property_filter.property.as_ref()?;
@@ -1829,9 +1907,7 @@ impl DatastoreStorage {
                                         .last()
                                         .is_some_and(|(k, _)| k == kind_name)
                                 {
-                                    let mut set = BTreeSet::new();
-                                    set.insert(key_struct);
-                                    return Some(set);
+                                    return Some(BTreeSet::from([Arc::new(key_struct)]));
                                 }
                                 return Some(BTreeSet::new());
                             }
@@ -1849,7 +1925,7 @@ impl DatastoreStorage {
                                                 .last()
                                                 .is_some_and(|(k, _)| k == kind_name)
                                         {
-                                            result.insert(key_struct);
+                                            result.insert(Arc::new(key_struct));
                                         }
                                     }
                                 }
@@ -1886,7 +1962,7 @@ impl DatastoreStorage {
                                     .last()
                                     .is_some_and(|(k, _)| k == kind_name)
                                 {
-                                    keys.insert(ancestor_key_struct);
+                                    keys.insert(Arc::new(ancestor_key_struct));
                                 }
                                 return Some(keys);
                             }
@@ -1895,45 +1971,16 @@ impl DatastoreStorage {
                         _ => None,
                     }
                 } else {
-                    let indexed_values = get_indexable_strings_for_value(filter_value);
-                    if indexed_values.is_empty() {
+                    let index_keys = index_keys_for_value(kind_name, &property.name, filter_value);
+                    if index_keys.is_empty() {
                         return None;
                     }
 
-                    let kind_key = kind_name.to_string();
-                    let property_key = property.name.clone();
-
                     match property_filter.op {
-                        5 => {
-                            let mut result: Option<BTreeSet<KeyStruct>> = None;
-                            for value_str in indexed_values.iter() {
-                                if let Some(keys) = self.indexes.get(&(
-                                    kind_key.clone(),
-                                    property_key.clone(),
-                                    value_str.clone(),
-                                )) {
-                                    // project_id and kind filtering happens again in
-                                    // query_candidates, so skip the redundant per-key
-                                    // filter+clone here and bulk-clone the index set.
-                                    result = Some(match result {
-                                        Some(mut acc) => {
-                                            acc.extend(keys.iter().cloned());
-                                            acc
-                                        }
-                                        None => keys.clone(),
-                                    });
-                                }
-                            }
-                            result.or(Some(BTreeSet::new()))
-                        }
-                        6 => {
+                        5 | 6 => {
                             let mut acc = BTreeSet::new();
-                            for value_str in indexed_values.iter() {
-                                if let Some(keys) = self.indexes.get(&(
-                                    kind_key.clone(),
-                                    property_key.clone(),
-                                    value_str.clone(),
-                                )) {
+                            for index_key in &index_keys {
+                                if let Some(keys) = self.indexes.get(index_key) {
                                     acc.extend(keys.iter().cloned());
                                 }
                             }
@@ -1970,10 +2017,7 @@ impl DatastoreStorage {
                         let mut iter = child_sets.into_iter();
                         let mut acc = iter.next().unwrap();
                         for set in iter {
-                            acc = acc
-                                .intersection(&set)
-                                .cloned()
-                                .collect::<BTreeSet<KeyStruct>>();
+                            acc = acc.intersection(&set).cloned().collect();
                             if acc.is_empty() {
                                 break;
                             }
@@ -2082,38 +2126,26 @@ impl DatastoreStorage {
         tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
         self.entities = entities
             .into_iter()
-            .map(|(key, metadata)| (key, Arc::new(metadata)))
+            .map(|(key, metadata)| (Arc::new(key), Arc::new(metadata)))
             .collect();
 
         // Bulk rebuild indexes
         tracing::info!("Rebuilding indexes for {} entities...", self.entities.len());
-        let mut new_indexes: HashMap<(String, String, String), BTreeSet<KeyStruct>> =
-            HashMap::new();
+        let mut new_indexes = PropertyIndex::new();
         let mut new_scoped_entities: HashMap<
             (String, String),
-            BTreeMap<KeyStruct, Arc<EntityWithMetadata>>,
+            BTreeMap<Arc<KeyStruct>, Arc<EntityWithMetadata>>,
         > = HashMap::new();
-        let mut new_ancestor_index: HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>> =
-            HashMap::new();
+        let mut new_ancestor_index = HashMap::new();
         for (key_struct, metadata) in &self.entities {
-            for (prop_name, prop_value) in &metadata.entity.properties {
-                if !prop_value.exclude_from_indexes
-                    && let Some((kind, _)) = key_struct.path_elements.last()
-                {
-                    for value_str in get_indexable_strings_for_value(prop_value) {
-                        let index_key = (kind.clone(), prop_name.clone(), value_str);
-                        new_indexes
-                            .entry(index_key)
-                            .or_default()
-                            .insert(key_struct.clone());
-                    }
-                }
-            }
             if let Some((kind, _)) = key_struct.path_elements.last() {
+                for_each_index_key_of_entity(kind, &metadata.entity, &mut |index_key| {
+                    insert_index_entry(&mut new_indexes, index_key, key_struct)
+                });
                 new_scoped_entities
                     .entry((key_struct.project_id.clone(), kind.clone()))
                     .or_default()
-                    .insert(key_struct.clone(), Arc::clone(metadata));
+                    .insert(Arc::clone(key_struct), Arc::clone(metadata));
             }
             Self::add_ancestor_index_entries(&mut new_ancestor_index, key_struct);
         }
@@ -2136,7 +2168,7 @@ impl DatastoreStorage {
         let entities: BTreeMap<KeyStruct, EntityWithMetadata> = self
             .entities
             .iter()
-            .map(|(key, metadata)| (key.clone(), metadata.as_ref().clone()))
+            .map(|(key, metadata)| (KeyStruct::clone(key), metadata.as_ref().clone()))
             .collect();
 
         let buffer = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
@@ -2245,8 +2277,6 @@ impl DatastoreStorage {
             }
         }
 
-        let final_key_struct = KeyStruct::from_datastore_key(&key_with_new_id);
-
         entity.key = Some(key_with_new_id.clone());
 
         let entity_metadata = Arc::new(EntityWithMetadata {
@@ -2255,18 +2285,45 @@ impl DatastoreStorage {
             create_time: timestamp_now.clone(),
             update_time: timestamp_now,
         });
-
-        self.entities
-            .insert(final_key_struct.clone(), Arc::clone(&entity_metadata));
-        self.upsert_scoped_entity(&final_key_struct, Arc::clone(&entity_metadata));
-        self.add_ancestor_indexes(&final_key_struct);
-        self.update_indexes(&final_key_struct, &entity_metadata.entity);
-        if let Some(ref key) = entity_metadata.entity.key {
-            self.observe_key_id(key);
-        }
+        self.put_entity(Arc::clone(&entity_metadata));
 
         Ok((key_with_new_id, entity_metadata))
     }
+
+    /// Stores `entity_metadata` under its key and brings every index up to
+    /// date, replacing a previous entity with that key. Returns the previous
+    /// entity.
+    pub fn put_entity(
+        &mut self,
+        entity_metadata: Arc<EntityWithMetadata>,
+    ) -> Option<Arc<EntityWithMetadata>> {
+        let key = entity_metadata
+            .entity
+            .key
+            .as_ref()
+            .expect("stored entities have a key");
+        let key_struct = KeyStruct::from_datastore_key(key);
+        let (key_struct, previous) = match self.entities.get_key_value(&key_struct) {
+            Some((shared, previous)) => (Arc::clone(shared), Some(Arc::clone(previous))),
+            None => (Arc::new(key_struct), None),
+        };
+
+        self.entities
+            .insert(Arc::clone(&key_struct), Arc::clone(&entity_metadata));
+        self.upsert_scoped_entity(&key_struct, Arc::clone(&entity_metadata));
+        match &previous {
+            Some(previous) => {
+                self.replace_indexes(&key_struct, &previous.entity, &entity_metadata.entity)
+            }
+            None => {
+                self.observe_key_id(key);
+                self.add_ancestor_indexes(&key_struct);
+                self.update_indexes(&key_struct, &entity_metadata.entity);
+            }
+        }
+        previous
+    }
+
     pub fn apply_filter(entity_metadata: &EntityWithMetadata, filter: &FilterType) -> bool {
         match filter {
             FilterType::PropertyFilter(property_filter) => {
@@ -3022,17 +3079,13 @@ impl DatastoreStorage {
         )
     }
 
-    pub fn update_indexes(&mut self, key_struct: &KeyStruct, entity: &Entity) {
+    pub fn update_indexes(&mut self, key_struct: &Arc<KeyStruct>, entity: &Entity) {
         let Some((kind, _)) = key_struct.path_elements.last() else {
             return;
         };
-
-        for_each_nested_indexable_path(&entity.properties, "", &mut |prop_path, value_str| {
-            let index_key = (kind.clone(), prop_path.to_string(), value_str);
-            self.indexes
-                .entry(index_key)
-                .or_default()
-                .insert(key_struct.clone());
+        let indexes = &mut self.indexes;
+        for_each_index_key_of_entity(kind, entity, &mut |index_key| {
+            insert_index_entry(indexes, index_key, key_struct)
         });
     }
 
@@ -3040,27 +3093,22 @@ impl DatastoreStorage {
         let Some((kind, _)) = key_struct.path_elements.last() else {
             return;
         };
-
-        for_each_nested_indexable_path(&entity.properties, "", &mut |prop_path, value_str| {
-            let index_key = (kind.clone(), prop_path.to_string(), value_str);
-            if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                indexed_keys_set.remove(key_struct);
-            }
+        let indexes = &mut self.indexes;
+        for_each_index_key_of_entity(kind, entity, &mut |index_key| {
+            remove_index_entry(indexes, index_key, key_struct)
         });
     }
 
     fn add_property_indexes(
         &mut self,
-        key_struct: &KeyStruct,
+        key_struct: &Arc<KeyStruct>,
         kind: &str,
         prop_name: &str,
         value: &Value,
     ) {
-        for_each_nested_indexable_value_path(prop_name, value, &mut |prop_path, value_str| {
-            self.indexes
-                .entry((kind.to_string(), prop_path.to_string(), value_str))
-                .or_default()
-                .insert(key_struct.clone());
+        let indexes = &mut self.indexes;
+        for_each_index_key_of_named_property(kind, prop_name, value, &mut |index_key| {
+            insert_index_entry(indexes, index_key, key_struct)
         });
     }
 
@@ -3071,17 +3119,15 @@ impl DatastoreStorage {
         prop_name: &str,
         value: &Value,
     ) {
-        for_each_nested_indexable_value_path(prop_name, value, &mut |prop_path, value_str| {
-            let index_key = (kind.to_string(), prop_path.to_string(), value_str);
-            if let Some(indexed_keys_set) = self.indexes.get_mut(&index_key) {
-                indexed_keys_set.remove(key_struct);
-            }
+        let indexes = &mut self.indexes;
+        for_each_index_key_of_named_property(kind, prop_name, value, &mut |index_key| {
+            remove_index_entry(indexes, index_key, key_struct)
         });
     }
 
     pub fn replace_indexes(
         &mut self,
-        key_struct: &KeyStruct,
+        key_struct: &Arc<KeyStruct>,
         previous_entity: &Entity,
         next_entity: &Entity,
     ) {
@@ -3111,7 +3157,7 @@ impl DatastoreStorage {
 
     pub(crate) fn upsert_scoped_entity(
         &mut self,
-        key_struct: &KeyStruct,
+        key_struct: &Arc<KeyStruct>,
         entity_metadata: Arc<EntityWithMetadata>,
     ) {
         let Some((kind, _)) = key_struct.path_elements.last() else {
@@ -3121,12 +3167,12 @@ impl DatastoreStorage {
         self.scoped_entities
             .entry((key_struct.project_id.clone(), kind.clone()))
             .or_default()
-            .insert(key_struct.clone(), entity_metadata);
+            .insert(Arc::clone(key_struct), entity_metadata);
     }
 
     fn add_ancestor_index_entries(
-        ancestor_index: &mut HashMap<(String, String, KeyStruct), BTreeSet<KeyStruct>>,
-        key_struct: &KeyStruct,
+        ancestor_index: &mut HashMap<(String, String, KeyStruct), BTreeSet<Arc<KeyStruct>>>,
+        key_struct: &Arc<KeyStruct>,
     ) {
         let Some((descendant_kind, _)) = key_struct.path_elements.last() else {
             return;
@@ -3148,11 +3194,11 @@ impl DatastoreStorage {
                     ancestor_key,
                 ))
                 .or_default()
-                .insert(key_struct.clone());
+                .insert(Arc::clone(key_struct));
         }
     }
 
-    pub(crate) fn add_ancestor_indexes(&mut self, key_struct: &KeyStruct) {
+    pub(crate) fn add_ancestor_indexes(&mut self, key_struct: &Arc<KeyStruct>) {
         Self::add_ancestor_index_entries(&mut self.ancestor_index, key_struct);
     }
 
@@ -3210,10 +3256,11 @@ impl DatastoreStorage {
     pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<Arc<EntityWithMetadata>> {
         let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
 
-        let removed_entity_metadata = self.entities.remove(&key_struct_to_delete)?;
-        self.remove_from_indexes(&key_struct_to_delete, &removed_entity_metadata.entity);
-        self.remove_ancestor_indexes(&key_struct_to_delete);
-        self.remove_scoped_entity(&key_struct_to_delete);
+        let (key_struct, removed_entity_metadata) =
+            self.entities.remove_entry(&key_struct_to_delete)?;
+        self.remove_from_indexes(&key_struct, &removed_entity_metadata.entity);
+        self.remove_ancestor_indexes(&key_struct);
+        self.remove_scoped_entity(&key_struct);
         Some(removed_entity_metadata)
     }
 }
@@ -3366,6 +3413,76 @@ mod tests {
         let lowest =
             dedup_distinct_candidates(candidates, &distinct_on, &[order_by("score", false)]);
         assert_eq!(ids(&lowest), vec![1, 4]);
+    }
+
+    fn equals_filter(name: &str, value: Value) -> FilterType {
+        FilterType::PropertyFilter(crate::google::datastore::v1::PropertyFilter {
+            property: Some(PropertyReference {
+                name: name.to_string(),
+            }),
+            op: 5,
+            value: Some(value),
+        })
+    }
+
+    fn entity_value(properties: Vec<(&str, Value)>) -> Value {
+        Value {
+            value_type: Some(ValueType::EntityValue(Entity {
+                key: None,
+                properties: properties
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value))
+                    .collect(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn indexes_rebuilt_on_load_cover_nested_properties() {
+        let mut storage = DatastoreStorage::default();
+        let candidate = candidate_with(
+            1,
+            vec![("nested", entity_value(vec![("field", str_value("x"))]))],
+        );
+        storage
+            .insert_entity(&candidate.entity_metadata.entity)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "datastore-emulator-index-rebuild-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+        storage.save_to_disk(path.to_str().unwrap()).unwrap();
+
+        let mut loaded = DatastoreStorage::default();
+        loaded.load_from_disk(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let filter = equals_filter("nested.field", str_value("x"));
+        let (candidates, _) = loaded.query_candidates("p", "Kind", "", Some(&filter));
+        assert_eq!(candidates.count(), 1);
+    }
+
+    #[test]
+    fn array_elements_excluded_from_indexes_are_not_indexed() {
+        let mut storage = DatastoreStorage::default();
+        let mut excluded = str_value("a");
+        excluded.exclude_from_indexes = true;
+        let candidate = candidate_with(
+            1,
+            vec![("tags", array_value(vec![excluded, str_value("b")]))],
+        );
+        storage
+            .insert_entity(&candidate.entity_metadata.entity)
+            .unwrap();
+
+        let hidden = equals_filter("tags", str_value("a"));
+        let (hidden, _) = storage.query_candidates("p", "Kind", "", Some(&hidden));
+        assert_eq!(hidden.count(), 0);
+
+        let visible = equals_filter("tags", str_value("b"));
+        let (visible, _) = storage.query_candidates("p", "Kind", "", Some(&visible));
+        assert_eq!(visible.count(), 1);
     }
 
     #[test]

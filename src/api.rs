@@ -86,11 +86,11 @@ mod tests {
         {
             let mut storage = state.storage.write().await;
             storage.entities.insert(
-                KeyStruct {
+                std::sync::Arc::new(KeyStruct {
                     project_id: "test-project".to_string(),
                     namespace: String::new(),
                     path_elements: vec![("Task".to_string(), KeyId::StringId("one".to_string()))],
-                },
+                }),
                 EntityWithMetadata {
                     entity: Entity::default(),
                     version: 1,

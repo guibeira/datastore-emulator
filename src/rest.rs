@@ -211,7 +211,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
 mod tests {
     use super::*;
     use crate::api::create_router;
-    use crate::database::{DatastoreStorage, EntityWithMetadata, KeyId, KeyStruct};
+    use crate::database::{DatastoreStorage, EntityWithMetadata};
     use crate::google::datastore::v1::key::PathElement;
     use crate::google::datastore::v1::key::path_element::IdType;
     use crate::google::datastore::v1::{Entity, Key, PartitionId};
@@ -224,11 +224,6 @@ mod tests {
 
     fn seeded_state(project: &str, kind: &str, name: &str) -> AppState {
         let mut storage = DatastoreStorage::default();
-        let key_struct = KeyStruct {
-            project_id: project.to_string(),
-            namespace: String::new(),
-            path_elements: vec![(kind.to_string(), KeyId::StringId(name.to_string()))],
-        };
         let datastore_key = Key {
             partition_id: Some(PartitionId {
                 project_id: project.to_string(),
@@ -240,8 +235,7 @@ mod tests {
                 id_type: Some(IdType::Name(name.to_string())),
             }],
         };
-        storage.entities.insert(
-            key_struct,
+        storage.put_entity(
             EntityWithMetadata {
                 entity: Entity {
                     key: Some(datastore_key),

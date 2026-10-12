@@ -13,7 +13,7 @@
 
 use datastore_emulator::{
     DatastoreStorage, core,
-    database::{EntityWithMetadata, KeyId, KeyStruct},
+    database::EntityWithMetadata,
     google::datastore::v1::{
         ArrayValue, CommitRequest, Entity, Filter, Key, Mutation, PartitionId, PropertyOrder,
         PropertyReference, Query, RunQueryRequest, Value,
@@ -48,14 +48,6 @@ fn key(name: &str) -> Key {
     }
 }
 
-fn key_struct_for(name: &str) -> KeyStruct {
-    KeyStruct {
-        project_id: PROJECT.to_string(),
-        namespace: String::new(),
-        path_elements: vec![(KIND.to_string(), KeyId::StringId(name.to_string()))],
-    }
-}
-
 fn val(value_type: ValueType) -> Value {
     Value {
         value_type: Some(value_type),
@@ -79,23 +71,19 @@ fn val_array(values: Vec<Value>) -> Value {
 }
 
 fn insert(storage: &mut DatastoreStorage, name: &str, props: HashMap<String, Value>) {
-    let key = key(name);
-    let key_struct = key_struct_for(name);
     let entity = Entity {
-        key: Some(key.clone()),
+        key: Some(key(name)),
         properties: props,
     };
-    storage.entities.insert(
-        key_struct.clone(),
+    storage.put_entity(
         EntityWithMetadata {
-            entity: entity.clone(),
+            entity,
             version: 1,
             create_time: pbjson_types::Timestamp::default(),
             update_time: pbjson_types::Timestamp::default(),
         }
         .into(),
     );
-    storage.update_indexes(&key_struct, &entity);
 }
 
 fn name_of(entity: &Entity) -> String {
@@ -454,7 +442,6 @@ async fn query_offset_is_respected() {
 #[tokio::test]
 async fn full_query_results_include_entity_metadata() {
     let mut storage = DatastoreStorage::default();
-    let key_struct = key_struct_for("with_metadata");
     let create_time = pbjson_types::Timestamp {
         seconds: 11,
         nanos: 22,
@@ -467,17 +454,15 @@ async fn full_query_results_include_entity_metadata() {
         key: Some(key("with_metadata")),
         properties: HashMap::from([("score".to_string(), val(ValueType::IntegerValue(7)))]),
     };
-    storage.entities.insert(
-        key_struct.clone(),
+    storage.put_entity(
         EntityWithMetadata {
-            entity: entity.clone(),
+            entity,
             version: 42,
             create_time: create_time.clone(),
             update_time: update_time.clone(),
         }
         .into(),
     );
-    storage.update_indexes(&key_struct, &entity);
     let storage = Arc::new(RwLock::new(storage));
 
     let query = Query {
@@ -569,11 +554,13 @@ async fn update_purges_stale_index_entries() {
     // After the update, the indexes map must not contain the stale "old"
     // entry pointing at this entity's key.
     let storage_guard = storage.read().await;
-    let stale =
-        storage_guard
-            .indexes
-            .get(&(KIND.to_string(), "tag".to_string(), "s:old".to_string()));
-    let stale_keys: Vec<&KeyStruct> = stale.map(|set| set.iter().collect()).unwrap_or_default();
+    let old_tag = datastore_emulator::database::index_keys_for_value(
+        KIND,
+        "tag",
+        &val(ValueType::StringValue("old".to_string())),
+    );
+    let stale = storage_guard.indexes.get(&old_tag[0]);
+    let stale_keys: Vec<_> = stale.map(|set| set.iter().collect()).unwrap_or_default();
     assert!(
         stale_keys.is_empty(),
         "stale index entry for old value not cleaned up: {:?}",

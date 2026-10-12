@@ -153,7 +153,9 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     let index_template = bench_entity_template();
-    let index_key = KeyStruct::from_datastore_key(index_template.key.as_ref().unwrap());
+    let index_key = Arc::new(KeyStruct::from_datastore_key(
+        index_template.key.as_ref().unwrap(),
+    ));
     group.bench_function("index_entity_with_nested", |b| {
         b.iter_batched(
             || DatastoreStorage::default(),
