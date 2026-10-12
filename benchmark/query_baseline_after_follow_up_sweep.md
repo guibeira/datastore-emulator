@@ -1,6 +1,6 @@
 # Query Baseline After the Follow-up Sweep
 
-Five changes, measured one after the other on the same machine (Apple
+Four changes, measured one after the other on the same machine (Apple
 Silicon, 10k entities, `DATASTORE_QUERY_BENCH_SAMPLES=20`,
 `DATASTORE_QUERY_BENCH_MEASUREMENT_SECONDS=3`). The baseline is `8021f3c`
 (main after #35, release profile and mimalloc already in).
