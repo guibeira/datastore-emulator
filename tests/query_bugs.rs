@@ -3,7 +3,7 @@
 //!
 //! Each test reproduces one of the reported issues:
 //!   1. Cross-type ordering must follow the documented Datastore order
-//!      (null < number < timestamp < boolean < string < ...).
+//!      (null < integer/timestamp < boolean < string < blob < double < ...).
 //!   2. An inequality filter without an explicit `order` should implicitly
 //!      sort by the inequality property (ascending).
 //!   3. Properties marked `exclude_from_indexes` must not match index-backed
@@ -149,7 +149,7 @@ fn prop_filter(name: &str, op: property_filter::Operator, value: Value) -> Filte
 }
 
 /// Bug 1: cross-type ordering should follow the documented Datastore order:
-/// null < integer/double < timestamp < boolean < string < blob.
+/// null < integer/timestamp (compared numerically) < boolean < string < blob.
 #[tokio::test]
 async fn cross_type_ordering_follows_datastore_spec() {
     let mut storage = DatastoreStorage::default();
@@ -200,15 +200,27 @@ async fn cross_type_ordering_follows_datastore_spec() {
     };
 
     let names = run(storage, query).await;
+    // int 0 and timestamp 1970-01-01T00:00:00Z are both 0 microseconds, so they tie.
+    assert_eq!(names.len(), 5, "cross-type ordering mismatch: {names:?}");
+    assert_eq!(names[0], "null", "cross-type ordering mismatch: {names:?}");
+    let mut tied = names[1..3].to_vec();
+    tied.sort();
     assert_eq!(
-        names,
-        vec!["null", "int", "ts", "bool", "str"],
-        "cross-type ordering mismatch"
+        tied,
+        vec!["int", "ts"],
+        "cross-type ordering mismatch: {names:?}"
+    );
+    assert_eq!(
+        names[3..],
+        ["bool", "str"],
+        "cross-type ordering mismatch: {names:?}"
     );
 }
 
+/// Integers and doubles are different ranks: every int sorts before every double,
+/// so `>`/`<` filters between them follow the rank, not the numeric value.
 #[tokio::test]
-async fn int_double_comparison_preserves_large_integer_precision() {
+async fn integers_never_compare_numerically_with_doubles() {
     let mut storage = DatastoreStorage::default();
     let threshold = 9_007_199_254_740_992.0;
     let int_above_threshold = 9_007_199_254_740_993i64;
@@ -243,8 +255,8 @@ async fn int_double_comparison_preserves_large_integer_precision() {
     let names = run(storage.clone(), greater_than_double).await;
     assert_eq!(
         names,
-        vec!["int_above"],
-        "integer 2^53 + 1 must compare greater than double 2^53"
+        Vec::<String>::new(),
+        "integer 2^53 + 1 ranks before double 2^53, so it must not match `> double`"
     );
 
     let less_than_int = Query {
@@ -262,8 +274,8 @@ async fn int_double_comparison_preserves_large_integer_precision() {
     let names = run(storage, less_than_int).await;
     assert_eq!(
         names,
-        vec!["double_threshold"],
-        "double 2^53 must compare less than integer 2^53 + 1"
+        Vec::<String>::new(),
+        "double 2^53 ranks after integer 2^53 + 1, so it must not match `< int`"
     );
 }
 
@@ -1252,5 +1264,272 @@ async fn not_equal_and_not_in_on_scalars_keep_null_and_drop_missing() {
         .await,
         vec!["none"],
         "score NOT_IN [1, 2]"
+    );
+}
+
+fn kind_query_with(filter: Option<Filter>, order: Vec<PropertyOrder>) -> Query {
+    Query {
+        kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
+            name: KIND.to_string(),
+        }],
+        filter,
+        order,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn cross_type_ordering_puts_doubles_after_strings() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "null",
+        HashMap::from([("score".to_string(), val(ValueType::NullValue(0)))]),
+    );
+    insert(
+        &mut storage,
+        "i1",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(
+        &mut storage,
+        "i2",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "ts",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::TimestampValue(pbjson_types::Timestamp {
+                seconds: 1_577_836_800,
+                nanos: 0,
+            })),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([("score".to_string(), val(ValueType::BooleanValue(true)))]),
+    );
+    insert(
+        &mut storage,
+        "s",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::StringValue("1".to_string())),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "d1",
+        HashMap::from([("score".to_string(), val(ValueType::DoubleValue(1.0)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let asc = run(
+        storage.clone(),
+        kind_query_with(None, vec![order_by_asc("score")]),
+    )
+    .await;
+    assert_eq!(
+        asc,
+        vec!["null", "i1", "i2", "ts", "b", "s", "d1"],
+        "ascending: every double must sort after every string"
+    );
+
+    let desc = run(storage, kind_query_with(None, vec![order_by_desc("score")])).await;
+    assert_eq!(
+        desc,
+        vec!["d1", "s", "b", "ts", "i2", "i1", "null"],
+        "descending: reverse of the ascending order"
+    );
+}
+
+#[tokio::test]
+async fn inequality_filters_never_compare_int_with_double() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "null",
+        HashMap::from([("score".to_string(), val(ValueType::NullValue(0)))]),
+    );
+    insert(
+        &mut storage,
+        "i1",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(1)))]),
+    );
+    insert(
+        &mut storage,
+        "i2",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2)))]),
+    );
+    insert(
+        &mut storage,
+        "ts",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::TimestampValue(pbjson_types::Timestamp {
+                seconds: 1_577_836_800,
+                nanos: 0,
+            })),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "b",
+        HashMap::from([("score".to_string(), val(ValueType::BooleanValue(true)))]),
+    );
+    insert(
+        &mut storage,
+        "s",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::StringValue("1".to_string())),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "d1",
+        HashMap::from([("score".to_string(), val(ValueType::DoubleValue(1.0)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let filter = |op, value| {
+        kind_query_with(
+            Some(prop_filter("score", op, value)),
+            vec![order_by_asc("score")],
+        )
+    };
+
+    let mut gt_half = run(
+        storage.clone(),
+        filter(
+            property_filter::Operator::GreaterThan,
+            val(ValueType::DoubleValue(0.5)),
+        ),
+    )
+    .await;
+    gt_half.sort();
+    assert_eq!(
+        gt_half,
+        vec!["d1"],
+        "score > 0.5 must only match the double"
+    );
+
+    let mut ge_int = run(
+        storage.clone(),
+        filter(
+            property_filter::Operator::GreaterThanOrEqual,
+            val(ValueType::IntegerValue(1)),
+        ),
+    )
+    .await;
+    ge_int.sort();
+    assert_eq!(
+        ge_int,
+        vec!["b", "d1", "i1", "i2", "s", "ts"],
+        "score >= 1 must match everything except null"
+    );
+
+    let mut ge_double = run(
+        storage.clone(),
+        filter(
+            property_filter::Operator::GreaterThanOrEqual,
+            val(ValueType::DoubleValue(1.0)),
+        ),
+    )
+    .await;
+    ge_double.sort();
+    assert_eq!(
+        ge_double,
+        vec!["d1"],
+        "score >= 1.0 must only match the double"
+    );
+
+    let mut lt_int = run(
+        storage,
+        filter(
+            property_filter::Operator::LessThan,
+            val(ValueType::IntegerValue(2)),
+        ),
+    )
+    .await;
+    lt_int.sort();
+    assert_eq!(
+        lt_int,
+        vec!["i1", "null"],
+        "score < 2 must match null and int 1"
+    );
+}
+
+#[tokio::test]
+async fn integers_and_timestamps_compare_numerically() {
+    let mut storage = DatastoreStorage::default();
+    insert(
+        &mut storage,
+        "small",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(5)))]),
+    );
+    // 1 second after the epoch is 1_000_000 microseconds.
+    insert(
+        &mut storage,
+        "epoch1s",
+        HashMap::from([(
+            "score".to_string(),
+            val(ValueType::TimestampValue(pbjson_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            })),
+        )]),
+    );
+    insert(
+        &mut storage,
+        "big",
+        HashMap::from([("score".to_string(), val(ValueType::IntegerValue(2_000_000)))]),
+    );
+    let storage = Arc::new(RwLock::new(storage));
+
+    let asc = run(
+        storage.clone(),
+        kind_query_with(None, vec![order_by_asc("score")]),
+    )
+    .await;
+    assert_eq!(
+        asc,
+        vec!["small", "epoch1s", "big"],
+        "integers and timestamps must interleave by microseconds"
+    );
+
+    let gt = run(
+        storage.clone(),
+        kind_query_with(
+            Some(prop_filter(
+                "score",
+                property_filter::Operator::GreaterThan,
+                val(ValueType::IntegerValue(1_000_000)),
+            )),
+            vec![order_by_asc("score")],
+        ),
+    )
+    .await;
+    assert_eq!(gt, vec!["big"], "int 1_000_000 must not match timestamp 1s");
+
+    let lt = run(
+        storage,
+        kind_query_with(
+            Some(prop_filter(
+                "score",
+                property_filter::Operator::LessThan,
+                val(ValueType::IntegerValue(1_000_000)),
+            )),
+            vec![order_by_asc("score")],
+        ),
+    )
+    .await;
+    assert_eq!(
+        lt,
+        vec!["small"],
+        "int 1_000_000 must not match timestamp 1s"
     );
 }

@@ -59,58 +59,27 @@ fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
 }
 
 fn compare_values(a: &Value, b: &Value) -> Ordering {
-    fn cmp_int_double(i: i64, d: f64) -> Ordering {
-        if d.is_nan() {
-            return Ordering::Equal;
-        }
-        if d == f64::INFINITY {
-            return Ordering::Less;
-        }
-        if d == f64::NEG_INFINITY {
-            return Ordering::Greater;
-        }
-
-        const I64_MIN_AS_F64: f64 = i64::MIN as f64;
-        const I64_MAX_PLUS_ONE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
-
-        if d < I64_MIN_AS_F64 {
-            return Ordering::Greater;
-        }
-        if d >= I64_MAX_PLUS_ONE_AS_F64 {
-            return Ordering::Less;
-        }
-        if d.fract() == 0.0 {
-            return i.cmp(&(d as i64));
-        }
-
-        let floor = d.floor() as i64;
-        let ceil = d.ceil() as i64;
-        if i <= floor {
-            Ordering::Less
-        } else if i >= ceil {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        }
-    }
-
     // Datastore canonical cross-type ordering:
-    // null < number (int/double) < timestamp < boolean < string < blob <
-    // geopoint < key < entity < array.
+    // null < integer/timestamp (compared numerically) < boolean < string <
+    // blob < double < geopoint < key < entity < array.
     fn type_rank(v: &Value) -> u8 {
         match &v.value_type {
             None => 0,
             Some(ValueType::NullValue(_)) => 1,
-            Some(ValueType::IntegerValue(_)) | Some(ValueType::DoubleValue(_)) => 2,
-            Some(ValueType::TimestampValue(_)) => 3,
-            Some(ValueType::BooleanValue(_)) => 4,
-            Some(ValueType::StringValue(_)) => 5,
-            Some(ValueType::BlobValue(_)) => 6,
+            Some(ValueType::IntegerValue(_)) | Some(ValueType::TimestampValue(_)) => 2,
+            Some(ValueType::BooleanValue(_)) => 3,
+            Some(ValueType::StringValue(_)) => 4,
+            Some(ValueType::BlobValue(_)) => 5,
+            Some(ValueType::DoubleValue(_)) => 6,
             Some(ValueType::GeoPointValue(_)) => 7,
             Some(ValueType::KeyValue(_)) => 8,
             Some(ValueType::EntityValue(_)) => 9,
             Some(ValueType::ArrayValue(_)) => 10,
         }
+    }
+
+    fn timestamp_micros(ts: &pbjson_types::Timestamp) -> i128 {
+        ts.seconds as i128 * 1_000_000 + ts.nanos as i128 / 1_000
     }
 
     let rank_ord = type_rank(a).cmp(&type_rank(b));
@@ -120,21 +89,20 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
 
     match (&a.value_type, &b.value_type) {
         (Some(ValueType::NullValue(_)), Some(ValueType::NullValue(_))) => Ordering::Equal,
-        // Integers and doubles share rank 2 and must compare as numbers.
+        // Integers and timestamps share rank 2 and compare numerically (microseconds).
         (Some(ValueType::IntegerValue(av)), Some(ValueType::IntegerValue(bv))) => av.cmp(bv),
+        (Some(ValueType::IntegerValue(av)), Some(ValueType::TimestampValue(bv))) => {
+            (*av as i128).cmp(&timestamp_micros(bv))
+        }
+        (Some(ValueType::TimestampValue(av)), Some(ValueType::IntegerValue(bv))) => {
+            timestamp_micros(av).cmp(&(*bv as i128))
+        }
+        (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => {
+            timestamp_micros(av).cmp(&timestamp_micros(bv))
+        }
         (Some(ValueType::DoubleValue(av)), Some(ValueType::DoubleValue(bv))) => {
             av.partial_cmp(bv).unwrap_or(Ordering::Equal)
         }
-        (Some(ValueType::IntegerValue(av)), Some(ValueType::DoubleValue(bv))) => {
-            cmp_int_double(*av, *bv)
-        }
-        (Some(ValueType::DoubleValue(av)), Some(ValueType::IntegerValue(bv))) => {
-            cmp_int_double(*bv, *av).reverse()
-        }
-        (Some(ValueType::TimestampValue(av)), Some(ValueType::TimestampValue(bv))) => av
-            .seconds
-            .cmp(&bv.seconds)
-            .then_with(|| av.nanos.cmp(&bv.nanos)),
         (Some(ValueType::BooleanValue(av)), Some(ValueType::BooleanValue(bv))) => av.cmp(bv),
         (Some(ValueType::StringValue(av)), Some(ValueType::StringValue(bv))) => av.cmp(bv),
         (Some(ValueType::BlobValue(av)), Some(ValueType::BlobValue(bv))) => av.cmp(bv),
