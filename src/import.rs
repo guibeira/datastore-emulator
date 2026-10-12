@@ -5,9 +5,10 @@ use futures::StreamExt;
 use gcloud_storage::client::{Client, ClientConfig};
 use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::{io::AsyncWriteExt, sync::RwLock, task};
+use tokio::{io::AsyncWriteExt, task};
 use tracing;
 
 fn download_temp_path_for_object(object: &str) -> std::path::PathBuf {
@@ -70,6 +71,21 @@ async fn download_gcs_file(
     Ok(local_path_str)
 }
 
+/// Marks the operation finished: failed with `error`, successful without.
+/// The lock is released on return, before the caller awaits anything.
+fn finish_operation(operations: &Operations, operation_id: &str, error: Option<String>) {
+    let mut operations = operations.write();
+    if let Some(state) = operations.get_mut(operation_id) {
+        state.status = if error.is_some() {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Successful
+        };
+        state.end_time = Some(Utc::now());
+        state.error = error;
+    }
+}
+
 pub async fn bg_import_data(
     storage: Arc<RwLock<DatastoreStorage>>,
     operations: Operations,
@@ -85,12 +101,7 @@ pub async fn bg_import_data(
             Ok(path) => path,
             Err(e) => {
                 tracing::error!("Failed to download file from GCS: {}", e);
-                let mut operations = operations.write().await;
-                if let Some(state) = operations.get_mut(&operation_id) {
-                    state.status = OperationStatus::Failed;
-                    state.end_time = Some(Utc::now());
-                    state.error = Some(e.to_string());
-                }
+                finish_operation(&operations, &operation_id, Some(e.to_string()));
                 return;
             }
         }
@@ -100,12 +111,11 @@ pub async fn bg_import_data(
         let path = std::path::Path::new(&input_url);
         if !path.exists() {
             tracing::warn!("File {:?} does not exist.", input_url);
-            let mut operations = operations.write().await;
-            if let Some(state) = operations.get_mut(&operation_id) {
-                state.status = OperationStatus::Failed;
-                state.end_time = Some(Utc::now());
-                state.error = Some(format!("File not found: {}", input_url));
-            }
+            finish_operation(
+                &operations,
+                &operation_id,
+                Some(format!("File not found: {}", input_url)),
+            );
             return;
         }
         input_url.clone()
@@ -152,15 +162,14 @@ pub async fn bg_import_data(
                 local_file_path,
                 e
             );
-            let mut operations = operations.write().await;
-            if let Some(state) = operations.get_mut(&operation_id) {
-                state.status = OperationStatus::Failed;
-                state.end_time = Some(Utc::now());
-                state.error = Some(format!(
+            finish_operation(
+                &operations,
+                &operation_id,
+                Some(format!(
                     "Failed to prepare export dir from {}: {}",
                     local_file_path, e
-                ));
-            }
+                )),
+            );
             if downloaded_from_gcs {
                 cleanup_downloaded_file(local_file_path.clone()).await;
             }
@@ -172,12 +181,11 @@ pub async fn bg_import_data(
                 local_file_path,
                 join_err
             );
-            let mut operations = operations.write().await;
-            if let Some(state) = operations.get_mut(&operation_id) {
-                state.status = OperationStatus::Failed;
-                state.end_time = Some(Utc::now());
-                state.error = Some("Background preparation task failed".to_string());
-            }
+            finish_operation(
+                &operations,
+                &operation_id,
+                Some("Background preparation task failed".to_string()),
+            );
             if downloaded_from_gcs {
                 cleanup_downloaded_file(local_file_path.clone()).await;
             }
@@ -187,7 +195,7 @@ pub async fn bg_import_data(
 
     let start = Instant::now();
     let import_result = {
-        let mut storage_guard = storage.write().await;
+        let mut storage_guard = storage.write();
         storage_guard.import_dump_for_project(&export_dir, target_project_id.as_deref())
     };
 
@@ -204,11 +212,7 @@ pub async fn bg_import_data(
                 minutes as u64,
                 seconds as u64
             );
-            let mut operations = operations.write().await;
-            if let Some(state) = operations.get_mut(&operation_id) {
-                state.status = OperationStatus::Successful;
-                state.end_time = Some(Utc::now());
-            }
+            finish_operation(&operations, &operation_id, None);
         }
         Err(status) => {
             tracing::error!("Failed to import entities from dump directory: {}", status);
@@ -217,12 +221,11 @@ pub async fn bg_import_data(
                 minutes as u64,
                 seconds as u64
             );
-            let mut operations = operations.write().await;
-            if let Some(state) = operations.get_mut(&operation_id) {
-                state.status = OperationStatus::Failed;
-                state.end_time = Some(Utc::now());
-                state.error = Some("Failed to import entities".to_string());
-            }
+            finish_operation(
+                &operations,
+                &operation_id,
+                Some("Failed to import entities".to_string()),
+            );
         }
     }
 

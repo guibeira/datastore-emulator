@@ -28,8 +28,8 @@ pub mod state;
 pub use crate::database::DatastoreStorage;
 pub use crate::state::AppState;
 
+use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Debug)]
 pub struct DatastoreEmulator {

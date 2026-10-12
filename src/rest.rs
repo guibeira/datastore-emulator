@@ -219,7 +219,6 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     state
         .operations
         .write()
-        .await
         .insert(operation_id.clone(), operation_state);
 
     bg_import_data(
@@ -234,7 +233,6 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
     let (final_state, start_time) = state
         .operations
         .read()
-        .await
         .get(&operation_id)
         .map(|s| {
             let state = match s.status {
@@ -274,9 +272,9 @@ mod tests {
     use crate::google::datastore::v1::{Entity, Key, PartitionId};
     use axum::body::Body;
     use axum::http::Request;
+    use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn seeded_state(project: &str, kind: &str, name: &str) -> AppState {
@@ -525,7 +523,7 @@ mod tests {
         let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["mutationResults"].is_array());
-        assert_eq!(state.storage.read().await.entities.len(), 1);
+        assert_eq!(state.storage.read().entities.len(), 1);
     }
 
     #[tokio::test]
@@ -739,7 +737,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["metadata"]["common"]["state"], "FAILED");
 
-        let operations = state.operations.read().await;
+        let operations = state.operations.read();
         assert_eq!(operations.len(), 1);
         let operation = operations.values().next().unwrap();
         assert_eq!(
@@ -778,7 +776,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(state.operations.read().await.len(), 1);
+        assert_eq!(state.operations.read().len(), 1);
     }
 
     #[tokio::test]

@@ -9,9 +9,9 @@ use datastore_emulator::{
         key::{PathElement, path_element::IdType},
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 fn key(project: &str, kind: &str, name: &str) -> Key {

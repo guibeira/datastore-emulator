@@ -17,9 +17,9 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::Code;
 
 const PROJECT: &str = "p1";
@@ -369,7 +369,7 @@ async fn cursor_survives_writes_between_pages() {
     let storage = storage_with_things();
     let page = run(&storage, limited(query(), 10)).await.unwrap();
     {
-        let mut storage = storage.write().await;
+        let mut storage = storage.write();
         storage.delete_entity(&key(KIND, Some(IdType::Name(name(9)))));
         insert_thing(&mut storage, "t0045", 0);
         insert_thing(&mut storage, "t0095", 0);

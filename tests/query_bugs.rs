@@ -26,9 +26,9 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tonic::Code;
 
 const PROJECT: &str = "p1";
@@ -553,14 +553,17 @@ async fn update_purges_stale_index_entries() {
 
     // After the update, the indexes map must not contain the stale "old"
     // entry pointing at this entity's key.
-    let storage_guard = storage.read().await;
     let old_tag = datastore_emulator::database::index_keys_for_value(
         KIND,
         "tag",
         &val(ValueType::StringValue("old".to_string())),
     );
-    let stale = storage_guard.indexes.get(&old_tag[0]);
-    let stale_keys: Vec<_> = stale.map(|set| set.iter().collect()).unwrap_or_default();
+    let stale_keys: Vec<_> = storage
+        .read()
+        .indexes
+        .get(&old_tag[0])
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default();
     assert!(
         stale_keys.is_empty(),
         "stale index entry for old value not cleaned up: {:?}",
@@ -568,7 +571,6 @@ async fn update_purges_stale_index_entries() {
     );
 
     // Querying by the old value must return no results.
-    drop(storage_guard);
     let query = Query {
         kind: vec![datastore_emulator::google::datastore::v1::KindExpression {
             name: KIND.to_string(),
@@ -701,7 +703,7 @@ async fn insert_existing_key_returns_already_exists() {
         .expect_err("inserting an existing key must fail");
     assert_eq!(err.code(), Code::AlreadyExists);
 
-    let guard = storage.read().await;
+    let guard = storage.read();
     let stored = guard.get_entity(&key("dup")).expect("entity still stored");
     assert_eq!(
         stored.entity.properties.get("tag"),

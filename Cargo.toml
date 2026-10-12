@@ -55,6 +55,7 @@ pbjson = "0.5"
 pbjson-types = "0.5"
 tower-http = { version = "0.4", features = ["cors"] }
 mimalloc = "0.1"
+parking_lot = "0.12"
 
 [build-dependencies]
 tonic-build = "0.9"

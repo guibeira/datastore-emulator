@@ -648,6 +648,7 @@ dependencies = [
  "hyper 0.14.32",
  "mimalloc",
  "once_cell",
+ "parking_lot",
  "pbjson",
  "pbjson-build",
  "pbjson-types",

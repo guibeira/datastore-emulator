@@ -22,13 +22,13 @@ use datastore_emulator::{
         value::ValueType,
     },
 };
+use parking_lot::RwLock;
 use pbjson_types::Int32Value;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::RwLock;
 
 // Same allocator as the binary (src/main.rs), so the numbers match it.
 #[global_allocator]

@@ -17,12 +17,12 @@ use crate::google::datastore::v1::{
     property_order,
     value::ValueType,
 };
+use parking_lot::RwLock;
 use pbjson_types::{Duration, Struct, Value as ValueProps, value::Kind};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime};
-use tokio::sync::RwLock;
 use tonic::Status;
 
 static TRANSACTION_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
@@ -269,7 +269,7 @@ pub async fn lookup(
         req.keys,
         req.read_options
     );
-    let storage = storage.read().await;
+    let storage = storage.read();
     let mut found = Vec::new();
     let mut missing = Vec::new();
 
@@ -361,7 +361,7 @@ pub async fn run_query(
         validate_kindless_query(&query_obj)?;
     }
 
-    let storage = storage.read().await;
+    let storage = storage.read();
     let (candidates, candidates_prefiltered): (
         Box<dyn Iterator<Item = QueryCandidate> + '_>,
         bool,
@@ -433,11 +433,6 @@ pub async fn commit(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: CommitRequest,
 ) -> Result<CommitResponse, Status> {
-    let mutation_count = req.mutations.len();
-    let mut storage = storage.write().await;
-    let mut mutation_results = Vec::with_capacity(mutation_count);
-    let commit_time = system_time_to_timestamp(SystemTime::now());
-
     let is_transactional = req.mode == Mode::Transactional as i32;
     let is_non_transactional = req.mode == Mode::NonTransactional as i32;
     let has_transaction = matches!(
@@ -471,14 +466,6 @@ pub async fn commit(
         None
     };
 
-    if let Some(tx_id) = transaction_id.as_ref() {
-        if storage.transactions.get(tx_id).is_some() {
-            tracing::info!("Committing transaction: {}", tx_id);
-        } else {
-            return Err(invalid_transaction());
-        }
-    }
-
     for mutation in &req.mutations {
         if let Some(operation) = mutation.operation.as_ref() {
             validate_mutation(operation)?;
@@ -489,10 +476,23 @@ pub async fn commit(
             "A non-transactional commit may not contain multiple mutations affecting the same entity.",
         ));
     }
+
+    // Everything above needs no storage; the write lock starts here.
+    let mut storage = storage.write();
+    if let Some(tx_id) = transaction_id.as_ref() {
+        if storage.transactions.contains_key(tx_id) {
+            tracing::info!("Committing transaction: {}", tx_id);
+        } else {
+            return Err(invalid_transaction());
+        }
+    }
     // Non-transactional commits may apply partially, like Datastore.
     if is_transactional || transaction_id.is_some() {
         check_transactional_preconditions(&storage, &req.mutations)?;
     }
+
+    let mut mutation_results = Vec::with_capacity(req.mutations.len());
+    let commit_time = system_time_to_timestamp(SystemTime::now());
 
     for mutation in req.mutations {
         if let Some(mutation) = mutation.operation {
@@ -609,7 +609,7 @@ pub async fn begin_transaction(
 
     let transaction_bytes = transaction_id.as_bytes().to_vec();
     {
-        let mut storage = storage.write().await;
+        let mut storage = storage.write();
         storage
             .transactions
             .insert(transaction_id, TransactionState);
@@ -634,7 +634,7 @@ pub async fn rollback(
         Err(_) => return Err(Status::invalid_argument("Invalid transaction ID format")),
     };
 
-    let mut storage = storage.write().await;
+    let mut storage = storage.write();
     if storage.transactions.remove(&transaction_id).is_none() {
         return Err(invalid_transaction());
     }
@@ -647,7 +647,7 @@ pub async fn allocate_ids(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: AllocateIdsRequest,
 ) -> Result<AllocateIdsResponse, Status> {
-    let mut storage = storage.write().await;
+    let mut storage = storage.write();
     let mut allocated_keys = Vec::new();
 
     for incomplete_key in req.keys {
@@ -681,7 +681,7 @@ pub async fn reserve_ids(
     storage: &Arc<RwLock<DatastoreStorage>>,
     req: ReserveIdsRequest,
 ) -> Result<ReserveIdsResponse, Status> {
-    let mut storage = storage.write().await;
+    let mut storage = storage.write();
     for key in &req.keys {
         if key.path.is_empty() {
             return Err(Status::invalid_argument("Key path cannot be empty"));
@@ -754,7 +754,7 @@ pub async fn run_aggregation_query(
         .partition_id
         .as_ref()
         .map_or("", |p| p.namespace_id.as_str());
-    let storage = storage.read().await;
+    let storage = storage.read();
 
     // Extract the aggregation query from the request
     let aggregation_query = match req.query_type {

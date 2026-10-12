@@ -12,7 +12,7 @@ pub async fn get_operation_status(
     State(state): State<AppState>,
     Path((_project_id, operation_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let operations = state.operations.read().await;
+    let operations = state.operations.read();
     if let Some(state) = operations.get(&operation_id) {
         (StatusCode::OK, Json(state.clone())).into_response()
     } else {
@@ -26,10 +26,10 @@ pub async fn healthcheck_handler() -> impl IntoResponse {
 
 pub async fn reset_handler(State(state): State<AppState>) -> impl IntoResponse {
     {
-        let mut storage = state.storage.write().await;
+        let mut storage = state.storage.write();
         *storage = crate::database::DatastoreStorage::default();
     }
-    state.operations.write().await.clear();
+    state.operations.write().clear();
     StatusCode::OK
 }
 
@@ -56,9 +56,9 @@ mod tests {
     use crate::google::datastore::v1::Entity;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -84,7 +84,7 @@ mod tests {
     async fn reset_clears_datastore_storage() {
         let state = test_state();
         {
-            let mut storage = state.storage.write().await;
+            let mut storage = state.storage.write();
             storage.entities.insert(
                 std::sync::Arc::new(KeyStruct {
                     project_id: "test-project".to_string(),
@@ -114,6 +114,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(state.storage.read().await.entities.is_empty());
+        assert!(state.storage.read().entities.is_empty());
     }
 }
