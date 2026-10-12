@@ -353,10 +353,6 @@ pub async fn run_query(
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
-    let retain_key_struct = query_obj.distinct_on.iter().any(|p| p.name == "__key__")
-        || order
-            .iter()
-            .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
     let namespace = req
         .partition_id
         .as_ref()
@@ -364,13 +360,7 @@ pub async fn run_query(
     let (candidates, candidates_prefiltered) = match query_obj.kind.first() {
         Some(kind) => {
             let storage = storage.read().await;
-            storage.query_candidates(
-                &req.project_id,
-                &kind.name,
-                namespace,
-                filter_type.as_ref(),
-                retain_key_struct,
-            )
+            storage.query_candidates(&req.project_id, &kind.name, namespace, filter_type.as_ref())
         }
         None => {
             validate_kindless_query(&query_obj)?;
@@ -838,10 +828,6 @@ pub async fn run_aggregation_query(
         Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
             let order = effective_query_order(query);
             let filter_type = query.filter.as_ref().and_then(|f| f.filter_type.clone());
-            let retain_key_struct = query.distinct_on.iter().any(|p| p.name == "__key__")
-                || order
-                    .iter()
-                    .any(|p| p.property.as_ref().is_some_and(|pr| pr.name == "__key__"));
 
             let (mut candidates, candidates_prefiltered) = match query.kind.first() {
                 Some(kind) => storage.query_candidates(
@@ -849,7 +835,6 @@ pub async fn run_aggregation_query(
                     &kind.name,
                     namespace,
                     filter_type.as_ref(),
-                    retain_key_struct,
                 ),
                 // An empty kind list is a kindless query over the whole namespace.
                 None => (

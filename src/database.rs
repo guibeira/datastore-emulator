@@ -319,10 +319,12 @@ fn for_each_nested_indexable_value_path(
     }
 }
 
+/// A `__key__` filter with its target keys, matched with `compare_keys` so no
+/// `KeyStruct` is built per candidate.
 enum PreparedKeyFilter {
-    Compare(i32, KeyStruct),
-    In(Vec<KeyStruct>),
-    NotIn(Vec<KeyStruct>),
+    Compare(i32, Key),
+    In(Vec<Key>),
+    NotIn(Vec<Key>),
 }
 
 fn try_prepare_key_filter(filter: &FilterType) -> Option<PreparedKeyFilter> {
@@ -338,32 +340,21 @@ fn try_prepare_key_filter(filter: &FilterType) -> Option<PreparedKeyFilter> {
     }
     let value = pf.value.as_ref()?;
 
+    let key_values = |arr: &ArrayValue| -> Vec<Key> {
+        arr.values
+            .iter()
+            .filter_map(|v| match &v.value_type {
+                Some(ValueType::KeyValue(k)) => Some(k.clone()),
+                _ => None,
+            })
+            .collect()
+    };
     match (pf.op, &value.value_type) {
-        (op @ (1 | 2 | 3 | 4 | 5 | 9), Some(ValueType::KeyValue(k))) => Some(
-            PreparedKeyFilter::Compare(op, KeyStruct::from_datastore_key(k)),
-        ),
-        (6, Some(ValueType::ArrayValue(arr))) => {
-            let keys = arr
-                .values
-                .iter()
-                .filter_map(|v| match &v.value_type {
-                    Some(ValueType::KeyValue(k)) => Some(KeyStruct::from_datastore_key(k)),
-                    _ => None,
-                })
-                .collect();
-            Some(PreparedKeyFilter::In(keys))
+        (op @ (1 | 2 | 3 | 4 | 5 | 9), Some(ValueType::KeyValue(k))) => {
+            Some(PreparedKeyFilter::Compare(op, k.clone()))
         }
-        (13, Some(ValueType::ArrayValue(arr))) => {
-            let keys = arr
-                .values
-                .iter()
-                .filter_map(|v| match &v.value_type {
-                    Some(ValueType::KeyValue(k)) => Some(KeyStruct::from_datastore_key(k)),
-                    _ => None,
-                })
-                .collect();
-            Some(PreparedKeyFilter::NotIn(keys))
-        }
+        (6, Some(ValueType::ArrayValue(arr))) => Some(PreparedKeyFilter::In(key_values(arr))),
+        (13, Some(ValueType::ArrayValue(arr))) => Some(PreparedKeyFilter::NotIn(key_values(arr))),
         _ => None,
     }
 }
@@ -402,10 +393,10 @@ fn index_lookup_covers_filter(filter: &FilterType) -> bool {
     }
 }
 
-fn match_prepared_key_filter(key_struct: &KeyStruct, kind: &PreparedKeyFilter) -> bool {
+fn match_prepared_key_filter(entity_key: &Key, kind: &PreparedKeyFilter) -> bool {
     match kind {
         PreparedKeyFilter::Compare(op, target) => {
-            let ord = key_struct.cmp(target);
+            let ord = compare_keys(entity_key, target);
             match op {
                 1 => ord.is_lt(),
                 2 => ord.is_le(),
@@ -416,15 +407,13 @@ fn match_prepared_key_filter(key_struct: &KeyStruct, kind: &PreparedKeyFilter) -
                 _ => false,
             }
         }
-        PreparedKeyFilter::In(keys) => keys.iter().any(|k| k == key_struct),
-        PreparedKeyFilter::NotIn(keys) => !keys.iter().any(|k| k == key_struct),
+        PreparedKeyFilter::In(keys) => keys.iter().any(|k| compare_keys(k, entity_key).is_eq()),
+        PreparedKeyFilter::NotIn(keys) => !keys.iter().any(|k| compare_keys(k, entity_key).is_eq()),
     }
 }
 
 fn match_key_against_filter(entity_key: &Key, filter_value: &Value, op: i32) -> bool {
-    let entity_key_struct = KeyStruct::from_datastore_key(entity_key);
-
-    let compare_with = |other: &Key| entity_key_struct.cmp(&KeyStruct::from_datastore_key(other));
+    let compare_with = |other: &Key| compare_keys(entity_key, other);
 
     match op {
         0 => true,
@@ -1021,23 +1010,16 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
 #[derive(Debug)]
 pub struct TransactionState;
 
+/// A query result candidate. Keys are compared through the entity key with
+/// `compare_keys`, so no per-candidate `KeyStruct` is built.
 #[derive(Clone)]
 pub(crate) struct QueryCandidate {
-    pub(crate) key_struct: Option<KeyStruct>,
     pub(crate) entity_metadata: Arc<EntityWithMetadata>,
 }
 
 impl QueryCandidate {
-    fn from_metadata(entity_metadata: Arc<EntityWithMetadata>) -> Self {
-        let key_struct = entity_metadata
-            .entity
-            .key
-            .as_ref()
-            .map(KeyStruct::from_datastore_key);
-        Self {
-            key_struct,
-            entity_metadata,
-        }
+    fn entity_key(&self) -> Option<&Key> {
+        self.entity_metadata.entity.key.as_ref()
     }
 }
 
@@ -1065,13 +1047,7 @@ fn compare_keys(a: &Key, b: &Key) -> Ordering {
 }
 
 fn compare_candidate_keys(a: &QueryCandidate, b: &QueryCandidate) -> Ordering {
-    if let (Some(a), Some(b)) = (a.key_struct.as_ref(), b.key_struct.as_ref()) {
-        return a.cmp(b);
-    }
-    match (
-        a.entity_metadata.entity.key.as_ref(),
-        b.entity_metadata.entity.key.as_ref(),
-    ) {
+    match (a.entity_key(), b.entity_key()) {
         (Some(a), Some(b)) => compare_keys(a, b),
         (Some(_), None) => Ordering::Greater,
         (None, Some(_)) => Ordering::Less,
@@ -1208,11 +1184,10 @@ fn decode_cursor(cursor: &[u8]) -> Result<Option<QueryCandidate>, tonic::Status>
     let invalid = || tonic::Status::invalid_argument("Invalid query cursor");
     let payload = cursor.strip_prefix(&CURSOR_MAGIC[..]).ok_or_else(invalid)?;
     let entity = Entity::decode(payload).map_err(|_| invalid())?;
-    let Some(key) = entity.key.as_ref() else {
+    if entity.key.is_none() {
         return Ok(None);
-    };
+    }
     Ok(Some(QueryCandidate {
-        key_struct: Some(KeyStruct::from_datastore_key(key)),
         entity_metadata: Arc::new(EntityWithMetadata {
             entity,
             ..Default::default()
@@ -1272,7 +1247,7 @@ fn hash_distinct_value<H: Hasher>(hasher: &mut H, value: &Value, scratch: &mut V
 
 #[derive(Clone, PartialEq)]
 enum DistinctComponent {
-    Key(Option<KeyStruct>),
+    Key(Option<Key>),
     Value(Value),
     Missing,
 }
@@ -1286,7 +1261,12 @@ fn hash_distinct_signature(
     for prop in distinct_on {
         if prop.name == "__key__" {
             1u8.hash(&mut hasher);
-            candidate.key_struct.hash(&mut hasher);
+            if let Some(key) = candidate.entity_key() {
+                scratch.clear();
+                key.encode_length_delimited(scratch)
+                    .expect("encode distinct key signature");
+                scratch.hash(&mut hasher);
+            }
         } else if let Some(value) = candidate.entity_metadata.entity.properties.get(&prop.name) {
             2u8.hash(&mut hasher);
             hash_distinct_value(&mut hasher, value, scratch);
@@ -1306,7 +1286,7 @@ fn build_distinct_signature(
         .iter()
         .map(|prop| {
             if prop.name == "__key__" {
-                DistinctComponent::Key(candidate.key_struct.clone())
+                DistinctComponent::Key(candidate.entity_key().cloned())
             } else if let Some(value) = candidate.entity_metadata.entity.properties.get(&prop.name)
             {
                 DistinctComponent::Value(value.clone())
@@ -1328,7 +1308,11 @@ fn distinct_signature_matches(
             .zip(distinct_on)
             .all(|(stored, prop)| match stored {
                 DistinctComponent::Key(stored) if prop.name == "__key__" => {
-                    stored.as_ref() == candidate.key_struct.as_ref()
+                    match (stored.as_ref(), candidate.entity_key()) {
+                        (Some(stored), Some(key)) => compare_keys(stored, key).is_eq(),
+                        (None, None) => true,
+                        _ => false,
+                    }
                 }
                 DistinctComponent::Value(stored) => {
                     candidate.entity_metadata.entity.properties.get(&prop.name) == Some(stored)
@@ -1353,10 +1337,9 @@ fn candidate_matches_filter(
         return true;
     }
     if let Some(pkf) = prepared_key_filter {
-        let Some(ks) = candidate.key_struct.as_ref() else {
-            return false;
-        };
-        return match_prepared_key_filter(ks, pkf);
+        return candidate
+            .entity_key()
+            .is_some_and(|key| match_prepared_key_filter(key, pkf));
     }
     match filter_type {
         Some(filter_type) => {
@@ -1364,6 +1347,28 @@ fn candidate_matches_filter(
         }
         None => true,
     }
+}
+
+/// `Some(descending)` when the order is empty or only `__key__` in one
+/// direction. Candidates arrive in ascending key order, so such queries need
+/// no sort, or just a reverse.
+fn key_only_order(order: &[PropertyOrder]) -> Option<bool> {
+    let mut descending = None;
+    for order_by in order {
+        if order_by
+            .property
+            .as_ref()
+            .is_none_or(|p| p.name != "__key__")
+        {
+            return None;
+        }
+        let this = order_by.direction == property_order::Direction::Descending as i32;
+        match descending {
+            Some(previous) if previous != this => return None,
+            _ => descending = Some(this),
+        }
+    }
+    Some(descending.unwrap_or(false))
 }
 
 /// Index scans drop entities without an indexed value for any ordered
@@ -1481,7 +1486,6 @@ fn expand_projection_rows(candidate: QueryCandidate, names: &[&str]) -> Vec<Quer
 
     rows.into_iter()
         .map(|properties| QueryCandidate {
-            key_struct: candidate.key_struct.clone(),
             entity_metadata: Arc::new(EntityWithMetadata {
                 entity: Entity {
                     key: source.entity.key.clone(),
@@ -1544,7 +1548,6 @@ impl DatastoreStorage {
         project_id_filter: &str,
         kind_name: &str,
         namespace: &str,
-        retain_key_struct: bool,
         keys: impl IntoIterator<Item = &'a KeyStruct>,
     ) -> Vec<QueryCandidate> {
         let scope_key = (project_id_filter.to_string(), kind_name.to_string());
@@ -1564,7 +1567,6 @@ impl DatastoreStorage {
                     .and_then(|entities| entities.get(key_struct))
                     .or_else(|| self.entities.get(key_struct))
                     .map(|entity_metadata| QueryCandidate {
-                        key_struct: retain_key_struct.then(|| key_struct.clone()),
                         entity_metadata: Arc::clone(entity_metadata),
                     })
             })
@@ -1577,7 +1579,6 @@ impl DatastoreStorage {
         kind_name: &str,
         namespace: &str,
         filter_type: &FilterType,
-        retain_key_struct: bool,
     ) -> Option<Vec<QueryCandidate>> {
         let FilterType::PropertyFilter(property_filter) = filter_type else {
             return None;
@@ -1619,7 +1620,6 @@ impl DatastoreStorage {
                     project_id_filter,
                     kind_name,
                     namespace,
-                    retain_key_struct,
                     ancestor_itself
                         .into_iter()
                         .chain(descendants.into_iter().flatten()),
@@ -1646,7 +1646,6 @@ impl DatastoreStorage {
                     project_id_filter,
                     kind_name,
                     namespace,
-                    retain_key_struct,
                     keys.iter(),
                 ))
             }
@@ -1668,7 +1667,6 @@ impl DatastoreStorage {
                     project_id_filter,
                     kind_name,
                     namespace,
-                    retain_key_struct,
                     unique_keys,
                 ))
             }
@@ -2465,8 +2463,7 @@ impl DatastoreStorage {
             .filter(|(key_struct, _)| {
                 key_struct.project_id == project_id_filter && key_struct.namespace == namespace
             })
-            .map(|(key_struct, entity_metadata)| QueryCandidate {
-                key_struct: Some(key_struct.clone()),
+            .map(|(_, entity_metadata)| QueryCandidate {
                 entity_metadata: Arc::clone(entity_metadata),
             })
             .collect()
@@ -2478,13 +2475,14 @@ impl DatastoreStorage {
         kind_name: &str,
         namespace: &str,
         filter_type: Option<&FilterType>,
-        retain_key_struct: bool,
     ) -> (Vec<QueryCandidate>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             let mut candidates: Vec<QueryCandidate> = self
                 .get_metadata(kind_name, project_id_filter, namespace)
                 .into_iter()
-                .map(|metadata| QueryCandidate::from_metadata(Arc::new(metadata)))
+                .map(|metadata| QueryCandidate {
+                    entity_metadata: Arc::new(metadata),
+                })
                 .collect();
             // Other candidate sources are in key order; cursors rely on it.
             candidates.sort_by(compare_candidate_keys);
@@ -2497,7 +2495,6 @@ impl DatastoreStorage {
                 kind_name,
                 namespace,
                 filter_type,
-                retain_key_struct,
             )
         {
             return (candidates, true);
@@ -2525,12 +2522,8 @@ impl DatastoreStorage {
                         scoped_entities
                             .and_then(|entities| entities.get(&key_struct))
                             .or_else(|| self.entities.get(&key_struct))
-                            .map(|entity_metadata| {
-                                let key_struct = retain_key_struct.then_some(key_struct);
-                                QueryCandidate {
-                                    key_struct,
-                                    entity_metadata: Arc::clone(entity_metadata),
-                                }
+                            .map(|entity_metadata| QueryCandidate {
+                                entity_metadata: Arc::clone(entity_metadata),
                             })
                     })
                     .collect(),
@@ -2545,21 +2538,21 @@ impl DatastoreStorage {
             scoped_entities
                 .iter()
                 .filter(|(key_struct, _)| key_struct.namespace == namespace)
-                .filter(|(key_struct, entity_metadata)| {
+                .filter(|(_, entity_metadata)| {
                     if let Some(ref pkf) = prepared_key_filter {
-                        match_prepared_key_filter(key_struct, pkf)
+                        entity_metadata
+                            .entity
+                            .key
+                            .as_ref()
+                            .is_some_and(|key| match_prepared_key_filter(key, pkf))
                     } else {
                         filter_type.is_none_or(|filter_type| {
                             DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
                         })
                     }
                 })
-                .map(|(key_struct, entity_metadata)| {
-                    let key_struct = retain_key_struct.then(|| key_struct.clone());
-                    QueryCandidate {
-                        key_struct,
-                        entity_metadata: Arc::clone(entity_metadata),
-                    }
+                .map(|(_, entity_metadata)| QueryCandidate {
+                    entity_metadata: Arc::clone(entity_metadata),
                 })
                 .collect()
         } else if !self.scoped_entities.is_empty() {
@@ -2575,21 +2568,21 @@ impl DatastoreStorage {
                             .last()
                             .is_some_and(|(k, _)| k == kind_name)
                 })
-                .filter(|(key_struct, entity_metadata)| {
+                .filter(|(_, entity_metadata)| {
                     if let Some(ref pkf) = prepared_key_filter {
-                        match_prepared_key_filter(key_struct, pkf)
+                        entity_metadata
+                            .entity
+                            .key
+                            .as_ref()
+                            .is_some_and(|key| match_prepared_key_filter(key, pkf))
                     } else {
                         filter_type.is_none_or(|filter_type| {
                             DatastoreStorage::apply_filter(entity_metadata.as_ref(), filter_type)
                         })
                     }
                 })
-                .map(|(key_struct, entity_metadata)| {
-                    let key_struct = retain_key_struct.then(|| key_struct.clone());
-                    QueryCandidate {
-                        key_struct,
-                        entity_metadata: Arc::clone(entity_metadata),
-                    }
+                .map(|(_, entity_metadata)| QueryCandidate {
+                    entity_metadata: Arc::clone(entity_metadata),
                 })
                 .collect()
         };
@@ -2653,8 +2646,13 @@ impl DatastoreStorage {
             );
         }
 
-        // 2. Sort entities
-        if !order.is_empty() {
+        // 2. Sort entities. Candidates arrive in ascending key order, so a
+        // `__key__`-only order needs no sort (or just a reverse).
+        if let Some(descending) = key_only_order(&order) {
+            if descending {
+                filtered_entities.reverse();
+            }
+        } else {
             let bounded_sort_len = if distinct_on.is_empty() {
                 limit.map(|limit_value| {
                     (offset.max(0) as usize)
@@ -2846,8 +2844,10 @@ impl DatastoreStorage {
             .collect();
 
         let limit = limit.filter(|value| *value >= 0);
-        if !order.is_empty() || limit.is_some() || offset > 0 {
-            matching.sort_unstable_by(|a, b| compare_query_position(a, b, &order));
+        match key_only_order(&order) {
+            Some(false) => {}
+            Some(true) => matching.reverse(),
+            None => matching.sort_unstable_by(|a, b| compare_query_position(a, b, &order)),
         }
         if !distinct_on.is_empty() {
             matching = dedup_distinct_candidates(matching, &distinct_on);
@@ -2881,7 +2881,6 @@ impl DatastoreStorage {
             &kind_name,
             &namespace,
             filter_type.as_ref(),
-            true,
         );
         Self::get_entities_from_candidates(
             candidates,
