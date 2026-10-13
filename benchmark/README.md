@@ -25,67 +25,64 @@ Once you have poetry installed, you can install the dependencies by running the 
 poetry install
 ```
 
-Once the dependencies are installed, you can run the benchmark by running the following command:
+Once the dependencies are installed, run the benchmark against both emulators:
 
 ```bash
-poetry run python benchmark/test_benchmark.py --num-clients 30 --num-runs 5
+poetry run python benchmark/test_benchmark.py --num-clients 10 --num-runs 20 --warmup-runs 5 --repeat 3
 ```
 
-Done! You should see the benchmark results printed in the console like this:
+Each client runs every scenario `--warmup-runs` times untimed, then `--num-runs`
+times with each call timed; the whole run repeats `--repeat` times and the median
+is kept. The summary shows, per scenario and emulator, the average time per client
+(the dashboard's historical metric), the p50 and the p95 per call, and the
+Java/Rust speedup:
 
 ```bash
 --- Benchmark Summary ---
 
 Operation: Single Insert
-  - Rust (30 clients, 5 runs each):
-    - Total time: 0.8413 seconds
-    - Avg time per client: 0.0280 seconds
-  - Java (30 clients, 5 runs each):
-    - Total time: 48.1050 seconds
-    - Avg time per client: 1.6035 seconds
-  - Verdict: Rust was 57.18x faster overall.
-
-Operation: Bulk Insert (50)
-  - Rust (30 clients, 5 runs each):
-    - Total time: 9.5209 seconds
-    - Avg time per client: 0.3174 seconds
-  - Java (30 clients, 5 runs each):
-    - Total time: 163.7277 seconds
-    - Avg time per client: 5.4576 seconds
-  - Verdict: Rust was 17.20x faster overall.
-
-Operation: Simple Query
-  - Rust (30 clients, 5 runs each):
-    - Total time: 2.2610 seconds
-    - Avg time per client: 0.0754 seconds
-  - Java (30 clients, 5 runs each):
-    - Total time: 29.3397 seconds
-    - Avg time per client: 0.9780 seconds
+  - Rust (10 clients, 20 runs each): avg per client 0.1694s, p50 7.8 ms, p95 12.1 ms
+  - Java (10 clients, 20 runs each): avg per client 0.5895s, p50 27.4 ms, p95 48.0 ms
+  - Verdict: Rust p50 is 3.51x faster than Java.
 ```
+
+`--target rust` or `--target java` benchmarks one emulator (`--host` overrides its
+URL). If an emulator stops answering, the run aborts with exit code 2 and says
+which scenario and how many clients failed.
 
 ### Emitting JSON for the continuous dashboard
 
-Pass `--json-out PATH` to write results in the `github-action-benchmark`
-`customSmallerIsBetter` format. The human-readable summary is still printed:
+`--json-out PATH` writes the per-target summaries. `merge_results.py` turns one or
+more of those files into the two `github-action-benchmark` files: `latency.json`
+(`customSmallerIsBetter`: avg per client, p50, p95) and `speedup.json`
+(`customBiggerIsBetter`: Java/Rust p50 ratio, stable across runners of different
+speed):
 
 ```bash
-poetry run python benchmark/test_benchmark.py \
-  --num-clients 10 --num-runs 20 \
-  --json-out benchmark-output/results.json
+poetry run python benchmark/test_benchmark.py --target rust --json-out out/rust.json
+poetry run python benchmark/test_benchmark.py --target java --json-out out/java.json
+poetry run python benchmark/merge_results.py --out-dir out out/rust.json out/java.json
 ```
 
 ### Continuous benchmark dashboard
 
-On every `v*` tag push, `.github/workflows/benchmark.yml` runs this script
-against both emulators (`docker compose up`) and publishes the results to
-GitHub Pages via [`benchmark-action/github-action-benchmark`][gab]. The
-dashboard lives at:
+The `Release` workflow calls `.github/workflows/benchmark.yml` after the Docker
+image is published. It pulls that image and the official emulator image
+(`guibeira/datastore-emulator-google`, built from `Dockerfile.google` by
+`.github/workflows/google-emulator-image.yml`), runs each emulator alone pinned
+to two CPUs (`benchmark/compose.yml`) with the client on the other two, and
+publishes the results to GitHub Pages via
+[`benchmark-action/github-action-benchmark`][gab]:
 
 <https://guibeira.github.io/datastore-emulator/dev/bench/>
 
-To smoke-test without cutting a tag, run the workflow manually from the
-**Actions** tab (`Benchmark` → **Run workflow**); the manual trigger
-accepts `num_clients` and `num_runs` overrides.
+If the Java emulator dies or hangs, the Rust numbers are still published and
+the speedup chart skips that release. To re-run a release by hand, use the
+**Actions** tab (`Benchmark` → **Run workflow**) with its tag; `num_clients`,
+`num_runs` and `repeat` can be overridden.
+
+The page at `dev/bench/index.html` on `gh-pages` is customized to draw both
+emulators on one chart per scenario; the action keeps it as it only writes
+that file when it does not exist.
 
 [gab]: https://github.com/benchmark-action/github-action-benchmark
-
