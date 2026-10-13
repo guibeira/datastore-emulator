@@ -366,11 +366,15 @@ pub async fn run_query(
         Box<dyn Iterator<Item = QueryCandidate> + '_>,
         bool,
     ) = match query_obj.kind.first() {
-        Some(kind) => {
-            storage.query_candidates(&req.project_id, &kind.name, namespace, filter_type.as_ref())
-        }
+        Some(kind) => storage.query_candidates(
+            &req.project_id,
+            &kind.name,
+            &req.database_id,
+            namespace,
+            filter_type.as_ref(),
+        ),
         None => (
-            Box::new(storage.kindless_candidates(&req.project_id, namespace)),
+            Box::new(storage.kindless_candidates(&req.project_id, &req.database_id, namespace)),
             false,
         ),
     };
@@ -802,12 +806,17 @@ pub async fn run_aggregation_query(
                 Some(kind) => storage.query_candidates(
                     &req.project_id,
                     &kind.name,
+                    &req.database_id,
                     namespace,
                     filter_type.as_ref(),
                 ),
                 // An empty kind list is a kindless query over the whole namespace.
                 None => (
-                    Box::new(storage.kindless_candidates(&req.project_id, namespace)),
+                    Box::new(storage.kindless_candidates(
+                        &req.project_id,
+                        &req.database_id,
+                        namespace,
+                    )),
                     false,
                 ),
             };

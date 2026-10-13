@@ -246,10 +246,16 @@ fn push_indexable_value(buf: &mut Vec<u8>, value_type: &ValueType) -> bool {
         }
         ValueType::KeyValue(key) => {
             buf.extend_from_slice(b"k:");
-            let (project_id, namespace) = key.partition_id.as_ref().map_or(("", ""), |p| {
-                (p.project_id.as_str(), p.namespace_id.as_str())
-            });
+            let (project_id, database_id, namespace) =
+                key.partition_id.as_ref().map_or(("", "", ""), |p| {
+                    (
+                        p.project_id.as_str(),
+                        p.database_id.as_str(),
+                        p.namespace_id.as_str(),
+                    )
+                });
             push_len_prefixed(buf, project_id);
+            push_len_prefixed(buf, database_id);
             push_len_prefixed(buf, namespace);
             for element in &key.path {
                 match &element.id_type {
@@ -1031,6 +1037,7 @@ pub enum KeyId {
 )]
 pub struct KeyStruct {
     pub project_id: String,
+    pub database_id: String,
     pub namespace: String,
     pub path_elements: Vec<(String, KeyId)>, // (kind, id/name)
 }
@@ -1052,6 +1059,10 @@ impl KeyStruct {
                 .partition_id
                 .as_ref()
                 .map_or_else(|| "".to_string(), |p| p.project_id.clone()),
+            database_id: key
+                .partition_id
+                .as_ref()
+                .map_or_else(|| "".to_string(), |p| p.database_id.clone()),
             namespace: key
                 .partition_id
                 .as_ref()
@@ -1131,9 +1142,13 @@ impl QueryCandidate {
 
 /// Same order as `KeyStruct`'s `Ord`, without building a `KeyStruct`.
 fn compare_keys(a: &Key, b: &Key) -> Ordering {
-    fn partition(key: &Key) -> (&str, &str) {
-        key.partition_id.as_ref().map_or(("", ""), |p| {
-            (p.project_id.as_str(), p.namespace_id.as_str())
+    fn partition(key: &Key) -> (&str, &str, &str) {
+        key.partition_id.as_ref().map_or(("", "", ""), |p| {
+            (
+                p.project_id.as_str(),
+                p.database_id.as_str(),
+                p.namespace_id.as_str(),
+            )
         })
     }
     // `Ok` (integer id) sorts before `Err` (name), like `KeyId`.
@@ -1787,6 +1802,7 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         keys: impl IntoIterator<Item = K> + 'a,
     ) -> impl Iterator<Item = QueryCandidate> + 'a {
@@ -1797,6 +1813,7 @@ impl DatastoreStorage {
             .filter(move |key| {
                 let key_struct = key.borrow();
                 key_struct.project_id == project_id_filter
+                    && key_struct.database_id == database_id
                     && key_struct.namespace == namespace
                     && key_struct
                         .path_elements
@@ -1818,6 +1835,7 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         filter_type: &'a FilterType,
     ) -> Option<Box<dyn Iterator<Item = QueryCandidate> + 'a>> {
@@ -1837,6 +1855,7 @@ impl DatastoreStorage {
             };
             let ancestor_key_struct = KeyStruct::from_datastore_key(key);
             if ancestor_key_struct.project_id != project_id_filter
+                || ancestor_key_struct.database_id != database_id
                 || ancestor_key_struct.path_elements.is_empty()
             {
                 return Some(Box::new(std::iter::empty()));
@@ -1856,6 +1875,7 @@ impl DatastoreStorage {
             let descendants = self.candidates_from_index_keys(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 self.ancestor_index
                     .get(&index_key)
@@ -1867,6 +1887,7 @@ impl DatastoreStorage {
             let ancestor_itself = self.candidates_from_index_keys(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 std::iter::once(ancestor_key_struct),
             );
@@ -1886,6 +1907,7 @@ impl DatastoreStorage {
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     keys.iter().map(Arc::as_ref),
                 )))
@@ -1900,6 +1922,7 @@ impl DatastoreStorage {
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     unique_keys,
                 )))
@@ -2494,6 +2517,7 @@ impl DatastoreStorage {
         &self,
         metadata_key: &str,
         project_id: &str,
+        database_id: &str,
         namespace: &str,
     ) -> Vec<EntityWithMetadata> {
         let mut results = Vec::new();
@@ -2503,6 +2527,7 @@ impl DatastoreStorage {
                 let mut unique_kinds = HashSet::new();
                 for key_struct in self.entities.keys() {
                     if key_struct.project_id == project_id
+                        && key_struct.database_id == database_id
                         && key_struct.namespace == namespace
                         && let Some((kind, _)) = key_struct.path_elements.last()
                     {
@@ -2526,7 +2551,7 @@ impl DatastoreStorage {
                                 partition_id: Some(PartitionId {
                                     project_id,
                                     namespace_id: namespace,
-                                    database_id: "".to_string(),
+                                    database_id: database_id.to_string(),
                                 }),
                                 path: vec![PathElement {
                                     kind: "__kind__".to_string(),
@@ -2540,7 +2565,8 @@ impl DatastoreStorage {
             "__namespace__" => {
                 let mut unique_namespaces = HashSet::new();
                 for key_struct in self.entities.keys() {
-                    if key_struct.project_id == project_id {
+                    if key_struct.project_id == project_id && key_struct.database_id == database_id
+                    {
                         unique_namespaces.insert(key_struct.namespace.clone());
                     }
                 }
@@ -2563,7 +2589,7 @@ impl DatastoreStorage {
                                     partition_id: Some(PartitionId {
                                         project_id: project_id.to_string(),
                                         namespace_id: "".to_string(),
-                                        database_id: "".to_string(),
+                                        database_id: database_id.to_string(),
                                     }),
                                     path: vec![PathElement {
                                         kind: "__namespace__".to_string(),
@@ -2581,7 +2607,10 @@ impl DatastoreStorage {
                     HashMap::new();
 
                 for (key_struct, entity_meta) in &self.entities {
-                    if key_struct.project_id != project_id || key_struct.namespace != namespace {
+                    if key_struct.project_id != project_id
+                        || key_struct.database_id != database_id
+                        || key_struct.namespace != namespace
+                    {
                         continue;
                     }
                     if let Some((kind, _)) = key_struct.path_elements.last() {
@@ -2608,7 +2637,7 @@ impl DatastoreStorage {
                             partition_id: Some(PartitionId {
                                 project_id: project_id.to_string(),
                                 namespace_id: namespace,
-                                database_id: "".to_string(),
+                                database_id: database_id.to_string(),
                             }),
                             path: vec![
                                 PathElement {
@@ -2663,12 +2692,15 @@ impl DatastoreStorage {
     pub(crate) fn kindless_candidates<'a>(
         &'a self,
         project_id_filter: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
     ) -> impl Iterator<Item = QueryCandidate> + 'a {
         self.entities
             .iter()
             .filter(move |(key_struct, _)| {
-                key_struct.project_id == project_id_filter && key_struct.namespace == namespace
+                key_struct.project_id == project_id_filter
+                    && key_struct.database_id == database_id
+                    && key_struct.namespace == namespace
             })
             .map(|(_, entity_metadata)| QueryCandidate {
                 entity_metadata: Arc::clone(entity_metadata),
@@ -2682,12 +2714,13 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         filter_type: Option<&'a FilterType>,
     ) -> (Box<dyn Iterator<Item = QueryCandidate> + 'a>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             let mut candidates: Vec<QueryCandidate> = self
-                .get_metadata(kind_name, project_id_filter, namespace)
+                .get_metadata(kind_name, project_id_filter, database_id, namespace)
                 .into_iter()
                 .map(|metadata| QueryCandidate {
                     entity_metadata: Arc::new(metadata),
@@ -2702,6 +2735,7 @@ impl DatastoreStorage {
             && let Some(candidates) = self.query_simple_index_candidates(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 filter_type,
             )
@@ -2718,6 +2752,7 @@ impl DatastoreStorage {
                 Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     candidate_keys,
                 )),
@@ -2750,7 +2785,10 @@ impl DatastoreStorage {
                 Box::new(
                     scoped_entities
                         .iter()
-                        .filter(move |(key_struct, _)| key_struct.namespace == namespace)
+                        .filter(move |(key_struct, _)| {
+                            key_struct.database_id == database_id
+                                && key_struct.namespace == namespace
+                        })
                         .filter(move |(_, entity_metadata)| matches(entity_metadata))
                         .map(move |(_, entity_metadata)| to_candidate(entity_metadata)),
                 )
@@ -2762,6 +2800,7 @@ impl DatastoreStorage {
                         .iter()
                         .filter(move |(key_struct, _)| {
                             key_struct.project_id == project_id_filter
+                                && key_struct.database_id == database_id
                                 && key_struct.namespace == namespace
                                 && key_struct
                                     .path_elements
@@ -3065,6 +3104,7 @@ impl DatastoreStorage {
         &self,
         project_id_filter: String,
         kind_name: String,
+        database_id: String,
         namespace: String,
         filter: Option<Filter>,
         limit: Option<i32>,
@@ -3079,6 +3119,7 @@ impl DatastoreStorage {
         let (candidates, candidates_prefiltered) = self.query_candidates(
             &project_id_filter,
             &kind_name,
+            &database_id,
             &namespace,
             filter_type.as_ref(),
         );
@@ -3201,6 +3242,7 @@ impl DatastoreStorage {
         for ancestor_len in 1..key_struct.path_elements.len() {
             let ancestor_key = KeyStruct {
                 project_id: key_struct.project_id.clone(),
+                database_id: key_struct.database_id.clone(),
                 namespace: key_struct.namespace.clone(),
                 path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
             };
@@ -3231,6 +3273,7 @@ impl DatastoreStorage {
         for ancestor_len in 1..key_struct.path_elements.len() {
             let ancestor_key = KeyStruct {
                 project_id: key_struct.project_id.clone(),
+                database_id: key_struct.database_id.clone(),
                 namespace: key_struct.namespace.clone(),
                 path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
             };
@@ -3476,8 +3519,162 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let filter = equals_filter("nested.field", str_value("x"));
-        let (candidates, _) = loaded.query_candidates("p", "Kind", "", Some(&filter));
+        let (candidates, _) = loaded.query_candidates("p", "Kind", "", "", Some(&filter));
         assert_eq!(candidates.count(), 1);
+    }
+
+    fn key_in_database(database_id: &str, kind: &str, name: &str) -> Key {
+        Key {
+            partition_id: Some(PartitionId {
+                project_id: "p".to_string(),
+                database_id: database_id.to_string(),
+                namespace_id: String::new(),
+            }),
+            path: vec![PathElement {
+                kind: kind.to_string(),
+                id_type: Some(IdType::Name(name.to_string())),
+            }],
+        }
+    }
+
+    fn entity_in_database(
+        database_id: &str,
+        kind: &str,
+        name: &str,
+        props: Vec<(&str, Value)>,
+    ) -> Entity {
+        Entity {
+            key: Some(key_in_database(database_id, kind, name)),
+            properties: props.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
+
+    fn key_value(key: Key) -> Value {
+        Value {
+            value_type: Some(ValueType::KeyValue(key)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entities_with_the_same_path_in_different_databases_are_distinct() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("db", str_value("default"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "one",
+                vec![("db", str_value("db1"))],
+            ))
+            .unwrap();
+
+        assert_eq!(storage.entities.len(), 2);
+        let found = storage
+            .get_entity(&key_in_database("db1", "Kind", "one"))
+            .unwrap();
+        assert_eq!(found.entity.properties["db"], str_value("db1"));
+        assert!(
+            storage
+                .get_entity(&key_in_database("db2", "Kind", "one"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compare_keys_distinguishes_databases() {
+        let default = key_in_database("", "Kind", "one");
+        let named = key_in_database("db1", "Kind", "one");
+        assert_ne!(compare_keys(&default, &named), Ordering::Equal);
+    }
+
+    #[test]
+    fn key_values_in_different_databases_index_differently() {
+        let default = index_keys_for_value(
+            "Kind",
+            "ref",
+            &key_value(key_in_database("", "Kind", "one")),
+        );
+        let named = index_keys_for_value(
+            "Kind",
+            "ref",
+            &key_value(key_in_database("db1", "Kind", "one")),
+        );
+        assert_ne!(default, named);
+    }
+
+    fn names(candidates: impl Iterator<Item = QueryCandidate>) -> Vec<String> {
+        candidates
+            .filter_map(|c| {
+                let key = c.entity_metadata.entity.key.clone()?;
+                match key.path.last()?.id_type.clone()? {
+                    IdType::Name(name) => Some(name),
+                    IdType::Id(id) => Some(id.to_string()),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn query_candidates_only_see_the_requested_database() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("tag", str_value("x"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "two",
+                vec![("tag", str_value("x"))],
+            ))
+            .unwrap();
+
+        let filter = equals_filter("tag", str_value("x"));
+        let (indexed, _) = storage.query_candidates("p", "Kind", "db1", "", Some(&filter));
+        assert_eq!(names(indexed), vec!["two"]);
+        let (scanned, _) = storage.query_candidates("p", "Kind", "db1", "", None);
+        assert_eq!(names(scanned), vec!["two"]);
+        assert_eq!(
+            names(storage.kindless_candidates("p", "db1", "")),
+            vec!["two"]
+        );
+    }
+
+    #[test]
+    fn metadata_kinds_are_scoped_to_the_database_and_carry_it() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database("db1", "Kind", "one", vec![]))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database("", "Other", "one", vec![]))
+            .unwrap();
+
+        let (kinds, _) = storage.query_candidates("p", "__kind__", "db1", "", None);
+        let kinds: Vec<QueryCandidate> = kinds.collect();
+        let keys: Vec<&Key> = kinds
+            .iter()
+            .filter_map(|c| c.entity_metadata.entity.key.as_ref())
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].path[0].id_type,
+            Some(IdType::Name("Kind".to_string()))
+        );
+        assert_eq!(keys[0].partition_id.as_ref().unwrap().database_id, "db1");
     }
 
     #[test]
@@ -3494,11 +3691,11 @@ mod tests {
             .unwrap();
 
         let hidden = equals_filter("tags", str_value("a"));
-        let (hidden, _) = storage.query_candidates("p", "Kind", "", Some(&hidden));
+        let (hidden, _) = storage.query_candidates("p", "Kind", "", "", Some(&hidden));
         assert_eq!(hidden.count(), 0);
 
         let visible = equals_filter("tags", str_value("b"));
-        let (visible, _) = storage.query_candidates("p", "Kind", "", Some(&visible));
+        let (visible, _) = storage.query_candidates("p", "Kind", "", "", Some(&visible));
         assert_eq!(visible.count(), 1);
     }
 
