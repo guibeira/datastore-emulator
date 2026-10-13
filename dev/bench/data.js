@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791910684497,
+  "lastUpdate": 1791910834989,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -778,6 +778,136 @@ window.BENCHMARK_DATA = {
           {
             "name": "Simple Query (Java) - p95 s/op",
             "value": 0.246244,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "id": "7a6d688fcc3f3c5876bc30da73d529054db7a9c4",
+          "message": "chore(release): v0.1.7",
+          "timestamp": "2026-10-13T13:12:34Z",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/7a6d688fcc3f3c5876bc30da73d529054db7a9c4"
+        },
+        "date": 1791910834083,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Single Insert (Rust) - avg seconds per client",
+            "value": 0.092308,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Rust) - p50 s/op",
+            "value": 0.003389,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Rust) - p95 s/op",
+            "value": 0.012225,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - avg seconds per client",
+            "value": 0.105274,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - p50 s/op",
+            "value": 0.004833,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - p95 s/op",
+            "value": 0.011172,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - avg seconds per client",
+            "value": 0.639061,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - p50 s/op",
+            "value": 0.028021,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - p95 s/op",
+            "value": 0.064109,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - avg seconds per client",
+            "value": 2.32981,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - p50 s/op",
+            "value": 0.04169,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - p95 s/op",
+            "value": 0.550079,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - avg seconds per client",
+            "value": 0.291797,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - p50 s/op",
+            "value": 0.009334,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - p95 s/op",
+            "value": 0.043146,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - avg seconds per client",
+            "value": 1.698912,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - p50 s/op",
+            "value": 0.067361,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - p95 s/op",
+            "value": 0.203449,
             "unit": "s",
             "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
           }
