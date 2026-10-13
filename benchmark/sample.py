@@ -21,12 +21,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmark.resources import StatsSampler
 
 
-def sample_around(command, json_path, sampler):
+# Below the benchmark job's 45-minute limit with room for both emulators.
+DEFAULT_TIMEOUT = 1200.0
+
+
+def sample_around(command, json_path, sampler, timeout=DEFAULT_TIMEOUT):
     """Runs `command` with `sampler` active; writes the summary under
-    `resources` for the single target in `json_path`, when the file exists."""
+    `resources` for the single target in `json_path`, when the file exists.
+    A command still running after `timeout` seconds is killed and reported
+    with exit code 124."""
     sampler.start()
     try:
-        code = subprocess.call(command)
+        code = subprocess.call(command, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"::error::{command[0]} still running after {timeout:.0f}s; killed")
+        code = 124
     finally:
         usage = sampler.stop()
     json_path = Path(json_path)
@@ -51,12 +60,13 @@ def main(argv=None, sampler_factory=StatsSampler):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--container", required=True, help="Docker container of the emulator under test")
     parser.add_argument("--json", required=True, help="The JSON file the command writes (its --json-out)")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Seconds before the command is killed")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="The benchmark command and its arguments")
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("no command given")
-    return sample_around(command, args.json, sampler_factory(args.container))
+    return sample_around(command, args.json, sampler_factory(args.container), timeout=args.timeout)
 
 
 if __name__ == "__main__":

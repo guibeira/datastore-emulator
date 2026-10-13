@@ -85,3 +85,15 @@ def test_main_takes_the_command_without_a_separator(tmp_path):
 
     assert code == 0
     assert json.loads(out.read_text())["resources"]["Rust"]["samples"] == 2
+
+
+def test_kills_a_stalled_command_after_the_timeout(tmp_path):
+    out = tmp_path / "rust.json"
+    sampler = StatsSampler("ignored", command=[sys.executable, "-c", FAKE_STATS])
+    stalled = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    code = sample_around(stalled, out, sampler, timeout=0.5)
+
+    assert code == 124
+    assert not out.exists()
+    assert sampler.process.poll() is not None
