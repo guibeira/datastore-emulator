@@ -174,6 +174,9 @@ use uuid::Uuid;
 pub struct ImportRequest {
     #[serde(rename = "inputUrl", alias = "input_url")]
     pub input_url: String,
+    /// Database the imported entities land in; the default database when absent.
+    #[serde(rename = "databaseId", alias = "database_id", default)]
+    pub database_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -227,6 +230,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
         operation_id.clone(),
         payload.input_url.clone(),
         Some(project_id.clone()),
+        Some(payload.database_id.clone().unwrap_or_default()),
     )
     .await;
 

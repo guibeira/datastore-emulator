@@ -88,6 +88,7 @@ mod tests {
             storage.entities.insert(
                 std::sync::Arc::new(KeyStruct {
                     project_id: "test-project".to_string(),
+                    database_id: String::new(),
                     namespace: String::new(),
                     path_elements: vec![("Task".to_string(), KeyId::StringId("one".to_string()))],
                 }),
