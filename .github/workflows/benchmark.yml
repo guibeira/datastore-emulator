@@ -91,6 +91,8 @@ jobs:
         shell: bash
         run: docker compose down -v || true
 
+      # dev/bench/index.html on gh-pages is customized (Rust and Java on the
+      # same chart); the action only writes it when it does not exist.
       - name: Publish benchmark results
         uses: benchmark-action/github-action-benchmark@v1
         with:
