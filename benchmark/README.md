@@ -66,16 +66,19 @@ Operation: Single Insert
 ```
 
 `--target rust` or `--target java` benchmarks one emulator (`--host` overrides its
-URL). If an emulator stops answering, the run aborts with exit code 2 and says
-which scenario and how many clients failed.
+URL). `--container NAME` samples that emulator's container through `docker stats`
+while the clients run and reports mean and peak CPU (percent of one core) and
+peak and final memory. If an emulator stops answering, the run aborts with exit
+code 2 and says which scenario and how many clients failed.
 
 ### Emitting JSON for the continuous dashboard
 
 `--json-out PATH` writes the per-target summaries. `merge_results.py` turns one or
-more of those files into the two `github-action-benchmark` files: `latency.json`
-(`customSmallerIsBetter`: avg per client, p50, p95) and `speedup.json`
+more of those files into the `github-action-benchmark` files: `latency.json`
+(`customSmallerIsBetter`: avg per client, p50, p95), `speedup.json`
 (`customBiggerIsBetter`: Java/Rust p50 ratio, stable across runners of different
-speed):
+speed) and `resources.json` (`customSmallerIsBetter`: CPU and memory of each
+container, one chart per metric with both emulators):
 
 ```bash
 poetry run python benchmark/test_benchmark.py --target rust --json-out out/rust.json

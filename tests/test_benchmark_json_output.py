@@ -25,7 +25,7 @@ def test_emits_three_metrics_per_scenario_per_emulator(tmp_path):
     rust = _write_target(tmp_path / "rust.json", "Rust", 1.0)
     java = _write_target(tmp_path / "java.json", "Java", 5.0)
 
-    latency, speedup = merge_files([rust, java], tmp_path / "out")
+    latency, speedup, _ = merge_files([rust, java], tmp_path / "out")
 
     names = [entry["name"] for entry in latency]
     assert len(latency) == 18
@@ -46,7 +46,7 @@ def test_values_and_extra_come_from_the_files(tmp_path):
     rust = _write_target(tmp_path / "rust.json", "Rust", 1.0)
     java = _write_target(tmp_path / "java.json", "Java", 5.0)
 
-    latency, _ = merge_files([rust, java], tmp_path / "out")
+    latency, _, _ = merge_files([rust, java], tmp_path / "out")
 
     by_name = {entry["name"]: entry for entry in latency}
     avg = by_name["Single Insert (Rust) - avg seconds per client"]
@@ -72,7 +72,7 @@ def test_writes_both_files_creating_the_directory(tmp_path):
 def test_publishes_rust_alone_when_the_java_file_is_missing(tmp_path, capsys):
     rust = _write_target(tmp_path / "rust.json", "Rust", 1.0)
 
-    latency, speedup = merge_files([rust, tmp_path / "java.json"], tmp_path / "out")
+    latency, speedup, _ = merge_files([rust, tmp_path / "java.json"], tmp_path / "out")
 
     assert len(latency) == 9
     assert speedup == []
@@ -83,3 +83,31 @@ def test_publishes_rust_alone_when_the_java_file_is_missing(tmp_path, capsys):
 def test_fails_when_no_file_exists(tmp_path):
     with pytest.raises(SystemExit):
         merge_files([tmp_path / "rust.json"], tmp_path / "out")
+
+
+def test_writes_resources_when_the_targets_carry_them(tmp_path):
+    rust = _write_target(tmp_path / "rust.json", "Rust", 1.0)
+    data = json.loads(rust.read_text())
+    data["resources"] = {
+        "Rust": {"samples": 5, "cpu_mean_percent": 42.0, "cpu_peak_percent": 80.0, "mem_peak_mb": 30.0, "mem_end_mb": 25.0}
+    }
+    rust.write_text(json.dumps(data))
+
+    latency, speedup, resources = merge_files([rust], tmp_path / "out")
+
+    assert [e["name"] for e in resources] == [
+        "CPU (Rust) - mean %",
+        "CPU (Rust) - peak %",
+        "Memory (Rust) - peak MB",
+        "Memory (Rust) - end MB",
+    ]
+    assert json.loads((tmp_path / "out" / "resources.json").read_text()) == resources
+
+
+def test_writes_an_empty_resources_file_without_samples(tmp_path):
+    rust = _write_target(tmp_path / "rust.json", "Rust", 1.0)
+
+    _, _, resources = merge_files([rust], tmp_path / "out")
+
+    assert resources == []
+    assert json.loads((tmp_path / "out" / "resources.json").read_text()) == []
