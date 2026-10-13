@@ -4,7 +4,7 @@
 set -euo pipefail
 port="$1"
 for attempt in $(seq 1 60); do
-  if curl -sf -o /dev/null "http://localhost:${port}/"; then
+  if curl -sf --max-time 5 -o /dev/null "http://localhost:${port}/"; then
     echo "Port ${port} answers."
     exit 0
   fi
