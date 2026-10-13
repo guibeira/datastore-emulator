@@ -193,7 +193,8 @@
             canvas.className = 'benchmark-chart';
             parent.appendChild(canvas);
 
-            // Commits in first-seen order; a series missing a commit gets a gap.
+            // Commits by commit date, so backfilled releases land in order;
+            // a series missing a commit gets a gap.
             const commits = [];
             const commitIndex = new Map();
             for (const points of seriesMap.values()) {
@@ -204,6 +205,8 @@
                 }
               }
             }
+            commits.sort((a, b) => Date.parse(a.commit.timestamp) - Date.parse(b.commit.timestamp));
+            commits.forEach((point, i) => commitIndex.set(point.commit.id, i));
 
             let fallback = 0;
             const datasets = [];
