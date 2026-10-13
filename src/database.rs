@@ -1042,14 +1042,47 @@ pub enum KeyId {
 }
 
 // Custom key structure for efficient indexing
-#[derive(
-    serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug,
-)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct KeyStruct {
     pub project_id: String,
     pub database_id: String,
     pub namespace: String,
     pub path_elements: Vec<(String, KeyId)>, // (kind, id/name)
+}
+
+/// Path first, partition as the tie-break. Every candidate stream is
+/// filtered to one partition before its order matters, so within a
+/// partition this is the `__key__` order of `compare_keys`, and the three
+/// partition strings (usually equal) are not compared on every lookup.
+impl Ord for KeyStruct {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path_elements
+            .cmp(&other.path_elements)
+            .then_with(|| cmp_str(&self.project_id, &other.project_id))
+            .then_with(|| cmp_str(&self.database_id, &other.database_id))
+            .then_with(|| cmp_str(&self.namespace, &other.namespace))
+    }
+}
+
+impl PartialOrd for KeyStruct {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `str::cmp` without the `memcmp` call when either side is empty, which
+/// the database and namespace of most keys are.
+/// `a == b` without the `memcmp` call when both are empty.
+fn same_partition_field(a: &str, b: &str) -> bool {
+    a.len() == b.len() && (a.is_empty() || a == b)
+}
+
+fn cmp_str(a: &str, b: &str) -> Ordering {
+    if a.is_empty() || b.is_empty() {
+        a.len().cmp(&b.len())
+    } else {
+        a.cmp(b)
+    }
 }
 
 impl KeyStruct {
@@ -1161,6 +1194,11 @@ fn compare_keys(a: &Key, b: &Key) -> Ordering {
             )
         })
     }
+    fn compare_partitions(a: (&str, &str, &str), b: (&str, &str, &str)) -> Ordering {
+        cmp_str(a.0, b.0)
+            .then_with(|| cmp_str(a.1, b.1))
+            .then_with(|| cmp_str(a.2, b.2))
+    }
     // `Ok` (integer id) sorts before `Err` (name), like `KeyId`.
     fn path(key: &Key) -> impl Iterator<Item = (&str, Result<i64, &str>)> {
         key.path.iter().filter_map(|element| {
@@ -1172,9 +1210,7 @@ fn compare_keys(a: &Key, b: &Key) -> Ordering {
         })
     }
 
-    partition(a)
-        .cmp(&partition(b))
-        .then_with(|| path(a).cmp(path(b)))
+    compare_partitions(partition(a), partition(b)).then_with(|| path(a).cmp(path(b)))
 }
 
 fn compare_candidate_keys(a: &QueryCandidate, b: &QueryCandidate) -> Ordering {
@@ -1823,8 +1859,8 @@ impl DatastoreStorage {
             .filter(move |key| {
                 let key_struct = key.borrow();
                 key_struct.project_id == project_id_filter
-                    && key_struct.database_id == database_id
-                    && key_struct.namespace == namespace
+                    && same_partition_field(&key_struct.database_id, database_id)
+                    && same_partition_field(&key_struct.namespace, namespace)
                     && key_struct
                         .path_elements
                         .last()
@@ -2537,8 +2573,8 @@ impl DatastoreStorage {
                 let mut unique_kinds = HashSet::new();
                 for key_struct in self.entities.keys() {
                     if key_struct.project_id == project_id
-                        && key_struct.database_id == database_id
-                        && key_struct.namespace == namespace
+                        && same_partition_field(&key_struct.database_id, database_id)
+                        && same_partition_field(&key_struct.namespace, namespace)
                         && let Some((kind, _)) = key_struct.path_elements.last()
                     {
                         unique_kinds.insert((
@@ -2709,8 +2745,8 @@ impl DatastoreStorage {
             .iter()
             .filter(move |(key_struct, _)| {
                 key_struct.project_id == project_id_filter
-                    && key_struct.database_id == database_id
-                    && key_struct.namespace == namespace
+                    && same_partition_field(&key_struct.database_id, database_id)
+                    && same_partition_field(&key_struct.namespace, namespace)
             })
             .map(|(_, entity_metadata)| QueryCandidate {
                 entity_metadata: Arc::clone(entity_metadata),
@@ -2796,8 +2832,8 @@ impl DatastoreStorage {
                     scoped_entities
                         .iter()
                         .filter(move |(key_struct, _)| {
-                            key_struct.database_id == database_id
-                                && key_struct.namespace == namespace
+                            same_partition_field(&key_struct.database_id, database_id)
+                                && same_partition_field(&key_struct.namespace, namespace)
                         })
                         .filter(move |(_, entity_metadata)| matches(entity_metadata))
                         .map(move |(_, entity_metadata)| to_candidate(entity_metadata)),
@@ -2810,8 +2846,8 @@ impl DatastoreStorage {
                         .iter()
                         .filter(move |(key_struct, _)| {
                             key_struct.project_id == project_id_filter
-                                && key_struct.database_id == database_id
-                                && key_struct.namespace == namespace
+                                && same_partition_field(&key_struct.database_id, database_id)
+                                && same_partition_field(&key_struct.namespace, namespace)
                                 && key_struct
                                     .path_elements
                                     .last()
@@ -3596,6 +3632,43 @@ mod tests {
                 .get_entity(&key_in_database("db2", "Kind", "one"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn key_struct_order_matches_compare_keys_within_a_partition() {
+        let mut keys: Vec<Key> = ["Kind", "Alpha", "Kind", "Zeta"]
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| key_in_database("db1", kind, &format!("n{}", 3 - i)))
+            .collect();
+        keys.push(Key {
+            path: vec![
+                PathElement {
+                    kind: "Kind".to_string(),
+                    id_type: Some(IdType::Name("n0".to_string())),
+                },
+                PathElement {
+                    kind: "Child".to_string(),
+                    id_type: Some(IdType::Id(7)),
+                },
+            ],
+            ..key_in_database("db1", "Kind", "n0")
+        });
+
+        let mut by_struct = keys.clone();
+        by_struct.sort_by_key(KeyStruct::from_datastore_key);
+        let mut by_compare = keys.clone();
+        by_compare.sort_by(compare_keys);
+
+        assert_eq!(by_struct, by_compare);
+    }
+
+    #[test]
+    fn compare_keys_sorts_an_empty_partition_field_first() {
+        let default = key_in_database("", "Kind", "one");
+        let named = key_in_database("db1", "Kind", "one");
+        assert_eq!(compare_keys(&default, &named), Ordering::Less);
+        assert_eq!(compare_keys(&named, &default), Ordering::Greater);
     }
 
     #[test]
