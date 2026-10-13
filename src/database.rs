@@ -246,10 +246,16 @@ fn push_indexable_value(buf: &mut Vec<u8>, value_type: &ValueType) -> bool {
         }
         ValueType::KeyValue(key) => {
             buf.extend_from_slice(b"k:");
-            let (project_id, namespace) = key.partition_id.as_ref().map_or(("", ""), |p| {
-                (p.project_id.as_str(), p.namespace_id.as_str())
-            });
+            let (project_id, database_id, namespace) =
+                key.partition_id.as_ref().map_or(("", "", ""), |p| {
+                    (
+                        p.project_id.as_str(),
+                        p.database_id.as_str(),
+                        p.namespace_id.as_str(),
+                    )
+                });
             push_len_prefixed(buf, project_id);
+            push_len_prefixed(buf, database_id);
             push_len_prefixed(buf, namespace);
             for element in &key.path {
                 match &element.id_type {
@@ -763,31 +769,33 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
         .collect()
 }
 
-fn rewrite_key_project_id(key: &mut Key, project_id: &str) {
+fn rewrite_key_partition(key: &mut Key, rewrite: &dyn Fn(&mut PartitionId)) {
     if let Some(partition) = key.partition_id.as_mut() {
-        partition.project_id = project_id.to_string();
+        rewrite(partition);
     }
 }
 
-fn rewrite_value_project_id(value: &mut Value, project_id: &str) {
+fn rewrite_value_partition(value: &mut Value, rewrite: &dyn Fn(&mut PartitionId)) {
     match value.value_type.as_mut() {
-        Some(ValueType::KeyValue(key)) => rewrite_key_project_id(key, project_id),
+        Some(ValueType::KeyValue(key)) => rewrite_key_partition(key, rewrite),
         Some(ValueType::ArrayValue(array)) => {
             for value in array.values.iter_mut() {
-                rewrite_value_project_id(value, project_id);
+                rewrite_value_partition(value, rewrite);
             }
         }
-        Some(ValueType::EntityValue(entity)) => rewrite_entity_project_id(entity, project_id),
+        Some(ValueType::EntityValue(entity)) => rewrite_entity_partition(entity, rewrite),
         _ => {}
     }
 }
 
-fn rewrite_entity_project_id(entity: &mut Entity, project_id: &str) {
+/// Apply `rewrite` to the entity key and to every key-valued property,
+/// nested entities included.
+fn rewrite_entity_partition(entity: &mut Entity, rewrite: &dyn Fn(&mut PartitionId)) {
     if let Some(key) = entity.key.as_mut() {
-        rewrite_key_project_id(key, project_id);
+        rewrite_key_partition(key, rewrite);
     }
     for value in entity.properties.values_mut() {
-        rewrite_value_project_id(value, project_id);
+        rewrite_value_partition(value, rewrite);
     }
 }
 
@@ -905,6 +913,7 @@ pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExport
 pub fn prepare_dump_for_project(
     path: &str,
     target_project_id: Option<&str>,
+    target_database_id: Option<&str>,
 ) -> Result<Vec<EntityWithMetadata>, tonic::Status> {
     let dump_entities = read_dump(path).map_err(|e| {
         tonic::Status::invalid_argument(format!("Failed to read datastore export: {}", e))
@@ -912,7 +921,14 @@ pub fn prepare_dump_for_project(
     let mut entities_with_metadata = converter_dump(dump_entities);
     if let Some(project_id) = target_project_id {
         for ewm in entities_with_metadata.iter_mut() {
-            rewrite_entity_project_id(&mut ewm.entity, project_id);
+            rewrite_entity_partition(&mut ewm.entity, &|p| p.project_id = project_id.to_string());
+        }
+    }
+    if let Some(database_id) = target_database_id {
+        for ewm in entities_with_metadata.iter_mut() {
+            rewrite_entity_partition(&mut ewm.entity, &|p| {
+                p.database_id = database_id.to_string()
+            });
         }
     }
     tracing::info!(
@@ -1026,13 +1042,87 @@ pub enum KeyId {
 }
 
 // Custom key structure for efficient indexing
-#[derive(
-    serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug,
-)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct KeyStruct {
     pub project_id: String,
+    pub database_id: String,
     pub namespace: String,
     pub path_elements: Vec<(String, KeyId)>, // (kind, id/name)
+}
+
+/// Path first, partition as the tie-break. Every candidate stream is
+/// filtered to one partition before its order matters, so within a
+/// partition this is the `__key__` order of `compare_keys`, and the three
+/// partition strings (usually equal) are not compared on every lookup.
+impl Ord for KeyStruct {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.path_elements
+            .cmp(&other.path_elements)
+            .then_with(|| cmp_str(&self.project_id, &other.project_id))
+            .then_with(|| cmp_str(&self.database_id, &other.database_id))
+            .then_with(|| cmp_str(&self.namespace, &other.namespace))
+    }
+}
+
+impl PartialOrd for KeyStruct {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `str::cmp` without the `memcmp` call when either side is empty, which
+/// the database and namespace of most keys are.
+/// The data file starts with this header followed by a version byte. A file
+/// without it was written before keys carried a database id: the earlier
+/// layout, a map keyed by (project_id, namespace, path_elements). 0xFF never
+/// starts a bincode varint, so the two cannot be confused.
+const DATA_FILE_HEADER: [u8; 4] = [0xFF, b'D', b'S', b'E'];
+/// Version 2 stores the entities only; the key is rebuilt from each entity.
+const DATA_FILE_VERSION: u8 = 2;
+
+type LegacyKey = (String, String, Vec<(String, KeyId)>);
+
+fn decode_data_file(buffer: &[u8], path: &str) -> std::io::Result<Vec<EntityWithMetadata>> {
+    let invalid =
+        |e: bincode::error::DecodeError| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    let config = bincode::config::standard();
+    let Some(payload) = buffer.strip_prefix(&DATA_FILE_HEADER) else {
+        tracing::info!(
+            "Data file '{}' predates database ids; reading the earlier layout.",
+            path
+        );
+        let (legacy, _): (Vec<(LegacyKey, EntityWithMetadata)>, _) =
+            bincode::serde::decode_from_slice(buffer, config).map_err(invalid)?;
+        return Ok(legacy.into_iter().map(|(_, metadata)| metadata).collect());
+    };
+    match payload.split_first() {
+        Some((&DATA_FILE_VERSION, payload)) => {
+            let (entities, _) =
+                bincode::serde::decode_from_slice(payload, config).map_err(invalid)?;
+            Ok(entities)
+        }
+        Some((version, _)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported data file version {version}"),
+        )),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated data file header",
+        )),
+    }
+}
+
+/// `a == b` without the `memcmp` call when both are empty.
+fn same_partition_field(a: &str, b: &str) -> bool {
+    a.len() == b.len() && (a.is_empty() || a == b)
+}
+
+fn cmp_str(a: &str, b: &str) -> Ordering {
+    if a.is_empty() || b.is_empty() {
+        a.len().cmp(&b.len())
+    } else {
+        a.cmp(b)
+    }
 }
 
 impl KeyStruct {
@@ -1052,6 +1142,10 @@ impl KeyStruct {
                 .partition_id
                 .as_ref()
                 .map_or_else(|| "".to_string(), |p| p.project_id.clone()),
+            database_id: key
+                .partition_id
+                .as_ref()
+                .map_or_else(|| "".to_string(), |p| p.database_id.clone()),
             namespace: key
                 .partition_id
                 .as_ref()
@@ -1131,10 +1225,19 @@ impl QueryCandidate {
 
 /// Same order as `KeyStruct`'s `Ord`, without building a `KeyStruct`.
 fn compare_keys(a: &Key, b: &Key) -> Ordering {
-    fn partition(key: &Key) -> (&str, &str) {
-        key.partition_id.as_ref().map_or(("", ""), |p| {
-            (p.project_id.as_str(), p.namespace_id.as_str())
+    fn partition(key: &Key) -> (&str, &str, &str) {
+        key.partition_id.as_ref().map_or(("", "", ""), |p| {
+            (
+                p.project_id.as_str(),
+                p.database_id.as_str(),
+                p.namespace_id.as_str(),
+            )
         })
+    }
+    fn compare_partitions(a: (&str, &str, &str), b: (&str, &str, &str)) -> Ordering {
+        cmp_str(a.0, b.0)
+            .then_with(|| cmp_str(a.1, b.1))
+            .then_with(|| cmp_str(a.2, b.2))
     }
     // `Ok` (integer id) sorts before `Err` (name), like `KeyId`.
     fn path(key: &Key) -> impl Iterator<Item = (&str, Result<i64, &str>)> {
@@ -1147,9 +1250,7 @@ fn compare_keys(a: &Key, b: &Key) -> Ordering {
         })
     }
 
-    partition(a)
-        .cmp(&partition(b))
-        .then_with(|| path(a).cmp(path(b)))
+    compare_partitions(partition(a), partition(b)).then_with(|| path(a).cmp(path(b)))
 }
 
 fn compare_candidate_keys(a: &QueryCandidate, b: &QueryCandidate) -> Ordering {
@@ -1787,6 +1888,7 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         keys: impl IntoIterator<Item = K> + 'a,
     ) -> impl Iterator<Item = QueryCandidate> + 'a {
@@ -1797,7 +1899,8 @@ impl DatastoreStorage {
             .filter(move |key| {
                 let key_struct = key.borrow();
                 key_struct.project_id == project_id_filter
-                    && key_struct.namespace == namespace
+                    && same_partition_field(&key_struct.database_id, database_id)
+                    && same_partition_field(&key_struct.namespace, namespace)
                     && key_struct
                         .path_elements
                         .last()
@@ -1818,6 +1921,7 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         filter_type: &'a FilterType,
     ) -> Option<Box<dyn Iterator<Item = QueryCandidate> + 'a>> {
@@ -1837,6 +1941,7 @@ impl DatastoreStorage {
             };
             let ancestor_key_struct = KeyStruct::from_datastore_key(key);
             if ancestor_key_struct.project_id != project_id_filter
+                || ancestor_key_struct.database_id != database_id
                 || ancestor_key_struct.path_elements.is_empty()
             {
                 return Some(Box::new(std::iter::empty()));
@@ -1856,6 +1961,7 @@ impl DatastoreStorage {
             let descendants = self.candidates_from_index_keys(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 self.ancestor_index
                     .get(&index_key)
@@ -1867,6 +1973,7 @@ impl DatastoreStorage {
             let ancestor_itself = self.candidates_from_index_keys(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 std::iter::once(ancestor_key_struct),
             );
@@ -1886,6 +1993,7 @@ impl DatastoreStorage {
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     keys.iter().map(Arc::as_ref),
                 )))
@@ -1900,6 +2008,7 @@ impl DatastoreStorage {
                 Some(Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     unique_keys,
                 )))
@@ -2141,15 +2250,15 @@ impl DatastoreStorage {
             return Ok(());
         }
 
-        // Deserialize the buffer directly into the BTreeMap
-        let (entities, _): (BTreeMap<KeyStruct, EntityWithMetadata>, _) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let entities = decode_data_file(&buffer, path)?;
 
         tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
         self.entities = entities
             .into_iter()
-            .map(|(key, metadata)| (Arc::new(key), Arc::new(metadata)))
+            .filter_map(|metadata| {
+                let key = KeyStruct::from_datastore_key(metadata.entity.key.as_ref()?);
+                Some((Arc::new(key), Arc::new(metadata)))
+            })
             .collect();
 
         // Bulk rebuild indexes
@@ -2187,19 +2296,18 @@ impl DatastoreStorage {
     pub fn save_to_disk(&self, path: &str) -> std::io::Result<()> {
         tracing::info!("Saving {} entities to '{}'...", self.entities.len(), path);
 
-        // Serialize the whole BTreeMap
-        let entities: BTreeMap<KeyStruct, EntityWithMetadata> = self
+        let entities: Vec<&EntityWithMetadata> = self
             .entities
-            .iter()
-            .map(|(key, metadata)| (KeyStruct::clone(key), metadata.as_ref().clone()))
+            .values()
+            .map(|metadata| metadata.as_ref())
             .collect();
-
-        let buffer = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
             .map_err(std::io::Error::other)?;
 
-        // Write the serialized buffer to the file
         let mut file = std::fs::File::create(path)?;
-        file.write_all(&buffer)?;
+        file.write_all(&DATA_FILE_HEADER)?;
+        file.write_all(&[DATA_FILE_VERSION])?;
+        file.write_all(&payload)?;
         tracing::info!("Data saved successfully.");
         Ok(())
     }
@@ -2223,7 +2331,7 @@ impl DatastoreStorage {
         path: &str,
         target_project_id: Option<&str>,
     ) -> Result<(), tonic::Status> {
-        self.insert_imported(prepare_dump_for_project(path, target_project_id)?)
+        self.insert_imported(prepare_dump_for_project(path, target_project_id, None)?)
     }
 
     /// Store entities prepared by `prepare_dump_for_project`.
@@ -2494,6 +2602,7 @@ impl DatastoreStorage {
         &self,
         metadata_key: &str,
         project_id: &str,
+        database_id: &str,
         namespace: &str,
     ) -> Vec<EntityWithMetadata> {
         let mut results = Vec::new();
@@ -2503,7 +2612,8 @@ impl DatastoreStorage {
                 let mut unique_kinds = HashSet::new();
                 for key_struct in self.entities.keys() {
                     if key_struct.project_id == project_id
-                        && key_struct.namespace == namespace
+                        && same_partition_field(&key_struct.database_id, database_id)
+                        && same_partition_field(&key_struct.namespace, namespace)
                         && let Some((kind, _)) = key_struct.path_elements.last()
                     {
                         unique_kinds.insert((
@@ -2526,7 +2636,7 @@ impl DatastoreStorage {
                                 partition_id: Some(PartitionId {
                                     project_id,
                                     namespace_id: namespace,
-                                    database_id: "".to_string(),
+                                    database_id: database_id.to_string(),
                                 }),
                                 path: vec![PathElement {
                                     kind: "__kind__".to_string(),
@@ -2540,7 +2650,8 @@ impl DatastoreStorage {
             "__namespace__" => {
                 let mut unique_namespaces = HashSet::new();
                 for key_struct in self.entities.keys() {
-                    if key_struct.project_id == project_id {
+                    if key_struct.project_id == project_id && key_struct.database_id == database_id
+                    {
                         unique_namespaces.insert(key_struct.namespace.clone());
                     }
                 }
@@ -2563,7 +2674,7 @@ impl DatastoreStorage {
                                     partition_id: Some(PartitionId {
                                         project_id: project_id.to_string(),
                                         namespace_id: "".to_string(),
-                                        database_id: "".to_string(),
+                                        database_id: database_id.to_string(),
                                     }),
                                     path: vec![PathElement {
                                         kind: "__namespace__".to_string(),
@@ -2581,7 +2692,10 @@ impl DatastoreStorage {
                     HashMap::new();
 
                 for (key_struct, entity_meta) in &self.entities {
-                    if key_struct.project_id != project_id || key_struct.namespace != namespace {
+                    if key_struct.project_id != project_id
+                        || key_struct.database_id != database_id
+                        || key_struct.namespace != namespace
+                    {
                         continue;
                     }
                     if let Some((kind, _)) = key_struct.path_elements.last() {
@@ -2608,7 +2722,7 @@ impl DatastoreStorage {
                             partition_id: Some(PartitionId {
                                 project_id: project_id.to_string(),
                                 namespace_id: namespace,
-                                database_id: "".to_string(),
+                                database_id: database_id.to_string(),
                             }),
                             path: vec![
                                 PathElement {
@@ -2663,12 +2777,15 @@ impl DatastoreStorage {
     pub(crate) fn kindless_candidates<'a>(
         &'a self,
         project_id_filter: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
     ) -> impl Iterator<Item = QueryCandidate> + 'a {
         self.entities
             .iter()
             .filter(move |(key_struct, _)| {
-                key_struct.project_id == project_id_filter && key_struct.namespace == namespace
+                key_struct.project_id == project_id_filter
+                    && same_partition_field(&key_struct.database_id, database_id)
+                    && same_partition_field(&key_struct.namespace, namespace)
             })
             .map(|(_, entity_metadata)| QueryCandidate {
                 entity_metadata: Arc::clone(entity_metadata),
@@ -2682,12 +2799,13 @@ impl DatastoreStorage {
         &'a self,
         project_id_filter: &'a str,
         kind_name: &'a str,
+        database_id: &'a str,
         namespace: &'a str,
         filter_type: Option<&'a FilterType>,
     ) -> (Box<dyn Iterator<Item = QueryCandidate> + 'a>, bool) {
         if METADATA_KINDS.contains(&kind_name) {
             let mut candidates: Vec<QueryCandidate> = self
-                .get_metadata(kind_name, project_id_filter, namespace)
+                .get_metadata(kind_name, project_id_filter, database_id, namespace)
                 .into_iter()
                 .map(|metadata| QueryCandidate {
                     entity_metadata: Arc::new(metadata),
@@ -2702,6 +2820,7 @@ impl DatastoreStorage {
             && let Some(candidates) = self.query_simple_index_candidates(
                 project_id_filter,
                 kind_name,
+                database_id,
                 namespace,
                 filter_type,
             )
@@ -2718,6 +2837,7 @@ impl DatastoreStorage {
                 Box::new(self.candidates_from_index_keys(
                     project_id_filter,
                     kind_name,
+                    database_id,
                     namespace,
                     candidate_keys,
                 )),
@@ -2750,7 +2870,10 @@ impl DatastoreStorage {
                 Box::new(
                     scoped_entities
                         .iter()
-                        .filter(move |(key_struct, _)| key_struct.namespace == namespace)
+                        .filter(move |(key_struct, _)| {
+                            same_partition_field(&key_struct.database_id, database_id)
+                                && same_partition_field(&key_struct.namespace, namespace)
+                        })
                         .filter(move |(_, entity_metadata)| matches(entity_metadata))
                         .map(move |(_, entity_metadata)| to_candidate(entity_metadata)),
                 )
@@ -2762,7 +2885,8 @@ impl DatastoreStorage {
                         .iter()
                         .filter(move |(key_struct, _)| {
                             key_struct.project_id == project_id_filter
-                                && key_struct.namespace == namespace
+                                && same_partition_field(&key_struct.database_id, database_id)
+                                && same_partition_field(&key_struct.namespace, namespace)
                                 && key_struct
                                     .path_elements
                                     .last()
@@ -3065,6 +3189,7 @@ impl DatastoreStorage {
         &self,
         project_id_filter: String,
         kind_name: String,
+        database_id: String,
         namespace: String,
         filter: Option<Filter>,
         limit: Option<i32>,
@@ -3079,6 +3204,7 @@ impl DatastoreStorage {
         let (candidates, candidates_prefiltered) = self.query_candidates(
             &project_id_filter,
             &kind_name,
+            &database_id,
             &namespace,
             filter_type.as_ref(),
         );
@@ -3201,6 +3327,7 @@ impl DatastoreStorage {
         for ancestor_len in 1..key_struct.path_elements.len() {
             let ancestor_key = KeyStruct {
                 project_id: key_struct.project_id.clone(),
+                database_id: key_struct.database_id.clone(),
                 namespace: key_struct.namespace.clone(),
                 path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
             };
@@ -3231,6 +3358,7 @@ impl DatastoreStorage {
         for ancestor_len in 1..key_struct.path_elements.len() {
             let ancestor_key = KeyStruct {
                 project_id: key_struct.project_id.clone(),
+                database_id: key_struct.database_id.clone(),
                 namespace: key_struct.namespace.clone(),
                 path_elements: key_struct.path_elements[..ancestor_len].to_vec(),
             };
@@ -3476,8 +3604,272 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let filter = equals_filter("nested.field", str_value("x"));
-        let (candidates, _) = loaded.query_candidates("p", "Kind", "", Some(&filter));
+        let (candidates, _) = loaded.query_candidates("p", "Kind", "", "", Some(&filter));
         assert_eq!(candidates.count(), 1);
+    }
+
+    fn key_in_database(database_id: &str, kind: &str, name: &str) -> Key {
+        Key {
+            partition_id: Some(PartitionId {
+                project_id: "p".to_string(),
+                database_id: database_id.to_string(),
+                namespace_id: String::new(),
+            }),
+            path: vec![PathElement {
+                kind: kind.to_string(),
+                id_type: Some(IdType::Name(name.to_string())),
+            }],
+        }
+    }
+
+    fn entity_in_database(
+        database_id: &str,
+        kind: &str,
+        name: &str,
+        props: Vec<(&str, Value)>,
+    ) -> Entity {
+        Entity {
+            key: Some(key_in_database(database_id, kind, name)),
+            properties: props.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
+
+    fn key_value(key: Key) -> Value {
+        Value {
+            value_type: Some(ValueType::KeyValue(key)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entities_with_the_same_path_in_different_databases_are_distinct() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("db", str_value("default"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "one",
+                vec![("db", str_value("db1"))],
+            ))
+            .unwrap();
+
+        assert_eq!(storage.entities.len(), 2);
+        let found = storage
+            .get_entity(&key_in_database("db1", "Kind", "one"))
+            .unwrap();
+        assert_eq!(found.entity.properties["db"], str_value("db1"));
+        assert!(
+            storage
+                .get_entity(&key_in_database("db2", "Kind", "one"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn key_struct_order_matches_compare_keys_within_a_partition() {
+        let mut keys: Vec<Key> = ["Kind", "Alpha", "Kind", "Zeta"]
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| key_in_database("db1", kind, &format!("n{}", 3 - i)))
+            .collect();
+        keys.push(Key {
+            path: vec![
+                PathElement {
+                    kind: "Kind".to_string(),
+                    id_type: Some(IdType::Name("n0".to_string())),
+                },
+                PathElement {
+                    kind: "Child".to_string(),
+                    id_type: Some(IdType::Id(7)),
+                },
+            ],
+            ..key_in_database("db1", "Kind", "n0")
+        });
+
+        let mut by_struct = keys.clone();
+        by_struct.sort_by_key(KeyStruct::from_datastore_key);
+        let mut by_compare = keys.clone();
+        by_compare.sort_by(compare_keys);
+
+        assert_eq!(by_struct, by_compare);
+    }
+
+    #[test]
+    fn compare_keys_sorts_an_empty_partition_field_first() {
+        let default = key_in_database("", "Kind", "one");
+        let named = key_in_database("db1", "Kind", "one");
+        assert_eq!(compare_keys(&default, &named), Ordering::Less);
+        assert_eq!(compare_keys(&named, &default), Ordering::Greater);
+    }
+
+    /// `datastore.bin` files written before `KeyStruct` had a `database_id`
+    /// encode the key as (project_id, namespace, path_elements).
+    #[test]
+    fn load_from_disk_reads_a_file_written_before_database_id() {
+        let entity = entity_in_database("", "Kind", "one", vec![("a", int_value(1))]);
+        let legacy_key = (
+            "p".to_string(),
+            String::new(),
+            vec![("Kind".to_string(), KeyId::StringId("one".to_string()))],
+        );
+        let legacy: BTreeMap<_, _> = [(
+            legacy_key,
+            EntityWithMetadata {
+                entity: entity.clone(),
+                version: 1,
+                create_time: pbjson_types::Timestamp::default(),
+                update_time: pbjson_types::Timestamp::default(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let bytes = bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("datastore-legacy-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut storage = DatastoreStorage::default();
+        storage.load_from_disk(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(storage.entities.len(), 1);
+        let loaded = storage
+            .get_entity(&key_in_database("", "Kind", "one"))
+            .unwrap();
+        assert_eq!(loaded.entity.properties["a"], int_value(1));
+    }
+
+    #[test]
+    fn save_to_disk_round_trips_named_databases() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("db", str_value("default"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "one",
+                vec![("db", str_value("db1"))],
+            ))
+            .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("datastore-named-{}.bin", uuid::Uuid::new_v4()));
+        storage.save_to_disk(path.to_str().unwrap()).unwrap();
+
+        let mut loaded = DatastoreStorage::default();
+        loaded.load_from_disk(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.entities.len(), 2);
+        let named = loaded
+            .get_entity(&key_in_database("db1", "Kind", "one"))
+            .unwrap();
+        assert_eq!(named.entity.properties["db"], str_value("db1"));
+        let (candidates, _) = loaded.query_candidates("p", "Kind", "db1", "", None);
+        assert_eq!(names(candidates), vec!["one"]);
+    }
+
+    #[test]
+    fn compare_keys_distinguishes_databases() {
+        let default = key_in_database("", "Kind", "one");
+        let named = key_in_database("db1", "Kind", "one");
+        assert_ne!(compare_keys(&default, &named), Ordering::Equal);
+    }
+
+    #[test]
+    fn key_values_in_different_databases_index_differently() {
+        let default = index_keys_for_value(
+            "Kind",
+            "ref",
+            &key_value(key_in_database("", "Kind", "one")),
+        );
+        let named = index_keys_for_value(
+            "Kind",
+            "ref",
+            &key_value(key_in_database("db1", "Kind", "one")),
+        );
+        assert_ne!(default, named);
+    }
+
+    fn names(candidates: impl Iterator<Item = QueryCandidate>) -> Vec<String> {
+        candidates
+            .filter_map(|c| {
+                let key = c.entity_metadata.entity.key.clone()?;
+                match key.path.last()?.id_type.clone()? {
+                    IdType::Name(name) => Some(name),
+                    IdType::Id(id) => Some(id.to_string()),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn query_candidates_only_see_the_requested_database() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("tag", str_value("x"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "two",
+                vec![("tag", str_value("x"))],
+            ))
+            .unwrap();
+
+        let filter = equals_filter("tag", str_value("x"));
+        let (indexed, _) = storage.query_candidates("p", "Kind", "db1", "", Some(&filter));
+        assert_eq!(names(indexed), vec!["two"]);
+        let (scanned, _) = storage.query_candidates("p", "Kind", "db1", "", None);
+        assert_eq!(names(scanned), vec!["two"]);
+        assert_eq!(
+            names(storage.kindless_candidates("p", "db1", "")),
+            vec!["two"]
+        );
+    }
+
+    #[test]
+    fn metadata_kinds_are_scoped_to_the_database_and_carry_it() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database("db1", "Kind", "one", vec![]))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database("", "Other", "one", vec![]))
+            .unwrap();
+
+        let (kinds, _) = storage.query_candidates("p", "__kind__", "db1", "", None);
+        let kinds: Vec<QueryCandidate> = kinds.collect();
+        let keys: Vec<&Key> = kinds
+            .iter()
+            .filter_map(|c| c.entity_metadata.entity.key.as_ref())
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].path[0].id_type,
+            Some(IdType::Name("Kind".to_string()))
+        );
+        assert_eq!(keys[0].partition_id.as_ref().unwrap().database_id, "db1");
     }
 
     #[test]
@@ -3494,11 +3886,11 @@ mod tests {
             .unwrap();
 
         let hidden = equals_filter("tags", str_value("a"));
-        let (hidden, _) = storage.query_candidates("p", "Kind", "", Some(&hidden));
+        let (hidden, _) = storage.query_candidates("p", "Kind", "", "", Some(&hidden));
         assert_eq!(hidden.count(), 0);
 
         let visible = equals_filter("tags", str_value("b"));
-        let (visible, _) = storage.query_candidates("p", "Kind", "", Some(&visible));
+        let (visible, _) = storage.query_candidates("p", "Kind", "", "", Some(&visible));
         assert_eq!(visible.count(), 1);
     }
 
@@ -3867,7 +4259,7 @@ mod tests {
         write_minimal_export(&root, entity);
 
         let prepared =
-            prepare_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT)).unwrap();
+            prepare_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT), None).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(key_project_id(&prepared[0].entity), LOCAL_PROJECT);
@@ -3880,10 +4272,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_dump_for_project_rewrites_the_database_id() {
+        let root = temp_export_root();
+        let mut entity = legacy_entity(SOURCE_PROJECT, "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            SOURCE_PROJECT,
+            "Owner",
+            "owner-one",
+        ));
+        write_minimal_export(&root, entity);
+
+        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None, Some("db1")).unwrap();
+
+        let entity = &prepared[0].entity;
+        let key = entity.key.as_ref().unwrap();
+        assert_eq!(key.partition_id.as_ref().unwrap().database_id, "db1");
+        let Some(ValueType::KeyValue(owner)) = entity.properties["owner"].value_type.as_ref()
+        else {
+            panic!("owner is a key");
+        };
+        assert_eq!(owner.partition_id.as_ref().unwrap().database_id, "db1");
+        assert_eq!(key_project_id(entity), SOURCE_PROJECT);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn insert_imported_stores_prepared_entities() {
         let root = temp_export_root();
         write_minimal_export(&root, legacy_entity(SOURCE_PROJECT, "Task", "one"));
-        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None).unwrap();
+        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None, None).unwrap();
 
         let mut storage = DatastoreStorage::default();
         storage.insert_imported(prepared).unwrap();

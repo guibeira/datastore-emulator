@@ -161,6 +161,21 @@ fn check_transactional_preconditions(
     Ok(())
 }
 
+/// Every key and partition in a request must name the request's database,
+/// like Cloud Datastore.
+fn check_request_database(
+    request_database: &str,
+    partition: Option<&crate::google::datastore::v1::PartitionId>,
+) -> Result<(), Status> {
+    let database = partition.map_or("", |p| p.database_id.as_str());
+    if database == request_database {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(format!(
+        "mismatched databases within request: {request_database:?} vs. {database:?}"
+    )))
+}
+
 fn has_duplicate_complete_key(mutations: &[Mutation]) -> bool {
     let mut seen = HashSet::new();
     mutations
@@ -269,6 +284,9 @@ pub async fn lookup(
         req.keys,
         req.read_options
     );
+    for key in &req.keys {
+        check_request_database(&req.database_id, key.partition_id.as_ref())?;
+    }
     let storage = storage.read();
     let mut found = Vec::new();
     let mut missing = Vec::new();
@@ -353,6 +371,7 @@ pub async fn run_query(
         .filter
         .as_ref()
         .and_then(|f| f.filter_type.clone());
+    check_request_database(&req.database_id, req.partition_id.as_ref())?;
     let namespace = req
         .partition_id
         .as_ref()
@@ -366,11 +385,15 @@ pub async fn run_query(
         Box<dyn Iterator<Item = QueryCandidate> + '_>,
         bool,
     ) = match query_obj.kind.first() {
-        Some(kind) => {
-            storage.query_candidates(&req.project_id, &kind.name, namespace, filter_type.as_ref())
-        }
+        Some(kind) => storage.query_candidates(
+            &req.project_id,
+            &kind.name,
+            &req.database_id,
+            namespace,
+            filter_type.as_ref(),
+        ),
         None => (
-            Box::new(storage.kindless_candidates(&req.project_id, namespace)),
+            Box::new(storage.kindless_candidates(&req.project_id, &req.database_id, namespace)),
             false,
         ),
     };
@@ -469,6 +492,8 @@ pub async fn commit(
     for mutation in &req.mutations {
         if let Some(operation) = mutation.operation.as_ref() {
             validate_mutation(operation)?;
+            let partition = mutation_key(operation).and_then(|key| key.partition_id.as_ref());
+            check_request_database(&req.database_id, partition)?;
         }
     }
     if is_non_transactional && has_duplicate_complete_key(&req.mutations) {
@@ -655,6 +680,7 @@ pub async fn allocate_ids(
             return Err(Status::invalid_argument("Key path cannot be empty"));
         }
         validate_allocate_ids_path(&incomplete_key)?;
+        check_request_database(&req.database_id, incomplete_key.partition_id.as_ref())?;
 
         let mut new_key = incomplete_key.clone();
         let mut allocated_id: Option<i64> = None;
@@ -686,6 +712,7 @@ pub async fn reserve_ids(
         if key.path.is_empty() {
             return Err(Status::invalid_argument("Key path cannot be empty"));
         }
+        check_request_database(&req.database_id, key.partition_id.as_ref())?;
         storage.observe_key_id(key);
     }
     Ok(ReserveIdsResponse {})
@@ -750,6 +777,7 @@ pub async fn run_aggregation_query(
 ) -> Result<RunAggregationQueryResponse, Status> {
     let explain_requested = req.explain_options.is_some();
     let start = explain_requested.then(Instant::now);
+    check_request_database(&req.database_id, req.partition_id.as_ref())?;
     let namespace = req
         .partition_id
         .as_ref()
@@ -802,12 +830,17 @@ pub async fn run_aggregation_query(
                 Some(kind) => storage.query_candidates(
                     &req.project_id,
                     &kind.name,
+                    &req.database_id,
                     namespace,
                     filter_type.as_ref(),
                 ),
                 // An empty kind list is a kindless query over the whole namespace.
                 None => (
-                    Box::new(storage.kindless_candidates(&req.project_id, namespace)),
+                    Box::new(storage.kindless_candidates(
+                        &req.project_id,
+                        &req.database_id,
+                        namespace,
+                    )),
                     false,
                 ),
             };
