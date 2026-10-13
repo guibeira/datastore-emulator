@@ -1,60 +1,66 @@
 name: Benchmark
 
+# Benchmarks the published images of a release: the Release workflow calls it
+# after publish-docker, and it can be run by hand for any tag. Each emulator
+# runs alone, pinned to two CPUs (benchmark/compose.yml), with the client on
+# the other two, so Rust and Java are measured on the same resources.
+
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag whose image to benchmark, e.g. v0.1.7"
+        required: true
+        type: string
+      num_clients:
+        type: string
+        default: "10"
+      num_runs:
+        type: string
+        default: "20"
+      repeat:
+        type: string
+        default: "3"
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Release tag whose image to benchmark, e.g. v0.1.7"
+        required: true
+        type: string
       num_clients:
         description: "Number of concurrent clients"
         required: false
         default: "10"
-      # num_runs default (20) is intentionally below the script default (100) to keep
-      # CI runtime bounded on GitHub-hosted runners. Override via workflow_dispatch.
       num_runs:
-        description: "Runs per client"
+        description: "Timed runs per client per scenario"
         required: false
         default: "20"
+      repeat:
+        description: "Whole-run repeats; the median is published"
+        required: false
+        default: "3"
 
 permissions:
   contents: write
 
-concurrency:
-  group: benchmark-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   benchmark:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    concurrency:
+      group: benchmark-${{ inputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.tag }}
+      NUM_CLIENTS: ${{ inputs.num_clients || '10' }}
+      NUM_RUNS: ${{ inputs.num_runs || '20' }}
+      REPEAT: ${{ inputs.repeat || '3' }}
+      WARMUP_RUNS: "5"
     steps:
-      - name: Checkout repository
+      - name: Checkout the tag
         uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and start emulators
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose up --build -d
-          echo "Waiting for emulators to become reachable..."
-          for port in 8042 8044; do
-            for attempt in $(seq 1 60); do
-              if curl -sf "http://localhost:${port}/" >/dev/null 2>&1 \
-                 || nc -z localhost "${port}" 2>/dev/null; then
-                echo "Port ${port} is up."
-                break
-              fi
-              if [[ "${attempt}" -eq 60 ]]; then
-                echo "::error::Emulator on port ${port} did not start in time."
-                docker compose logs
-                exit 1
-              fi
-              sleep 2
-            done
-          done
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -71,39 +77,93 @@ jobs:
         shell: bash
         run: poetry install --no-interaction --no-root
 
-      - name: Run benchmark
+      - name: Pull the emulator images
         shell: bash
-        env:
-          NUM_CLIENTS: ${{ github.event.inputs.num_clients || '10' }}
-          NUM_RUNS: ${{ github.event.inputs.num_runs || '20' }}
         run: |
           set -euo pipefail
-          mkdir -p benchmark-output
-          poetry run python benchmark/test_benchmark.py \
-            --num-clients "${NUM_CLIENTS}" \
-            --num-runs "${NUM_RUNS}" \
-            --json-out benchmark-output/results.json
-          echo "--- JSON output ---"
-          cat benchmark-output/results.json
+          export DATASTORE_EMULATOR_VERSION="${TAG#v}"
+          docker compose -f benchmark/compose.yml pull
+
+      - name: Benchmark the Rust emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATASTORE_EMULATOR_VERSION="${TAG#v}"
+          docker compose -f benchmark/compose.yml up -d rust
+          bash benchmark/wait_for_port.sh 8042
+          taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
+            --target rust --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
+            --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+            --json-out benchmark-output/rust.json
+          docker compose -f benchmark/compose.yml stop rust
+
+      # The Java emulator can die or hang under load; a failure here still
+      # publishes the Rust numbers and skips the speedup.
+      - name: Benchmark the Google emulator
+        id: java
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f benchmark/compose.yml up -d google
+          bash benchmark/wait_for_port.sh 8044
+          taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
+            --target java --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
+            --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+            --json-out benchmark-output/java.json
+          docker compose -f benchmark/compose.yml stop google
+
+      - name: Google emulator logs
+        if: steps.java.outcome != 'success'
+        shell: bash
+        run: |
+          echo "::warning::The Google emulator benchmark failed; publishing Rust only."
+          docker compose -f benchmark/compose.yml logs google || true
+
+      - name: Merge results
+        shell: bash
+        run: |
+          set -euo pipefail
+          poetry run python benchmark/merge_results.py --out-dir benchmark-output \
+            benchmark-output/rust.json benchmark-output/java.json
+          cat benchmark-output/latency.json benchmark-output/speedup.json
 
       - name: Stop emulators
         if: always()
         shell: bash
-        run: docker compose down -v || true
+        run: docker compose -f benchmark/compose.yml down -v || true
 
-      # dev/bench/index.html on gh-pages is customized (Rust and Java on the
-      # same chart); the action only writes it when it does not exist.
-      - name: Publish benchmark results
+      # dev/bench/index.html on gh-pages is customized (one chart per scenario,
+      # one line per emulator); the action only writes it when it does not exist.
+      - name: Publish latencies
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Datastore Emulator Benchmark
           tool: customSmallerIsBetter
-          output-file-path: benchmark-output/results.json
+          output-file-path: benchmark-output/latency.json
+          ref: ${{ inputs.tag }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
           auto-push: true
           alert-threshold: "150%"
           comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Publish speedup
+        if: steps.java.outcome == 'success'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Datastore Emulator Speedup
+          tool: customBiggerIsBetter
+          output-file-path: benchmark-output/speedup.json
+          ref: ${{ inputs.tag }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          auto-push: true
+          alert-threshold: "150%"
+          comment-on-alert: false
           fail-on-alert: false
           summary-always: true
