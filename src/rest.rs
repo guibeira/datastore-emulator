@@ -230,7 +230,7 @@ pub async fn import_handler(state: AppState, project_id: String, body: Bytes) ->
         operation_id.clone(),
         payload.input_url.clone(),
         Some(project_id.clone()),
-        payload.database_id.clone(),
+        Some(payload.database_id.clone().unwrap_or_default()),
     )
     .await;
 
