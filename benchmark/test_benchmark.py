@@ -121,7 +121,15 @@ def seed_dataset(client, total=SEED_TOTAL, groups=SEED_GROUPS, page_size=PAGE_SI
         entity = client.entity(client.key(seed.kind, row["name"]))
         entity.update(row)
         entities.append(entity)
-    put_in_chunks(client, entities)
+    try:
+        put_in_chunks(client, entities)
+    except Exception:
+        # Commits are per chunk: drop what the earlier chunks left behind.
+        try:
+            cleanup_seed(client, seed)
+        except Exception:  # noqa: BLE001 - the first error is the one to report
+            pass
+        raise
     return seed
 
 
@@ -139,8 +147,8 @@ def cleanup_seed(client, seed):
     delete_kind(client, seed.kind)
 
 
-def setup_client_run(client, index, seed):
-    run_id = f"perf-{uuid.uuid4()}"
+def setup_client_run(client, index, seed, run_id=None):
+    run_id = run_id or f"perf-{uuid.uuid4()}"
     own = client.entity(client.key(KIND, f"own-{run_id}"))
     own.update({"test_id": run_id, "counter": 0, "version": 0})
     multi = []
@@ -313,10 +321,9 @@ def run_scenarios(run, scenarios, num_runs, warmup_runs, barrier):
 def run_single_client(index, client, seed, barrier, num_runs, warmup_runs, results, failures):
     """Runs every scenario for one client; appends {scenario: timings}, or
     records failures[index] = (scenario, error) when the emulator stops answering."""
-    run_id = None
+    run_id = f"perf-{uuid.uuid4()}"
     try:
-        run = setup_client_run(client, index, seed)
-        run_id = run.run_id
+        run = setup_client_run(client, index, seed, run_id)
         results.append(run_scenarios(run, SCENARIOS, num_runs, warmup_runs, barrier))
     except ScenarioFailed as failure:
         failures[index] = failure
@@ -325,8 +332,7 @@ def run_single_client(index, client, seed, barrier, num_runs, warmup_runs, resul
         failures[index] = ScenarioFailed("setup", error)
     finally:
         try:
-            if run_id is not None:
-                cleanup_data(client, run_id)
+            cleanup_data(client, run_id)
         except Exception as error:  # noqa: BLE001
             failures.setdefault(index, ScenarioFailed("cleanup", error))
 

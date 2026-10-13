@@ -186,3 +186,42 @@ def test_run_scenarios_releases_the_others_when_one_client_fails():
 
     assert not any(t.is_alive() for t in threads)
     assert errors == {"bad": ("boom", False), "good": ("next", True)}
+
+
+@pytest.fixture(scope="module")
+def rust_client():
+    return make_client("http://" + HOSTS["rust"])
+
+
+def _put_first_then_fail(client, entities, size=500):
+    client.put_multi(entities[:1])
+    raise RuntimeError("emulator gone")
+
+
+def test_seed_dataset_removes_a_partial_seed_when_seeding_fails(rust_client, monkeypatch):
+    import benchmark.test_benchmark as harness
+
+    written = []
+    monkeypatch.setattr(harness, "put_in_chunks", lambda c, e, size=500: (written.extend(e[:1]), _put_first_then_fail(c, e)))
+
+    with pytest.raises(RuntimeError, match="emulator gone"):
+        seed_dataset(rust_client, total=20, groups=2, page_size=10)
+
+    assert rust_client.get(written[0].key) is None
+
+
+def test_run_single_client_cleans_up_when_setup_fails(rust_client, monkeypatch):
+    import benchmark.test_benchmark as harness
+
+    seed = seed_dataset(rust_client, total=20, groups=2, page_size=10)
+    written = []
+    monkeypatch.setattr(harness, "put_in_chunks", lambda c, e, size=500: (written.extend(e[:1]), _put_first_then_fail(c, e)))
+    results, failures = [], {}
+
+    harness.run_single_client(0, rust_client, seed, threading.Barrier(1), 1, 0, results, failures)
+
+    assert results == []
+    assert failures[0].scenario == "setup" and "emulator gone" in str(failures[0])
+    assert rust_client.get(written[0].key) is None
+    monkeypatch.undo()
+    cleanup_seed(rust_client, seed)
