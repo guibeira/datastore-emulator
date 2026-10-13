@@ -1072,6 +1072,46 @@ impl PartialOrd for KeyStruct {
 
 /// `str::cmp` without the `memcmp` call when either side is empty, which
 /// the database and namespace of most keys are.
+/// The data file starts with this header followed by a version byte. A file
+/// without it was written before keys carried a database id: the earlier
+/// layout, a map keyed by (project_id, namespace, path_elements). 0xFF never
+/// starts a bincode varint, so the two cannot be confused.
+const DATA_FILE_HEADER: [u8; 4] = [0xFF, b'D', b'S', b'E'];
+/// Version 2 stores the entities only; the key is rebuilt from each entity.
+const DATA_FILE_VERSION: u8 = 2;
+
+type LegacyKey = (String, String, Vec<(String, KeyId)>);
+
+fn decode_data_file(buffer: &[u8], path: &str) -> std::io::Result<Vec<EntityWithMetadata>> {
+    let invalid =
+        |e: bincode::error::DecodeError| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    let config = bincode::config::standard();
+    let Some(payload) = buffer.strip_prefix(&DATA_FILE_HEADER) else {
+        tracing::info!(
+            "Data file '{}' predates database ids; reading the earlier layout.",
+            path
+        );
+        let (legacy, _): (Vec<(LegacyKey, EntityWithMetadata)>, _) =
+            bincode::serde::decode_from_slice(buffer, config).map_err(invalid)?;
+        return Ok(legacy.into_iter().map(|(_, metadata)| metadata).collect());
+    };
+    match payload.split_first() {
+        Some((&DATA_FILE_VERSION, payload)) => {
+            let (entities, _) =
+                bincode::serde::decode_from_slice(payload, config).map_err(invalid)?;
+            Ok(entities)
+        }
+        Some((version, _)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported data file version {version}"),
+        )),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated data file header",
+        )),
+    }
+}
+
 /// `a == b` without the `memcmp` call when both are empty.
 fn same_partition_field(a: &str, b: &str) -> bool {
     a.len() == b.len() && (a.is_empty() || a == b)
@@ -2210,15 +2250,15 @@ impl DatastoreStorage {
             return Ok(());
         }
 
-        // Deserialize the buffer directly into the BTreeMap
-        let (entities, _): (BTreeMap<KeyStruct, EntityWithMetadata>, _) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let entities = decode_data_file(&buffer, path)?;
 
         tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
         self.entities = entities
             .into_iter()
-            .map(|(key, metadata)| (Arc::new(key), Arc::new(metadata)))
+            .filter_map(|metadata| {
+                let key = KeyStruct::from_datastore_key(metadata.entity.key.as_ref()?);
+                Some((Arc::new(key), Arc::new(metadata)))
+            })
             .collect();
 
         // Bulk rebuild indexes
@@ -2256,19 +2296,18 @@ impl DatastoreStorage {
     pub fn save_to_disk(&self, path: &str) -> std::io::Result<()> {
         tracing::info!("Saving {} entities to '{}'...", self.entities.len(), path);
 
-        // Serialize the whole BTreeMap
-        let entities: BTreeMap<KeyStruct, EntityWithMetadata> = self
+        let entities: Vec<&EntityWithMetadata> = self
             .entities
-            .iter()
-            .map(|(key, metadata)| (KeyStruct::clone(key), metadata.as_ref().clone()))
+            .values()
+            .map(|metadata| metadata.as_ref())
             .collect();
-
-        let buffer = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(&entities, bincode::config::standard())
             .map_err(std::io::Error::other)?;
 
-        // Write the serialized buffer to the file
         let mut file = std::fs::File::create(path)?;
-        file.write_all(&buffer)?;
+        file.write_all(&DATA_FILE_HEADER)?;
+        file.write_all(&[DATA_FILE_VERSION])?;
+        file.write_all(&payload)?;
         tracing::info!("Data saved successfully.");
         Ok(())
     }
@@ -3669,6 +3708,79 @@ mod tests {
         let named = key_in_database("db1", "Kind", "one");
         assert_eq!(compare_keys(&default, &named), Ordering::Less);
         assert_eq!(compare_keys(&named, &default), Ordering::Greater);
+    }
+
+    /// `datastore.bin` files written before `KeyStruct` had a `database_id`
+    /// encode the key as (project_id, namespace, path_elements).
+    #[test]
+    fn load_from_disk_reads_a_file_written_before_database_id() {
+        let entity = entity_in_database("", "Kind", "one", vec![("a", int_value(1))]);
+        let legacy_key = (
+            "p".to_string(),
+            String::new(),
+            vec![("Kind".to_string(), KeyId::StringId("one".to_string()))],
+        );
+        let legacy: BTreeMap<_, _> = [(
+            legacy_key,
+            EntityWithMetadata {
+                entity: entity.clone(),
+                version: 1,
+                create_time: pbjson_types::Timestamp::default(),
+                update_time: pbjson_types::Timestamp::default(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let bytes = bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("datastore-legacy-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut storage = DatastoreStorage::default();
+        storage.load_from_disk(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(storage.entities.len(), 1);
+        let loaded = storage
+            .get_entity(&key_in_database("", "Kind", "one"))
+            .unwrap();
+        assert_eq!(loaded.entity.properties["a"], int_value(1));
+    }
+
+    #[test]
+    fn save_to_disk_round_trips_named_databases() {
+        let mut storage = DatastoreStorage::default();
+        storage
+            .insert_entity(&entity_in_database(
+                "",
+                "Kind",
+                "one",
+                vec![("db", str_value("default"))],
+            ))
+            .unwrap();
+        storage
+            .insert_entity(&entity_in_database(
+                "db1",
+                "Kind",
+                "one",
+                vec![("db", str_value("db1"))],
+            ))
+            .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("datastore-named-{}.bin", uuid::Uuid::new_v4()));
+        storage.save_to_disk(path.to_str().unwrap()).unwrap();
+
+        let mut loaded = DatastoreStorage::default();
+        loaded.load_from_disk(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(loaded.entities.len(), 2);
+        let named = loaded
+            .get_entity(&key_in_database("db1", "Kind", "one"))
+            .unwrap();
+        assert_eq!(named.entity.properties["db"], str_value("db1"));
+        let (candidates, _) = loaded.query_candidates("p", "Kind", "db1", "", None);
+        assert_eq!(names(candidates), vec!["one"]);
     }
 
     #[test]
