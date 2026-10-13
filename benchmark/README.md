@@ -77,9 +77,11 @@ publishes the results to GitHub Pages via
 <https://guibeira.github.io/datastore-emulator/dev/bench/>
 
 If the Java emulator dies or hangs, the Rust numbers are still published and
-the speedup chart skips that release. To re-run a release by hand, use the
-**Actions** tab (`Benchmark` → **Run workflow**) with its tag; `num_clients`,
-`num_runs` and `repeat` can be overridden.
+the speedup chart skips that release. To run it by hand, use the **Actions**
+tab (`Benchmark` → **Run workflow**) with one or more tags, oldest first, e.g.
+`v0.1.6 v0.1.7`; `num_clients`, `num_runs` and `repeat` can be overridden. The
+harness comes from the branch the workflow runs on, so old releases can be
+benchmarked with the current scenarios to backfill the charts.
 
 The page at `dev/bench/index.html` on `gh-pages` is customized to draw both
 emulators on one chart per scenario; the action keeps it as it only writes

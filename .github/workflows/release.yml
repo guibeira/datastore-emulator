@@ -245,7 +245,7 @@ jobs:
     permissions:
       contents: write
     with:
-      tag: ${{ github.ref_name }}
+      tags: ${{ github.ref_name }}
 
   publish-homebrew:
     needs:
