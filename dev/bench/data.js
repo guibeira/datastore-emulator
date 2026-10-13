@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791910353030,
+  "lastUpdate": 1791910355592,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -642,6 +642,46 @@ window.BENCHMARK_DATA = {
             "value": 9.88,
             "unit": "x",
             "extra": "Java p50 0.124047 s / Rust p50 0.0125537 s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "id": "10382cff471456f2ece16c5f9865d7f7cf00f3be",
+          "message": "chore(release): v0.1.4",
+          "timestamp": "2026-05-23T18:55:43Z",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/10382cff471456f2ece16c5f9865d7f7cf00f3be"
+        },
+        "date": 1791910354993,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Single Insert (Java/Rust) - p50 speedup",
+            "value": 1.59,
+            "unit": "x",
+            "extra": "Java p50 0.00371375 s / Rust p50 0.00232968 s"
+          },
+          {
+            "name": "Bulk Insert (50) (Java/Rust) - p50 speedup",
+            "value": 1.16,
+            "unit": "x",
+            "extra": "Java p50 0.0285683 s / Rust p50 0.0247214 s"
+          },
+          {
+            "name": "Simple Query (Java/Rust) - p50 speedup",
+            "value": 7.93,
+            "unit": "x",
+            "extra": "Java p50 0.173396 s / Rust p50 0.0218587 s"
           }
         ]
       }
