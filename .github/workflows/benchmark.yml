@@ -20,7 +20,7 @@ on:
         default: "10"
       num_runs:
         type: string
-        default: "100"
+        default: "20"
       repeat:
         type: string
         default: "3"
@@ -37,7 +37,7 @@ on:
       num_runs:
         description: "Timed runs per client per scenario"
         required: false
-        default: "100"
+        default: "20"
       repeat:
         description: "Whole-run repeats; the median is published"
         required: false
@@ -115,12 +115,16 @@ jobs:
     concurrency:
       group: benchmark-${{ matrix.tag }}
       cancel-in-progress: false
+    # Every run adds 51 entities per client to the PerfTest kind (Single and
+    # Bulk Insert) and the Java emulator's queries slow down with the kind's
+    # size: 100 runs made its step take over 14 minutes per tag; 20 keep it
+    # around 2.
     env:
       TAG: ${{ matrix.tag }}
       NUM_CLIENTS: ${{ inputs.num_clients || '10' }}
-      NUM_RUNS: ${{ inputs.num_runs || '100' }}
+      NUM_RUNS: ${{ inputs.num_runs || '20' }}
       REPEAT: ${{ inputs.repeat || '3' }}
-      WARMUP_RUNS: "10"
+      WARMUP_RUNS: "5"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
