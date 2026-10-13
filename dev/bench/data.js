@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791916401356,
+  "lastUpdate": 1791916403885,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -4358,6 +4358,88 @@ window.BENCHMARK_DATA = {
             "value": 3.61,
             "unit": "x",
             "extra": "Java p50 0.217535 s / Rust p50 0.06025 s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "id": "7a6d688fcc3f3c5876bc30da73d529054db7a9c4",
+          "message": "chore(release): v0.1.7",
+          "timestamp": "2026-10-13T13:12:34Z",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/7a6d688fcc3f3c5876bc30da73d529054db7a9c4"
+        },
+        "date": 1791916403272,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Single Insert (Java/Rust) - p50 speedup",
+            "value": 1.3,
+            "unit": "x",
+            "extra": "Java p50 0.00342323 s / Rust p50 0.00262997 s"
+          },
+          {
+            "name": "Bulk Insert (50) (Java/Rust) - p50 speedup",
+            "value": 1.65,
+            "unit": "x",
+            "extra": "Java p50 0.0469381 s / Rust p50 0.0285192 s"
+          },
+          {
+            "name": "Simple Query (Java/Rust) - p50 speedup",
+            "value": 48.56,
+            "unit": "x",
+            "extra": "Java p50 0.227031 s / Rust p50 0.0046748 s"
+          },
+          {
+            "name": "Get (Java/Rust) - p50 speedup",
+            "value": 1.1,
+            "unit": "x",
+            "extra": "Java p50 0.00322948 s / Rust p50 0.0029433 s"
+          },
+          {
+            "name": "Get Multi (100) (Java/Rust) - p50 speedup",
+            "value": 1.12,
+            "unit": "x",
+            "extra": "Java p50 0.0294437 s / Rust p50 0.0262795 s"
+          },
+          {
+            "name": "Update (Java/Rust) - p50 speedup",
+            "value": 1.15,
+            "unit": "x",
+            "extra": "Java p50 0.00718113 s / Rust p50 0.00622733 s"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Java/Rust) - p50 speedup",
+            "value": 6.52,
+            "unit": "x",
+            "extra": "Java p50 0.0387533 s / Rust p50 0.00594652 s"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Java/Rust) - p50 speedup",
+            "value": 2.36,
+            "unit": "x",
+            "extra": "Java p50 0.222924 s / Rust p50 0.0944782 s"
+          },
+          {
+            "name": "Transaction RMW (Java/Rust) - p50 speedup",
+            "value": 1.03,
+            "unit": "x",
+            "extra": "Java p50 0.00918543 s / Rust p50 0.00891212 s"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Java/Rust) - p50 speedup",
+            "value": 4.4,
+            "unit": "x",
+            "extra": "Java p50 0.264202 s / Rust p50 0.0600631 s"
           }
         ]
       }
