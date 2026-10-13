@@ -18,19 +18,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from benchmark.stats import merge_entries
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("files", nargs="+", help="JSON files written by test_benchmark.py --json-out")
-    args = parser.parse_args()
-
+def merge_files(paths, out_dir):
+    """Merge the per-target files that exist into `out_dir/latency.json` and
+    `out_dir/speedup.json`; returns the two entry lists."""
     targets = {}
     settings = None
-    for path in args.files:
-        if not Path(path).exists():
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
             print(f"::warning::{path} is missing; publishing without it")
             continue
-        data = json.loads(Path(path).read_text())
+        data = json.loads(path.read_text())
         targets.update(data["targets"])
         settings = settings or data["settings"]
     if not targets:
@@ -41,11 +39,20 @@ def main():
         f"{settings['warmup_runs']} warm-up, median of {settings['repeat']}"
     )
     latency, speedup = merge_entries(targets, extra)
-    out = Path(args.out_dir)
+    out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "latency.json").write_text(json.dumps(latency, indent=2))
     (out / "speedup.json").write_text(json.dumps(speedup, indent=2))
     print(f"Wrote {len(latency)} latency and {len(speedup)} speedup entries to {out}")
+    return latency, speedup
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out-dir", required=True)
+    parser.add_argument("files", nargs="+", help="JSON files written by test_benchmark.py --json-out")
+    args = parser.parse_args()
+    merge_files(args.files, args.out_dir)
 
 
 if __name__ == "__main__":
