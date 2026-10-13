@@ -237,6 +237,16 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+  benchmark:
+    needs:
+      - validate
+      - publish-docker
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ github.ref_name }}
+
   publish-homebrew:
     needs:
       - validate

@@ -11,12 +11,12 @@ services:
     ports:
       - "8042:8042"
 
-  # Service for the official Google Datastore emulator
+  # The official Google Datastore emulator, published from Dockerfile.google
+  # by .github/workflows/google-emulator-image.yml (amd64 only).
   datastore-emulator-google:
     container_name: datastore_emulator_google
-    build:
-      context: .
-      dockerfile: Dockerfile.google
+    image: guibeira/datastore-emulator-google:541.0.0
+    platform: linux/amd64
     environment:
       - JAVA_TOOL_OPTIONS=-Xmx8G
     command: >

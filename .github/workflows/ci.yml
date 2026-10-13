@@ -28,6 +28,14 @@ jobs:
     - name: Install dependencies
       run: poetry install --no-interaction --no-root
 
+    # The pinned official emulator image is published from main; a pull
+    # request that bumps it builds the image locally until the tag exists.
+    - name: Pull the official emulator image, or build it when unpublished
+      run: |
+        set -euo pipefail
+        image=$(sed -n 's/^ *image: *\(guibeira\/datastore-emulator-google:[^ ]*\).*/\1/p' docker-compose.yml)
+        docker pull "$image" || docker build --platform linux/amd64 -f Dockerfile.google -t "$image" .
+
     - name: Start emulators
       run: docker compose up --build -d
 

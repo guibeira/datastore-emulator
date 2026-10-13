@@ -1,0 +1,26 @@
+# Emulators for the benchmark: published images, no build, each pinned to the
+# same two CPUs so Rust and Java are measured on identical resources while the
+# client runs on the other cores. Start one service at a time:
+#   DATASTORE_EMULATOR_VERSION=0.1.7 docker compose -f benchmark/compose.yml up -d rust
+services:
+  rust:
+    image: guibeira/datastore-emulator:${DATASTORE_EMULATOR_VERSION:-latest}
+    command: ["--host-port", "0.0.0.0:8042", "--no-store-on-disk"]
+    cpuset: "0,1"
+    ports:
+      - "8042:8042"
+
+  google:
+    image: guibeira/datastore-emulator-google:541.0.0
+    platform: linux/amd64
+    cpuset: "0,1"
+    environment:
+      - JAVA_TOOL_OPTIONS=-Xmx8G
+    command: >
+      /bin/sh -c "gcloud beta emulators datastore start
+      --project=test-project-2
+      --host-port=0.0.0.0:8044
+      --consistency=1.0
+      --no-store-on-disk"
+    ports:
+      - "8044:8044"
