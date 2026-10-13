@@ -49,6 +49,8 @@ permissions:
 jobs:
   plan:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       tags: ${{ steps.split.outputs.tags }}
     steps:
@@ -62,10 +64,15 @@ jobs:
           [ "$tags" != "[]" ] || { echo "::error::no tags given"; exit 1; }
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
+  # Builds third-party code (build scripts, proc macros): no write token here.
   build-loadgen:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup Rust toolchain
         shell: bash
