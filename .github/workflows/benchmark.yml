@@ -1,15 +1,18 @@
 name: Benchmark
 
-# Benchmarks the published images of a release: the Release workflow calls it
-# after publish-docker, and it can be run by hand for any tag. Each emulator
-# runs alone, pinned to two CPUs (benchmark/compose.yml), with the client on
-# the other two, so Rust and Java are measured on the same resources.
+# Benchmarks the published images of releases: the Release workflow calls it
+# after publish-docker, and it can be run by hand for any list of tags, oldest
+# first, to backfill the charts. The harness always comes from the ref the
+# workflow runs on; a tag only selects the image and the commit the results
+# are published under. Each emulator runs alone, pinned to two CPUs
+# (benchmark/compose.yml), with the client on the other two, so Rust and Java
+# are measured on the same resources.
 
 on:
   workflow_call:
     inputs:
-      tag:
-        description: "Release tag whose image to benchmark, e.g. v0.1.7"
+      tags:
+        description: "Release tags whose images to benchmark, space-separated"
         required: true
         type: string
       num_clients:
@@ -23,8 +26,8 @@ on:
         default: "3"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag whose image to benchmark, e.g. v0.1.7"
+      tags:
+        description: "Release tags to benchmark, space-separated, oldest first, e.g. v0.1.6 v0.1.7"
         required: true
         type: string
       num_clients:
@@ -44,23 +47,45 @@ permissions:
   contents: write
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.split.outputs.tags }}
+    steps:
+      - id: split
+        shell: bash
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          tags=$(printf '%s\n' $TAGS | jq -Rcs 'split("\n") | map(select(. != ""))')
+          [ "$tags" != "[]" ] || { echo "::error::no tags given"; exit 1; }
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  # One tag at a time; GitHub starts matrix jobs in list order in practice but
+  # does not promise it, so the page orders points by commit date rather than
+  # by publication order. A tag whose benchmark fails does not stop the others.
   benchmark:
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.plan.outputs.tags) }}
     concurrency:
-      group: benchmark-${{ inputs.tag }}
+      group: benchmark-${{ matrix.tag }}
       cancel-in-progress: false
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ matrix.tag }}
       NUM_CLIENTS: ${{ inputs.num_clients || '10' }}
       NUM_RUNS: ${{ inputs.num_runs || '20' }}
       REPEAT: ${{ inputs.repeat || '3' }}
       WARMUP_RUNS: "5"
     steps:
-      - name: Checkout the tag
+      - name: Checkout
         uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.tag }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -141,13 +166,15 @@ jobs:
           name: Datastore Emulator Benchmark
           tool: customSmallerIsBetter
           output-file-path: benchmark-output/latency.json
-          ref: ${{ inputs.tag }}
+          ref: ${{ matrix.tag }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
           auto-push: true
           alert-threshold: "150%"
-          comment-on-alert: true
+          # Alerts compare against the previous entry, which a backfill run
+          # by hand makes meaningless; comment only on releases.
+          comment-on-alert: ${{ github.event_name == 'push' }}
           fail-on-alert: false
           summary-always: true
 
@@ -158,7 +185,7 @@ jobs:
           name: Datastore Emulator Speedup
           tool: customBiggerIsBetter
           output-file-path: benchmark-output/speedup.json
-          ref: ${{ inputs.tag }}
+          ref: ${{ matrix.tag }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
