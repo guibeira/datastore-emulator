@@ -33,9 +33,28 @@ poetry run python benchmark/test_benchmark.py --num-clients 10 --num-runs 20 --w
 
 Each client runs every scenario `--warmup-runs` times untimed, then `--num-runs`
 times with each call timed; the whole run repeats `--repeat` times and the median
-is kept. The summary shows, per scenario and emulator, the average time per client
-(the dashboard's historical metric), the p50 and the p95 per call, and the
-Java/Rust speedup:
+is kept. Before the clients start, the target is seeded with a shared dataset of
+5,000 entities (10 groups of 500, random `score`); each client also gets its own
+entity and 100 entities for `get_multi`. Everything is deleted at the end.
+
+| Scenario | One call does |
+|---|---|
+| Single Insert | `put` of one new entity |
+| Bulk Insert (50) | `put_multi` of 50 new entities |
+| Simple Query | equality filter on the client's entities, limit 10 |
+| Get | `get` of the client's entity |
+| Get Multi (100) | `get_multi` of 100 keys |
+| Update | `get` then `put` of the client's entity |
+| Query Filter+Order (5k) | `group == g` ordered by `-score`, limit 20, over the seed |
+| Cursor Pagination (5x100) | walks the client's group of 500 in 5 pages of 100 through cursors |
+| Transaction RMW | begin, `get`, `put`, commit on the client's entity |
+| Mixed (get, get_multi, update, query) | the four calls of an app-like request |
+
+The insert scenarios are bound by the Python client (protobuf + gRPC), so
+they barely tell the emulators apart; the others make the server work. The
+summary shows, per scenario and emulator, the average time per client (the
+dashboard's historical metric), the p50 and the p95 per call, and the Java/Rust
+speedup:
 
 ```bash
 --- Benchmark Summary ---

@@ -141,13 +141,14 @@ Prereleases publish GitHub Release assets and Docker prerelease tags, but skip c
 
 ## Benchmarks
 
-Here are some results with 30 clients and 10 runs each:
+Every release is benchmarked against the official emulator on the same runner
+(each emulator alone on two pinned CPUs, 10 clients, warm-up, median of three
+runs) and published to the dashboard, with p50/p95 latencies per scenario and
+the Java/Rust speedup:
 
-| Operation | Total Time (Rust) | Total Time (Java) | Avg Time/Client (Rust) | Avg Time/Client (Java) | Verdict |
-|---|---|---|---|---|---|
-| Single Insert | 1.6883s | 95.1637s | 0.0563s | 3.1721s | Rust 56.37x faster |
-| Bulk Insert (50) | 17.7474s | 375.3370s | 0.5916s | 12.5112s | Rust 21.15x faster |
-| Simple Query | 20.5427s | 62.8813s | 0.6848s | 2.0960s | Rust 3.06x faster |
+<https://guibeira.github.io/datastore-emulator/dev/bench/>
 
+Insert scenarios are bound by the Python client, so expect ~1.3x there; queries,
+cursor walks and reads over seeded data show the emulator itself.
 
 If you want to run the benchmarks yourself, [here](https://github.com/guibeira/datastore-emulator/tree/main/benchmark#readme) are the instructions:
