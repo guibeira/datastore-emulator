@@ -769,31 +769,33 @@ pub fn converter_dump(dump_entities: Vec<EntityProto>) -> Vec<EntityWithMetadata
         .collect()
 }
 
-fn rewrite_key_project_id(key: &mut Key, project_id: &str) {
+fn rewrite_key_partition(key: &mut Key, rewrite: &dyn Fn(&mut PartitionId)) {
     if let Some(partition) = key.partition_id.as_mut() {
-        partition.project_id = project_id.to_string();
+        rewrite(partition);
     }
 }
 
-fn rewrite_value_project_id(value: &mut Value, project_id: &str) {
+fn rewrite_value_partition(value: &mut Value, rewrite: &dyn Fn(&mut PartitionId)) {
     match value.value_type.as_mut() {
-        Some(ValueType::KeyValue(key)) => rewrite_key_project_id(key, project_id),
+        Some(ValueType::KeyValue(key)) => rewrite_key_partition(key, rewrite),
         Some(ValueType::ArrayValue(array)) => {
             for value in array.values.iter_mut() {
-                rewrite_value_project_id(value, project_id);
+                rewrite_value_partition(value, rewrite);
             }
         }
-        Some(ValueType::EntityValue(entity)) => rewrite_entity_project_id(entity, project_id),
+        Some(ValueType::EntityValue(entity)) => rewrite_entity_partition(entity, rewrite),
         _ => {}
     }
 }
 
-fn rewrite_entity_project_id(entity: &mut Entity, project_id: &str) {
+/// Apply `rewrite` to the entity key and to every key-valued property,
+/// nested entities included.
+fn rewrite_entity_partition(entity: &mut Entity, rewrite: &dyn Fn(&mut PartitionId)) {
     if let Some(key) = entity.key.as_mut() {
-        rewrite_key_project_id(key, project_id);
+        rewrite_key_partition(key, rewrite);
     }
     for value in entity.properties.values_mut() {
-        rewrite_value_project_id(value, project_id);
+        rewrite_value_partition(value, rewrite);
     }
 }
 
@@ -911,6 +913,7 @@ pub fn read_overall_metadata(export_dir: &str) -> ImportReadResult<OverallExport
 pub fn prepare_dump_for_project(
     path: &str,
     target_project_id: Option<&str>,
+    target_database_id: Option<&str>,
 ) -> Result<Vec<EntityWithMetadata>, tonic::Status> {
     let dump_entities = read_dump(path).map_err(|e| {
         tonic::Status::invalid_argument(format!("Failed to read datastore export: {}", e))
@@ -918,7 +921,14 @@ pub fn prepare_dump_for_project(
     let mut entities_with_metadata = converter_dump(dump_entities);
     if let Some(project_id) = target_project_id {
         for ewm in entities_with_metadata.iter_mut() {
-            rewrite_entity_project_id(&mut ewm.entity, project_id);
+            rewrite_entity_partition(&mut ewm.entity, &|p| p.project_id = project_id.to_string());
+        }
+    }
+    if let Some(database_id) = target_database_id {
+        for ewm in entities_with_metadata.iter_mut() {
+            rewrite_entity_partition(&mut ewm.entity, &|p| {
+                p.database_id = database_id.to_string()
+            });
         }
     }
     tracing::info!(
@@ -2246,7 +2256,7 @@ impl DatastoreStorage {
         path: &str,
         target_project_id: Option<&str>,
     ) -> Result<(), tonic::Status> {
-        self.insert_imported(prepare_dump_for_project(path, target_project_id)?)
+        self.insert_imported(prepare_dump_for_project(path, target_project_id, None)?)
     }
 
     /// Store entities prepared by `prepare_dump_for_project`.
@@ -4064,7 +4074,7 @@ mod tests {
         write_minimal_export(&root, entity);
 
         let prepared =
-            prepare_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT)).unwrap();
+            prepare_dump_for_project(root.to_str().unwrap(), Some(LOCAL_PROJECT), None).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(key_project_id(&prepared[0].entity), LOCAL_PROJECT);
@@ -4077,10 +4087,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_dump_for_project_rewrites_the_database_id() {
+        let root = temp_export_root();
+        let mut entity = legacy_entity(SOURCE_PROJECT, "Task", "one");
+        entity.property.push(reference_property(
+            "owner",
+            SOURCE_PROJECT,
+            "Owner",
+            "owner-one",
+        ));
+        write_minimal_export(&root, entity);
+
+        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None, Some("db1")).unwrap();
+
+        let entity = &prepared[0].entity;
+        let key = entity.key.as_ref().unwrap();
+        assert_eq!(key.partition_id.as_ref().unwrap().database_id, "db1");
+        let Some(ValueType::KeyValue(owner)) = entity.properties["owner"].value_type.as_ref()
+        else {
+            panic!("owner is a key");
+        };
+        assert_eq!(owner.partition_id.as_ref().unwrap().database_id, "db1");
+        assert_eq!(key_project_id(entity), SOURCE_PROJECT);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn insert_imported_stores_prepared_entities() {
         let root = temp_export_root();
         write_minimal_export(&root, legacy_entity(SOURCE_PROJECT, "Task", "one"));
-        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None).unwrap();
+        let prepared = prepare_dump_for_project(root.to_str().unwrap(), None, None).unwrap();
 
         let mut storage = DatastoreStorage::default();
         storage.insert_imported(prepared).unwrap();

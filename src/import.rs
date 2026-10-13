@@ -92,6 +92,7 @@ pub async fn bg_import_data(
     operation_id: String,
     input_url: String,
     target_project_id: Option<String>,
+    target_database_id: Option<String>,
 ) {
     tracing::info!("Importing data from {:?} in the background...", input_url);
 
@@ -197,7 +198,14 @@ pub async fn bg_import_data(
     let prepared = task::spawn_blocking({
         let export_dir = export_dir.clone();
         let target_project_id = target_project_id.clone();
-        move || prepare_dump_for_project(&export_dir, target_project_id.as_deref())
+        let target_database_id = target_database_id.clone();
+        move || {
+            prepare_dump_for_project(
+                &export_dir,
+                target_project_id.as_deref(),
+                target_database_id.as_deref(),
+            )
+        }
     })
     .await;
     let import_result = match prepared {
