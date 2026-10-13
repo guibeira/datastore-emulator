@@ -1157,6 +1157,15 @@ enum Target {
     Both,
 }
 
+/// Counts that must be at least one: zero would leave nothing to summarize.
+fn at_least_one(text: &str) -> Result<usize, String> {
+    match text.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Benchmark an emulator with N concurrent gRPC clients.
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -1168,16 +1177,16 @@ struct Cli {
     host: Option<String>,
     #[arg(long, default_value_t = String::from("test-project-2"))]
     project: String,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = at_least_one)]
     num_clients: usize,
     /// Timed runs per client per scenario.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, value_parser = at_least_one)]
     num_runs: usize,
     /// Untimed runs before timing.
     #[arg(long, default_value_t = 5)]
     warmup_runs: usize,
     /// Whole-run repeats; the median is kept.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, value_parser = at_least_one)]
     repeat: usize,
     /// Write the per-target summaries as JSON for merge_results.py.
     #[arg(long)]
@@ -1437,6 +1446,21 @@ mod tests {
             .await
             .unwrap();
         (client, seed)
+    }
+
+    #[test]
+    fn zero_clients_runs_or_repeats_are_rejected_at_the_cli() {
+        for flag in ["--num-clients", "--num-runs", "--repeat"] {
+            assert!(
+                Cli::try_parse_from(["loadgen", flag, "0"]).is_err(),
+                "{flag} 0 must be rejected"
+            );
+            assert!(
+                Cli::try_parse_from(["loadgen", flag, "1"]).is_ok(),
+                "{flag} 1 must be accepted"
+            );
+        }
+        assert!(Cli::try_parse_from(["loadgen", "--warmup-runs", "0"]).is_ok());
     }
 
     #[test]
