@@ -150,9 +150,26 @@ fn query(
     }
 }
 
+/// Bounds a call on the client side. tonic's `Endpoint::timeout` only covers
+/// the request once the connection is ready; a server that accepts TCP but
+/// never finishes the HTTP/2 handshake would hang the first call forever.
+async fn timed<T>(
+    deadline: Duration,
+    call: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    match tokio::time::timeout(deadline, call).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "no answer within {}s",
+            deadline.as_secs_f64()
+        ))),
+    }
+}
+
 async fn connect_with_timeout(endpoint: &str, timeout: Duration) -> Result<Client, Status> {
     let channel = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| Status::invalid_argument(e.to_string()))?
+        .connect_timeout(timeout)
         .timeout(timeout)
         .connect()
         .await
@@ -177,15 +194,17 @@ async fn commit(
         ),
         None => (commit_request::Mode::NonTransactional, None),
     };
-    client
-        .commit(CommitRequest {
+    timed(
+        REQUEST_TIMEOUT,
+        client.commit(CommitRequest {
             project_id: project.to_string(),
             database_id: String::new(),
             mode: mode as i32,
             mutations,
             transaction_selector: selector,
-        })
-        .await?;
+        }),
+    )
+    .await?;
     Ok(())
 }
 
@@ -198,16 +217,18 @@ async fn lookup(
     let read_options = transaction.map(|id| ReadOptions {
         consistency_type: Some(read_options::ConsistencyType::Transaction(id)),
     });
-    let response = client
-        .lookup(LookupRequest {
+    let response = timed(
+        REQUEST_TIMEOUT,
+        client.lookup(LookupRequest {
             project_id: project.to_string(),
             database_id: String::new(),
             read_options,
             keys,
             property_mask: None,
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await?
+    .into_inner();
     Ok(response
         .found
         .into_iter()
@@ -220,8 +241,9 @@ async fn run_query(
     project: &str,
     query: Query,
 ) -> Result<QueryResultBatch, Status> {
-    let response = client
-        .run_query(RunQueryRequest {
+    let response = timed(
+        REQUEST_TIMEOUT,
+        client.run_query(RunQueryRequest {
             project_id: project.to_string(),
             database_id: String::new(),
             partition_id: Some(partition(project)),
@@ -229,9 +251,10 @@ async fn run_query(
             property_mask: None,
             explain_options: None,
             query_type: Some(run_query_request::QueryType::Query(query)),
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await?
+    .into_inner();
     Ok(response.batch.unwrap_or_default())
 }
 
@@ -568,16 +591,17 @@ impl ClientRun {
     }
 
     async fn transaction_rmw(&mut self) -> Result<(), Status> {
-        let transaction = self
-            .client
-            .begin_transaction(BeginTransactionRequest {
+        let transaction = timed(
+            REQUEST_TIMEOUT,
+            self.client.begin_transaction(BeginTransactionRequest {
                 project_id: self.project.clone(),
                 database_id: String::new(),
                 transaction_options: None,
-            })
-            .await?
-            .into_inner()
-            .transaction;
+            }),
+        )
+        .await?
+        .into_inner()
+        .transaction;
         let outcome = async {
             let mut own = lookup(
                 &mut self.client,
@@ -601,14 +625,15 @@ impl ClientRun {
         }
         .await;
         if outcome.is_err() {
-            let _ = self
-                .client
-                .rollback(RollbackRequest {
+            let _ = timed(
+                REQUEST_TIMEOUT,
+                self.client.rollback(RollbackRequest {
                     project_id: self.project.clone(),
                     database_id: String::new(),
                     transaction,
-                })
-                .await;
+                }),
+            )
+            .await;
         }
         outcome
     }
@@ -772,6 +797,13 @@ async fn run_scenarios(
 ) -> Result<HashMap<&'static str, Vec<f64>>, ScenarioFailed> {
     let mut timings = HashMap::new();
     for &scenario in scenarios {
+        if std::env::var_os("LOADGEN_TRACE").is_some() {
+            eprintln!(
+                "[trace] {} waiting at barrier before {:?}",
+                std::thread::current().name().unwrap_or("?"),
+                scenario
+            );
+        }
         tokio::select! {
             _ = barrier.wait() => {}
             _ = released.changed() => {
@@ -780,6 +812,9 @@ async fn run_scenarios(
         }
         let mut timed = Vec::with_capacity(num_runs);
         for i in 0..warmup_runs + num_runs {
+            if std::env::var_os("LOADGEN_TRACE").is_some() {
+                eprintln!("[trace] {scenario:?} call {i}");
+            }
             let start = Instant::now();
             if let Err(error) = workload.call(scenario).await {
                 let _ = failed.send(true);
@@ -863,6 +898,31 @@ async fn run_client(
     outcome
 }
 
+/// A client task that panics would leave the others waiting at the barrier
+/// forever; turn the panic into a failure that releases them.
+async fn guard_panics(
+    failed: watch::Sender<bool>,
+    client: impl Future<Output = Result<HashMap<&'static str, Vec<f64>>, ScenarioFailed>>,
+) -> Result<HashMap<&'static str, Vec<f64>>, ScenarioFailed> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(client).catch_unwind().await {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            let _ = failed.send(true);
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_else(|| "panic".to_string());
+            Err(ScenarioFailed {
+                scenario: "panic",
+                error: message,
+                released: false,
+            })
+        }
+    }
+}
+
 /// One pass with `num_clients` concurrent clients; returns {scenario: result}.
 async fn run_once(
     label: &str,
@@ -881,16 +941,20 @@ async fn run_once(
                 (endpoint.to_string(), project.to_string(), seed.clone());
             let (barrier, failed, released) = (barrier.clone(), failed.clone(), released.clone());
             tokio::spawn(async move {
-                run_client(
-                    index,
-                    &endpoint,
-                    &project,
-                    seed,
-                    barrier,
-                    failed,
-                    released,
-                    num_runs,
-                    warmup_runs,
+                let guard = failed.clone();
+                guard_panics(
+                    guard,
+                    run_client(
+                        index,
+                        &endpoint,
+                        &project,
+                        seed,
+                        barrier,
+                        failed,
+                        released,
+                        num_runs,
+                        warmup_runs,
+                    ),
                 )
                 .await
             })
@@ -951,7 +1015,7 @@ async fn wait_until_ready(
     let deadline = Instant::now() + timeout;
     let mut last_error = "no attempt".to_string();
     while Instant::now() < deadline {
-        let probe = async {
+        let probe = timed(Duration::from_secs(5), async {
             let mut client = connect_with_timeout(endpoint, Duration::from_secs(5)).await?;
             lookup(
                 &mut client,
@@ -960,7 +1024,7 @@ async fn wait_until_ready(
                 None,
             )
             .await
-        }
+        })
         .await;
         match probe {
             Ok(_) => return Ok(()),
@@ -1171,6 +1235,7 @@ async fn main() {
 mod tests {
     use super::*;
     use datastore_emulator::DatastoreEmulator;
+    use datastore_emulator::google::datastore::v1;
     use datastore_emulator::google::datastore::v1::datastore_server::DatastoreServer;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1190,6 +1255,126 @@ mod tests {
     }
 
     const PROJECT: &str = "test-project-2";
+
+    /// Speaks gRPC but never answers a lookup, like a wedged emulator.
+    struct Hanging;
+
+    #[tonic::async_trait]
+    impl datastore_emulator::google::datastore::v1::datastore_server::Datastore for Hanging {
+        async fn ping(
+            &self,
+            _: tonic::Request<v1::PingRequest>,
+        ) -> Result<tonic::Response<v1::PingResponse>, Status> {
+            Err(Status::unimplemented("ping"))
+        }
+        async fn begin_transaction(
+            &self,
+            _: tonic::Request<v1::BeginTransactionRequest>,
+        ) -> Result<tonic::Response<v1::BeginTransactionResponse>, Status> {
+            Err(Status::unimplemented("begin_transaction"))
+        }
+        async fn lookup(
+            &self,
+            _: tonic::Request<v1::LookupRequest>,
+        ) -> Result<tonic::Response<v1::LookupResponse>, Status> {
+            std::future::pending().await
+        }
+        async fn run_query(
+            &self,
+            _: tonic::Request<v1::RunQueryRequest>,
+        ) -> Result<tonic::Response<v1::RunQueryResponse>, Status> {
+            Err(Status::unimplemented("run_query"))
+        }
+        async fn commit(
+            &self,
+            _: tonic::Request<v1::CommitRequest>,
+        ) -> Result<tonic::Response<v1::CommitResponse>, Status> {
+            Err(Status::unimplemented("commit"))
+        }
+        async fn rollback(
+            &self,
+            _: tonic::Request<v1::RollbackRequest>,
+        ) -> Result<tonic::Response<v1::RollbackResponse>, Status> {
+            Err(Status::unimplemented("rollback"))
+        }
+        async fn run_aggregation_query(
+            &self,
+            _: tonic::Request<v1::RunAggregationQueryRequest>,
+        ) -> Result<tonic::Response<v1::RunAggregationQueryResponse>, Status> {
+            Err(Status::unimplemented("run_aggregation_query"))
+        }
+        async fn allocate_ids(
+            &self,
+            _: tonic::Request<v1::AllocateIdsRequest>,
+        ) -> Result<tonic::Response<v1::AllocateIdsResponse>, Status> {
+            Err(Status::unimplemented("allocate_ids"))
+        }
+        async fn reserve_ids(
+            &self,
+            _: tonic::Request<v1::ReserveIdsRequest>,
+        ) -> Result<tonic::Response<v1::ReserveIdsResponse>, Status> {
+            Err(Status::unimplemented("reserve_ids"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_emulator_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(DatastoreServer::new(Hanging))
+                .serve_with_incoming(incoming),
+        );
+        let endpoint = format!("http://{addr}");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client = connect_with_timeout(&endpoint, Duration::from_millis(300))
+                .await
+                .unwrap();
+            lookup(
+                &mut client,
+                PROJECT,
+                vec![name_key(PROJECT, "Healthcheck", "ping")],
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("the request must give up on its own");
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_emulator_never_completes_times_out() {
+        // Accepts TCP connections but never speaks HTTP/2, like an emulator wedged after bind.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(listener.accept().await.unwrap());
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client =
+                connect_with_timeout(&format!("http://{addr}"), Duration::from_millis(300))
+                    .await
+                    .unwrap();
+            lookup(
+                &mut client,
+                PROJECT,
+                vec![name_key(PROJECT, "Healthcheck", "ping")],
+                None,
+            )
+            .await
+        })
+        .await
+        .expect("the first request must give up on its own");
+        assert!(outcome.is_err());
+    }
 
     type Events = Arc<Mutex<Vec<(Scenario, usize, Instant, Instant)>>>;
 
@@ -1510,6 +1695,41 @@ mod tests {
             .min()
             .unwrap();
         assert!(slow_end <= fast_start);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_client_releases_the_others() {
+        let barrier = Arc::new(Barrier::new(2));
+        let (failed, _rx) = tokio::sync::watch::channel(false);
+        let scenarios = [Scenario::SingleInsert, Scenario::Get];
+        let (good_barrier, good_rx, good_failed) =
+            (barrier.clone(), failed.subscribe(), failed.clone());
+        let good = tokio::spawn(async move {
+            let mut workload = Failing { bad: false };
+            run_scenarios(
+                &mut workload,
+                &scenarios,
+                1,
+                0,
+                good_barrier,
+                good_failed,
+                good_rx,
+            )
+            .await
+        });
+        let bad = tokio::spawn(guard_panics(failed.clone(), async { panic!("boom") }));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            (bad.await.unwrap(), good.await.unwrap())
+        })
+        .await
+        .expect("the other client must not hang");
+        let bad = outcome.0.unwrap_err();
+        assert_eq!(
+            (bad.scenario, bad.error.as_str(), bad.released),
+            ("panic", "boom", false)
+        );
+        assert!(outcome.1.unwrap_err().released);
     }
 
     #[tokio::test]
