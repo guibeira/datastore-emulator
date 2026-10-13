@@ -36,6 +36,12 @@ def sample_around(command, json_path, sampler):
         if len(targets) == 1:
             data.setdefault("resources", {})[targets[0]] = usage
             json_path.write_text(json.dumps(data, indent=2))
+            if usage:
+                print(f"\n{targets[0]} container ({usage['samples']} samples): CPU mean {usage['cpu_mean_percent']:.0f}%, "
+                      f"peak {usage['cpu_peak_percent']:.0f}%; memory peak {usage['mem_peak_mb']:.0f} MB, "
+                      f"end {usage['mem_end_mb']:.0f} MB")
+            else:
+                print(f"\n{targets[0]} container: no samples")
         else:
             print(f"::warning::{json_path} has {len(targets)} targets; resources need exactly one")
     return code
