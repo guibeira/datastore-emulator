@@ -39,6 +39,7 @@ import sys
 # Runnable as `python benchmark/<script>.py` from anywhere: import from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from benchmark.resources import StatsSampler
 from benchmark.stats import median_of_summaries, merge_entries, summarize
 
 TARGETS = {
@@ -373,10 +374,12 @@ def run_once(label, base_url, seed, num_clients, num_runs, warmup_runs):
     return summary
 
 
-def run_target(label, base_url, num_clients, num_runs, warmup_runs, repeat):
+def run_target(label, base_url, num_clients, num_runs, warmup_runs, repeat, on_ready=None):
     print(f"\n--- {label} at {base_url}: {num_clients} clients, {num_runs} runs/client, "
           f"{warmup_runs} warm-up, {repeat} repeat(s) ---")
     wait_until_ready(label, base_url)
+    if on_ready is not None:
+        on_ready()
     client = make_client(base_url)
     try:
         started = time.perf_counter()
@@ -396,6 +399,16 @@ def run_target(label, base_url, num_clients, num_runs, warmup_runs, repeat):
         except Exception as error:  # noqa: BLE001 - the emulator is already gone
             print(f"  seed cleanup failed: {type(error).__name__}: {error}")
     return {name: median_of_summaries([r[name] for r in repeats]) for name, _ in SCENARIOS}
+
+
+def print_resources(resources_by_target):
+    for label, usage in resources_by_target.items():
+        if usage is None:
+            print(f"\n{label} container: no samples")
+            continue
+        print(f"\n{label} container ({usage['samples']} samples): CPU mean {usage['cpu_mean_percent']:.0f}%, "
+              f"peak {usage['cpu_peak_percent']:.0f}%; memory peak {usage['mem_peak_mb']:.0f} MB, "
+              f"end {usage['mem_end_mb']:.0f} MB")
 
 
 def print_summary(results_by_target, num_clients, num_runs):
@@ -421,25 +434,33 @@ def main():
     parser.add_argument("--warmup-runs", type=int, default=3, help="Untimed runs before timing.")
     parser.add_argument("--repeat", type=int, default=1, help="Whole-run repeats; the median is kept.")
     parser.add_argument("--json-out", help="Write the per-target summaries as JSON for merge_results.py.")
+    parser.add_argument("--container", help="Docker container of the emulator; samples its CPU and memory.")
     args = parser.parse_args()
 
     targets = ["rust", "java"] if args.target == "both" else [args.target]
-    if args.host and len(targets) > 1:
-        parser.error("--host needs a single --target")
+    if (args.host or args.container) and len(targets) > 1:
+        parser.error("--host and --container need a single --target")
 
     results_by_target = {}
+    resources_by_target = {}
     for target in targets:
         label, default_url = TARGETS[target]
+        sampler = StatsSampler(args.container) if args.container else None
         try:
             results_by_target[label] = run_target(
-                label, args.host or default_url, args.num_clients, args.num_runs, args.warmup_runs, args.repeat
+                label, args.host or default_url, args.num_clients, args.num_runs, args.warmup_runs, args.repeat,
+                on_ready=sampler.start if sampler else None,
             )
         except EmulatorFailed as failure:
             print(f"\n::error::{failure}")
             print(f"Clients that finished before the failure: {len(failure.partial)}")
             raise SystemExit(2) from failure
+        finally:
+            if sampler:
+                resources_by_target[label] = sampler.stop()
 
     print_summary(results_by_target, args.num_clients, args.num_runs)
+    print_resources(resources_by_target)
 
     if args.json_out:
         out = Path(args.json_out)
@@ -452,6 +473,7 @@ def main():
                 "repeat": args.repeat,
             },
             "targets": results_by_target,
+            "resources": resources_by_target,
         }, indent=2))
         print(f"\nWrote {out}")
         if len(results_by_target) > 1:

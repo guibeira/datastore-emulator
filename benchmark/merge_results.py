@@ -1,9 +1,10 @@
-"""Merge per-target benchmark results into the two dashboard files.
+"""Merge per-target benchmark results into the dashboard files.
 
     python benchmark/merge_results.py --out-dir benchmark-output rust.json java.json
 
-Writes `latency.json` (customSmallerIsBetter) and `speedup.json`
-(customBiggerIsBetter) for github-action-benchmark.
+Writes `latency.json` (customSmallerIsBetter), `speedup.json`
+(customBiggerIsBetter) and `resources.json` (customSmallerIsBetter; empty
+when no target sampled its container) for github-action-benchmark.
 """
 
 import argparse
@@ -15,13 +16,16 @@ import sys
 # Runnable as `python benchmark/<script>.py` from anywhere: import from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from benchmark.resources import resource_entries
 from benchmark.stats import merge_entries
 
 
 def merge_files(paths, out_dir):
-    """Merge the per-target files that exist into `out_dir/latency.json` and
-    `out_dir/speedup.json`; returns the two entry lists."""
+    """Merge the per-target files that exist into `out_dir/latency.json`,
+    `out_dir/speedup.json` and `out_dir/resources.json`; returns the three
+    entry lists."""
     targets = {}
+    resources = {}
     settings = None
     for path in paths:
         path = Path(path)
@@ -30,6 +34,7 @@ def merge_files(paths, out_dir):
             continue
         data = json.loads(path.read_text())
         targets.update(data["targets"])
+        resources.update(data.get("resources", {}))
         settings = settings or data["settings"]
     if not targets:
         raise SystemExit("no benchmark results to merge")
@@ -39,12 +44,14 @@ def merge_files(paths, out_dir):
         f"{settings['warmup_runs']} warm-up, median of {settings['repeat']}"
     )
     latency, speedup = merge_entries(targets, extra)
+    usage = resource_entries(resources, extra)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "latency.json").write_text(json.dumps(latency, indent=2))
     (out / "speedup.json").write_text(json.dumps(speedup, indent=2))
-    print(f"Wrote {len(latency)} latency and {len(speedup)} speedup entries to {out}")
-    return latency, speedup
+    (out / "resources.json").write_text(json.dumps(usage, indent=2))
+    print(f"Wrote {len(latency)} latency, {len(speedup)} speedup and {len(usage)} resource entries to {out}")
+    return latency, speedup, usage
 
 
 def main():
