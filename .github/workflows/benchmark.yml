@@ -2,11 +2,11 @@ name: Benchmark
 
 # Benchmarks the published images of releases: the Release workflow calls it
 # after publish-docker, and it can be run by hand for any list of tags, oldest
-# first, to backfill the charts. The harness always comes from the ref the
-# workflow runs on; a tag only selects the image and the commit the results
-# are published under. Each emulator runs alone, pinned to two CPUs
-# (benchmark/compose.yml), with the client on the other two, so Rust and Java
-# are measured on the same resources.
+# first, to backfill the charts. The load generator (src/bin/loadgen.rs) is
+# built once from the ref the workflow runs on; a tag only selects the image
+# and the commit the results are published under. Each emulator runs alone,
+# pinned to two CPUs (benchmark/compose.yml), with the load generator on the
+# other two, so Rust and Java are measured on the same resources.
 
 on:
   workflow_call:
@@ -20,7 +20,7 @@ on:
         default: "10"
       num_runs:
         type: string
-        default: "20"
+        default: "100"
       repeat:
         type: string
         default: "3"
@@ -37,7 +37,7 @@ on:
       num_runs:
         description: "Timed runs per client per scenario"
         required: false
-        default: "20"
+        default: "100"
       repeat:
         description: "Whole-run repeats; the median is published"
         required: false
@@ -62,11 +62,42 @@ jobs:
           [ "$tags" != "[]" ] || { echo "::error::no tags given"; exit 1; }
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
+  build-loadgen:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loadgen
+
+      - name: Build the load generator
+        shell: bash
+        run: cargo build --release --locked --features loadgen --bin loadgen
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loadgen
+          path: target/release/loadgen
+          retention-days: 1
+
   # One tag at a time; GitHub starts matrix jobs in list order in practice but
   # does not promise it, so the page orders points by commit date rather than
   # by publication order. A tag whose benchmark fails does not stop the others.
   benchmark:
-    needs: plan
+    needs: [plan, build-loadgen]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -80,9 +111,9 @@ jobs:
     env:
       TAG: ${{ matrix.tag }}
       NUM_CLIENTS: ${{ inputs.num_clients || '10' }}
-      NUM_RUNS: ${{ inputs.num_runs || '20' }}
+      NUM_RUNS: ${{ inputs.num_runs || '100' }}
       REPEAT: ${{ inputs.repeat || '3' }}
-      WARMUP_RUNS: "5"
+      WARMUP_RUNS: "10"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -102,6 +133,15 @@ jobs:
         shell: bash
         run: poetry install --no-interaction --no-root
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: loadgen
+          path: bin
+
+      - name: Make the load generator executable
+        shell: bash
+        run: chmod +x bin/loadgen
+
       - name: Pull the emulator images
         shell: bash
         run: |
@@ -116,11 +156,13 @@ jobs:
           export DATASTORE_EMULATOR_VERSION="${TAG#v}"
           docker compose -f benchmark/compose.yml up -d rust
           bash benchmark/wait_for_port.sh 8042
-          taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
-            --target rust --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
-            --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+          poetry run python benchmark/sample.py \
             --container "$(docker compose -f benchmark/compose.yml ps -q rust)" \
-            --json-out benchmark-output/rust.json
+            --json benchmark-output/rust.json -- \
+            taskset -c 2,3 bin/loadgen \
+              --target rust --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
+              --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+              --json-out benchmark-output/rust.json
           docker compose -f benchmark/compose.yml stop rust
 
       # The Java emulator can die or hang under load; a failure here still
@@ -133,11 +175,13 @@ jobs:
           set -euo pipefail
           docker compose -f benchmark/compose.yml up -d google
           bash benchmark/wait_for_port.sh 8044
-          taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
-            --target java --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
-            --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+          poetry run python benchmark/sample.py \
             --container "$(docker compose -f benchmark/compose.yml ps -q google)" \
-            --json-out benchmark-output/java.json
+            --json benchmark-output/java.json -- \
+            taskset -c 2,3 bin/loadgen \
+              --target java --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
+              --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+              --json-out benchmark-output/java.json
           docker compose -f benchmark/compose.yml stop google
 
       - name: Google emulator logs
