@@ -25,7 +25,20 @@ Once you have poetry installed, you can install the dependencies by running the 
 poetry install
 ```
 
-Once the dependencies are installed, run the benchmark against both emulators:
+Build the load generator and run it against both emulators:
+
+```bash
+cargo build --release --features loadgen --bin loadgen
+./target/release/loadgen --num-clients 10 --num-runs 20 --warmup-runs 5 --repeat 3
+```
+
+The load generator (`src/bin/loadgen.rs`) is a gRPC client on the emulator's
+own generated `DatastoreClient`, so a call costs microseconds on the client
+side and the emulators are what gets measured. `benchmark/test_benchmark.py`
+runs the same scenarios through the Python `google-cloud-datastore` client and
+shows what a Python application sees instead; with it the client is the
+bottleneck (one core under the GIL, ~2 ms per call) and most scenarios come
+out at 1x whatever the emulator does:
 
 ```bash
 poetry run python benchmark/test_benchmark.py --num-clients 10 --num-runs 20 --warmup-runs 5 --repeat 3
@@ -66,10 +79,12 @@ Operation: Single Insert
 ```
 
 `--target rust` or `--target java` benchmarks one emulator (`--host` overrides its
-URL). `--container NAME` samples that emulator's container through `docker stats`
-while the clients run and reports mean and peak CPU (percent of one core) and
-peak and final memory. If an emulator stops answering, the run aborts with exit
-code 2 and says which scenario and how many clients failed.
+URL). If an emulator stops answering, the run aborts with exit code 2 and says
+which scenario and how many clients failed. `benchmark/sample.py --container NAME
+--json out.json <command...>` runs either harness while sampling that emulator's
+container through `docker stats` and adds mean and peak CPU (percent of one core)
+and peak and final memory to the JSON (`test_benchmark.py --container` does the
+same on its own).
 
 ### Emitting JSON for the continuous dashboard
 
@@ -107,6 +122,8 @@ benchmarked with the current scenarios to backfill the charts.
 
 The page at `dev/bench/index.html` on `gh-pages` is customized to draw both
 emulators on one chart per scenario; the action keeps it as it only writes
-that file when it does not exist.
+that file when it does not exist. The workflow builds the load generator once
+(`build-loadgen`, cached with `Swatinem/rust-cache`) and each tag's job downloads
+it as an artifact.
 
 [gab]: https://github.com/benchmark-action/github-action-benchmark

@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "network-programming", "database"]
 include = [
     "/benches/**",
     "/src/*.rs",
+    "/src/bin/**",
     "/proto/**",
     "/build.rs",
     "/Cargo.toml",
@@ -25,6 +26,16 @@ include = [
 name = "datastore_emulator"
 path = "src/lib.rs"
 doctest = false
+
+# The benchmark load generator; not part of the default build or install:
+#   cargo build --release --features loadgen --bin loadgen
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+required-features = ["loadgen"]
+
+[features]
+loadgen = []
 
 [dependencies]
 tonic = { version = "0.9", features=["gzip"] }
