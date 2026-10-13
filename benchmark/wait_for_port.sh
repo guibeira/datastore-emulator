@@ -3,13 +3,14 @@
 # A bound socket is not enough: the Java emulator listens before it is ready.
 set -euo pipefail
 port="$1"
-for attempt in $(seq 1 60); do
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
   if curl -sf --max-time 5 -o /dev/null "http://localhost:${port}/"; then
     echo "Port ${port} answers."
     exit 0
   fi
   sleep 2
 done
-echo "::error::Emulator on port ${port} did not answer in time."
+echo "::error::Emulator on port ${port} did not answer within two minutes."
 docker compose -f benchmark/compose.yml logs || true
 exit 1
