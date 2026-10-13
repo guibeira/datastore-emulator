@@ -62,8 +62,9 @@ jobs:
           [ "$tags" != "[]" ] || { echo "::error::no tags given"; exit 1; }
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
-  # One tag at a time, in the given order, so the results land on gh-pages in
-  # sequence; a tag whose benchmark fails does not stop the others.
+  # One tag at a time; GitHub starts matrix jobs in list order in practice but
+  # does not promise it, so the page orders points by commit date rather than
+  # by publication order. A tag whose benchmark fails does not stop the others.
   benchmark:
     needs: plan
     runs-on: ubuntu-24.04
@@ -171,7 +172,9 @@ jobs:
           benchmark-data-dir-path: dev/bench
           auto-push: true
           alert-threshold: "150%"
-          comment-on-alert: true
+          # Alerts compare against the previous entry, which a backfill run
+          # by hand makes meaningless; comment only on releases.
+          comment-on-alert: ${{ github.event_name == 'push' }}
           fail-on-alert: false
           summary-always: true
 
