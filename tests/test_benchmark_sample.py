@@ -72,3 +72,16 @@ def test_main_wires_the_container_and_the_command(tmp_path):
 
     assert code == 0 and made == ["abc123"]
     assert json.loads(out.read_text())["resources"]["Rust"]["samples"] == 2
+
+
+def test_main_takes_the_command_without_a_separator(tmp_path):
+    """`poetry run` swallows `--`, so the command is simply what follows the options."""
+    out = tmp_path / "rust.json"
+
+    def factory(container):
+        return StatsSampler(container, command=[sys.executable, "-c", FAKE_STATS])
+
+    code = main(["--container", "abc123", "--json", str(out), *_writer(out)], sampler_factory=factory)
+
+    assert code == 0
+    assert json.loads(out.read_text())["resources"]["Rust"]["samples"] == 2

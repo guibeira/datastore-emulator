@@ -81,7 +81,7 @@ Operation: Single Insert
 `--target rust` or `--target java` benchmarks one emulator (`--host` overrides its
 URL). If an emulator stops answering, the run aborts with exit code 2 and says
 which scenario and how many clients failed. `benchmark/sample.py --container NAME
---json out.json -- <command>` runs either harness while sampling that emulator's
+--json out.json <command...>` runs either harness while sampling that emulator's
 container through `docker stats` and adds mean and peak CPU (percent of one core)
 and peak and final memory to the JSON (`test_benchmark.py --container` does the
 same on its own).

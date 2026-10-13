@@ -158,7 +158,7 @@ jobs:
           bash benchmark/wait_for_port.sh 8042
           poetry run python benchmark/sample.py \
             --container "$(docker compose -f benchmark/compose.yml ps -q rust)" \
-            --json benchmark-output/rust.json -- \
+            --json benchmark-output/rust.json \
             taskset -c 2,3 bin/loadgen \
               --target rust --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
               --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
@@ -177,7 +177,7 @@ jobs:
           bash benchmark/wait_for_port.sh 8044
           poetry run python benchmark/sample.py \
             --container "$(docker compose -f benchmark/compose.yml ps -q google)" \
-            --json benchmark-output/java.json -- \
+            --json benchmark-output/java.json \
             taskset -c 2,3 bin/loadgen \
               --target java --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
               --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
