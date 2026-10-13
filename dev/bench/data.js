@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791921378218,
+  "lastUpdate": 1791921656565,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -382,6 +382,388 @@ window.BENCHMARK_DATA = {
             "value": 0.007831,
             "unit": "s",
             "extra": "10 clients, 100 runs/client, 10 warm-up, median of 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "github-actions[bot]@users.noreply.github.com"
+          },
+          "id": "2b8357eb6a477a3eb7d9a981562aeee096d21c97",
+          "message": "chore(release): v0.1.1",
+          "timestamp": "2026-05-16T16:04:55Z",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/2b8357eb6a477a3eb7d9a981562aeee096d21c97"
+        },
+        "date": 1791921656009,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Bulk Insert (50) (Rust) - avg seconds per client",
+            "value": 0.053282,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - p50 s/op",
+            "value": 0.002668,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Rust) - p95 s/op",
+            "value": 0.002877,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - avg seconds per client",
+            "value": 1.331652,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - p50 s/op",
+            "value": 0.063375,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Bulk Insert (50) (Java) - p95 s/op",
+            "value": 0.122645,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Rust) - avg seconds per client",
+            "value": 1.124352,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Rust) - p50 s/op",
+            "value": 0.057402,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Rust) - p95 s/op",
+            "value": 0.071854,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Java) - avg seconds per client",
+            "value": 3.953797,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Java) - p50 s/op",
+            "value": 0.200633,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Cursor Pagination (5x100) (Java) - p95 s/op",
+            "value": 0.324661,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Rust) - avg seconds per client",
+            "value": 0.009834,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Rust) - p50 s/op",
+            "value": 0.000469,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Rust) - p95 s/op",
+            "value": 0.000788,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Java) - avg seconds per client",
+            "value": 0.039423,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Java) - p50 s/op",
+            "value": 0.001878,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get (Java) - p95 s/op",
+            "value": 0.003457,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Rust) - avg seconds per client",
+            "value": 0.039323,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Rust) - p50 s/op",
+            "value": 0.00203,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Rust) - p95 s/op",
+            "value": 0.003396,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Java) - avg seconds per client",
+            "value": 0.125626,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Java) - p50 s/op",
+            "value": 0.006017,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Get Multi (100) (Java) - p95 s/op",
+            "value": 0.010849,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Rust) - avg seconds per client",
+            "value": 0.50412,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Rust) - p50 s/op",
+            "value": 0.025092,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Rust) - p95 s/op",
+            "value": 0.03368,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Java) - avg seconds per client",
+            "value": 3.891554,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Java) - p50 s/op",
+            "value": 0.184548,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Mixed (get, get_multi, update, query) (Java) - p95 s/op",
+            "value": 0.332693,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Rust) - avg seconds per client",
+            "value": 0.189525,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Rust) - p50 s/op",
+            "value": 0.00976,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Rust) - p95 s/op",
+            "value": 0.014051,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Java) - avg seconds per client",
+            "value": 0.992182,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Java) - p50 s/op",
+            "value": 0.046868,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Query Filter+Order (5k) (Java) - p95 s/op",
+            "value": 0.103105,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - avg seconds per client",
+            "value": 0.341285,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - p50 s/op",
+            "value": 0.017235,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Rust) - p95 s/op",
+            "value": 0.027318,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - avg seconds per client",
+            "value": 3.291596,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - p50 s/op",
+            "value": 0.153918,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Simple Query (Java) - p95 s/op",
+            "value": 0.352989,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Rust) - avg seconds per client",
+            "value": 0.011905,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Rust) - p50 s/op",
+            "value": 0.000578,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Rust) - p95 s/op",
+            "value": 0.000951,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - avg seconds per client",
+            "value": 0.07564,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - p50 s/op",
+            "value": 0.003601,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Single Insert (Java) - p95 s/op",
+            "value": 0.006321,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Rust) - avg seconds per client",
+            "value": 0.042494,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Rust) - p50 s/op",
+            "value": 0.002074,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Rust) - p95 s/op",
+            "value": 0.002802,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Java) - avg seconds per client",
+            "value": 0.109977,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Java) - p50 s/op",
+            "value": 0.005292,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Transaction RMW (Java) - p95 s/op",
+            "value": 0.008671,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Rust) - avg seconds per client",
+            "value": 0.02316,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Rust) - p50 s/op",
+            "value": 0.001128,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Rust) - p95 s/op",
+            "value": 0.001619,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Java) - avg seconds per client",
+            "value": 0.104252,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Java) - p50 s/op",
+            "value": 0.004986,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          },
+          {
+            "name": "Update (Java) - p95 s/op",
+            "value": 0.008009,
+            "unit": "s",
+            "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
           }
         ]
       }
