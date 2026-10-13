@@ -119,6 +119,7 @@ jobs:
           taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
             --target rust --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
             --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+            --container "$(docker compose -f benchmark/compose.yml ps -q rust)" \
             --json-out benchmark-output/rust.json
           docker compose -f benchmark/compose.yml stop rust
 
@@ -135,6 +136,7 @@ jobs:
           taskset -c 2,3 poetry run python benchmark/test_benchmark.py \
             --target java --num-clients "$NUM_CLIENTS" --num-runs "$NUM_RUNS" \
             --warmup-runs "$WARMUP_RUNS" --repeat "$REPEAT" \
+            --container "$(docker compose -f benchmark/compose.yml ps -q google)" \
             --json-out benchmark-output/java.json
           docker compose -f benchmark/compose.yml stop google
 
@@ -146,12 +148,14 @@ jobs:
           docker compose -f benchmark/compose.yml logs google || true
 
       - name: Merge results
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
           poetry run python benchmark/merge_results.py --out-dir benchmark-output \
             benchmark-output/rust.json benchmark-output/java.json
-          cat benchmark-output/latency.json benchmark-output/speedup.json
+          cat benchmark-output/latency.json benchmark-output/speedup.json benchmark-output/resources.json
+          echo "resources=$(jq 'length > 0' benchmark-output/resources.json)" >> "$GITHUB_OUTPUT"
 
       - name: Stop emulators
         if: always()
@@ -185,6 +189,23 @@ jobs:
           name: Datastore Emulator Speedup
           tool: customBiggerIsBetter
           output-file-path: benchmark-output/speedup.json
+          ref: ${{ matrix.tag }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          auto-push: true
+          alert-threshold: "150%"
+          comment-on-alert: false
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Publish resource usage
+        if: steps.merge.outputs.resources == 'true'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Datastore Emulator Resources
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-output/resources.json
           ref: ${{ matrix.tag }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           gh-pages-branch: gh-pages
