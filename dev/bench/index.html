@@ -127,15 +127,27 @@
         };
 
         function init() {
+          // Benches named "<test> (<series>) - <metric>" share one chart per
+          // "<test> - <metric>", one line per series (Rust vs Java).
+          const SERIES_PATTERN = /^(.*) \(([^()]+)\)( - .*)?$/;
+
           function collectBenchesPerTestCase(entries) {
             const map = new Map();
             for (const entry of entries) {
               const {commit, date, tool, benches} = entry;
               for (const bench of benches) {
-                const result = { commit, date, tool, bench };
-                const arr = map.get(bench.name);
+                const m = SERIES_PATTERN.exec(bench.name);
+                const chartName = m ? m[1] + (m[3] || '') : bench.name;
+                const series = m ? m[2] : bench.name;
+                const result = { commit, date, tool, bench, series };
+                let chart = map.get(chartName);
+                if (chart === undefined) {
+                  chart = new Map();
+                  map.set(chartName, chart);
+                }
+                const arr = chart.get(series);
                 if (arr === undefined) {
-                  map.set(bench.name, [result]);
+                  chart.set(series, [result]);
                 } else {
                   arr.push(result);
                 }
@@ -170,24 +182,62 @@
 
         function renderAllChars(dataSets) {
 
-          function renderGraph(parent, name, dataset) {
+          const seriesColors = {
+            Rust: '#dea584',
+            Java: '#b07219',
+          };
+          const fallbackColors = ['#3273dc', '#23d160', '#ff3860', '#a270ba', '#00d1b2'];
+
+          function renderGraph(parent, name, seriesMap) {
             const canvas = document.createElement('canvas');
             canvas.className = 'benchmark-chart';
             parent.appendChild(canvas);
 
-            const color = toolColors[dataset.length > 0 ? dataset[0].tool : '_'];
-            const data = {
-              labels: dataset.map(d => d.commit.id.slice(0, 7)),
-              datasets: [
-                {
-                  label: name,
-                  data: dataset.map(d => d.bench.value),
-                  borderColor: color,
-                  backgroundColor: color + '60', // Add alpha for #rrggbbaa
+            // Commits in first-seen order; a series missing a commit gets a gap.
+            const commits = [];
+            const commitIndex = new Map();
+            for (const points of seriesMap.values()) {
+              for (const point of points) {
+                if (!commitIndex.has(point.commit.id)) {
+                  commitIndex.set(point.commit.id, commits.length);
+                  commits.push(point);
                 }
-              ],
+              }
+            }
+
+            let fallback = 0;
+            const datasets = [];
+            for (const [series, points] of seriesMap.entries()) {
+              const color = seriesColors[series] || fallbackColors[fallback++ % fallbackColors.length];
+              const values = new Array(commits.length).fill(null);
+              const byIndex = new Array(commits.length).fill(null);
+              for (const point of points) {
+                const i = commitIndex.get(point.commit.id);
+                values[i] = point.bench.value;
+                byIndex[i] = point;
+              }
+              datasets.push({
+                label: series,
+                data: values,
+                points: byIndex,
+                borderColor: color,
+                backgroundColor: color + '60', // Add alpha for #rrggbbaa
+                fill: false,
+                spanGaps: true,
+              });
+            }
+
+            const unit = commits.length > 0 ? commits[0].bench.unit : '';
+            const data = {
+              labels: commits.map(d => d.commit.id.slice(0, 7)),
+              datasets,
             };
             const options = {
+              title: {
+                display: true,
+                text: name,
+                fontSize: 16,
+              },
               scales: {
                 xAxes: [
                   {
@@ -201,7 +251,7 @@
                   {
                     scaleLabel: {
                       display: true,
-                      labelString: dataset.length > 0 ? dataset[0].bench.unit : '',
+                      labelString: unit,
                     },
                     ticks: {
                       beginAtZero: true,
@@ -210,24 +260,28 @@
                 ],
               },
               tooltips: {
+                mode: 'index',
+                intersect: false,
                 callbacks: {
                   afterTitle: items => {
                     const {index} = items[0];
-                    const data = dataset[index];
+                    const data = commits[index];
                     return '\n' + data.commit.message + '\n\n' + data.commit.timestamp + ' committed by @' + data.commit.committer.username + '\n';
                   },
                   label: item => {
-                    let label = item.value;
-                    const { range, unit } = dataset[item.index].bench;
-                    label += ' ' + unit;
-                    if (range) {
-                      label += ' (' + range + ')';
+                    const point = datasets[item.datasetIndex].points[item.index];
+                    if (!point) {
+                      return null;
+                    }
+                    let label = datasets[item.datasetIndex].label + ': ' + item.value + ' ' + point.bench.unit;
+                    if (point.bench.range) {
+                      label += ' (' + point.bench.range + ')';
                     }
                     return label;
                   },
                   afterLabel: item => {
-                    const { extra } = dataset[item.index].bench;
-                    return extra ? '\n' + extra : '';
+                    const point = datasets[item.datasetIndex].points[item.index];
+                    return point && point.bench.extra ? '  ' + point.bench.extra : '';
                   }
                 }
               },
@@ -237,7 +291,7 @@
                 }
                 // XXX: Undocumented. How can we know the index?
                 const index = activeElems[0]._index;
-                const url = dataset[index].commit.url;
+                const url = commits[index].commit.url;
                 window.open(url, '_blank');
               },
             };
@@ -263,8 +317,8 @@
             graphsElem.className = 'benchmark-graphs';
             setElem.appendChild(graphsElem);
 
-            for (const [benchName, benches] of benchSet.entries()) {
-              renderGraph(graphsElem, benchName, benches)
+            for (const [chartName, seriesMap] of benchSet.entries()) {
+              renderGraph(graphsElem, chartName, seriesMap)
             }
           }
 
