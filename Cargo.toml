@@ -38,9 +38,9 @@ required-features = ["loadgen"]
 loadgen = []
 
 [dependencies]
-tonic = { version = "0.9", features=["gzip"] }
-prost = "0.11"
-prost-types = "0.11"
+tonic = { version = "0.12", features=["gzip"] }
+prost = "0.13"
+prost-types = "0.13"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -53,28 +53,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 byteorder = "1.5.0"
 crc32c = "0.6.8"
 rayon = "1.10"
-tonic-health = "0.9"
-axum = "0.6"
-hyper = "0.14"
-tower = { version = "0.4", features = ["util"] }
-zip = "4.0.0"
+tonic-health = "0.12"
+axum = { version = "0.7", features = ["http2"] }
+tower = { version = "0.5", features = ["util"] }
+zip = "9.0.0"
 bincode = { version = "2.0.1", features = ["serde"] }
 base64 = "0.21"
 gcloud-storage = "1.3.0"
 clap = { version = "4.5.40", features = ["derive"] }
-pbjson = "0.5"
-pbjson-types = "0.5"
-tower-http = { version = "0.4", features = ["cors"] }
+pbjson = "0.7"
+pbjson-types = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
 mimalloc = "0.1"
 parking_lot = "0.12"
 
 [build-dependencies]
-tonic-build = "0.9"
-pbjson-build = "0.5"
+tonic-build = "0.12"
+pbjson-build = "0.7"
 
 [dev-dependencies]
 once_cell = "1.21.3"
-reqwest = { version = "0.11", features = ["json"] }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 
 [[bench]]

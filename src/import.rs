@@ -382,8 +382,8 @@ fn extract_zip_to_dir(
     let mut archive = zip::ZipArchive::new(zip_file)?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let outpath = dump_path.join(file.mangled_name());
-        if file.name().ends_with('/') {
+        let outpath = dump_path.join(file.mangled_name()?);
+        if file.name()?.ends_with('/') {
             std::fs::create_dir_all(&outpath)?;
         } else {
             if let Some(p) = outpath.parent() {

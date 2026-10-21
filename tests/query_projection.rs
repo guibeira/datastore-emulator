@@ -350,7 +350,7 @@ async fn projection_rows_page_with_cursors() {
         assert_eq!(batch.entity_result_type, 2);
         all.extend(rows(&batch));
         cursor = batch.end_cursor.clone();
-        if MoreResultsType::from_i32(batch.more_results) == Some(MoreResultsType::NoMoreResults) {
+        if MoreResultsType::try_from(batch.more_results) == Ok(MoreResultsType::NoMoreResults) {
             break;
         }
     }

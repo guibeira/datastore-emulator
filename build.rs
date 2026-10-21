@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_well_known_types(true)
         .extern_path(".google.protobuf", "::pbjson_types")
         .file_descriptor_set_path(&descriptor_path)
-        .compile(&protos, &includes)?;
+        .compile_protos(&protos, &includes)?;
 
     let descriptor_set = std::fs::read(&descriptor_path)?;
     pbjson_build::Builder::new()

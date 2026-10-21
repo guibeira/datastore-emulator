@@ -82,7 +82,9 @@ async fn grpc_and_rest_lookup_return_same_data() {
         )
         .await
         .unwrap();
-    let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["found"][0]["version"], "7");
     assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["kind"], "Task");

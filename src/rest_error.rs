@@ -99,7 +99,9 @@ mod tests {
     use super::*;
 
     async fn body_to_json(resp: Response) -> serde_json::Value {
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 

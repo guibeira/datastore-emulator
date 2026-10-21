@@ -1,18 +1,14 @@
-use axum::{
-    body::{Body, boxed},
-    http::Request,
-};
+use axum::{body::Body, http::Request};
 use clap::Parser;
 use datastore_emulator::{
     AppState, DatastoreEmulator, api::create_router,
     google::datastore::v1::datastore_server::DatastoreServer,
 };
-use hyper::server::conn::AddrIncoming;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::signal;
+use tokio::{net::TcpListener, signal};
 use tonic::server::NamedService;
 use tracing_subscriber::EnvFilter;
 
@@ -66,9 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .max_decoding_message_size(16 * 1024 * 1024); // 16 MB
     let grpc_path = format!("/{}/*rest", DatastoreServer::<DatastoreEmulator>::NAME);
     let datastore_service =
-        tower::ServiceExt::<Request<Body>>::map_response(datastore_service, |res| res.map(boxed));
+        tower::ServiceExt::<Request<Body>>::map_response(datastore_service, |res| {
+            res.map(Body::new)
+        });
     let health_service =
-        tower::ServiceExt::<Request<Body>>::map_response(health_service, |res| res.map(boxed));
+        tower::ServiceExt::<Request<Body>>::map_response(health_service, |res| res.map(Body::new));
 
     let app = create_router(app_state.clone())
         .route_service(&grpc_path, datastore_service)
@@ -79,9 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listen_addr
     );
 
-    let mut incoming = AddrIncoming::bind(&listen_addr)?;
-    incoming.set_nodelay(true);
-    let server = axum::Server::builder(incoming).serve(app.into_make_service());
+    let listener = TcpListener::bind(listen_addr).await?;
+    let server = axum::serve(listener, app.into_make_service()).tcp_nodelay(true);
 
     // --- Run the server with graceful shutdown ---
     tokio::select! {
