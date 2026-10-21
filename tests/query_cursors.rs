@@ -165,7 +165,7 @@ fn result_names(batch: &QueryResultBatch) -> Vec<String> {
 }
 
 fn more_results(batch: &QueryResultBatch) -> MoreResultsType {
-    MoreResultsType::from_i32(batch.more_results).expect("more_results")
+    MoreResultsType::try_from(batch.more_results).expect("more_results")
 }
 
 /// Pages with `end_cursor` like google-cloud-ndb `fetch_page`, which uses the

@@ -338,7 +338,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             v["error"]["message"]
@@ -384,7 +386,9 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "application/x-protobuf");
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let decoded = LookupResponse::decode(bytes).unwrap();
         assert_eq!(decoded.found.len(), 1);
         let key = decoded.found[0]
@@ -424,7 +428,9 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(resp.headers()["content-type"], "application/x-protobuf");
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status = crate::rest_error::RpcStatus::decode(bytes).unwrap();
         assert_eq!(status.code, tonic::Code::InvalidArgument as i32);
         assert!(!status.message.is_empty());
@@ -455,7 +461,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["found"].is_array());
         assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["kind"], "Task");
@@ -484,7 +492,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["batch"].is_object());
     }
@@ -524,7 +534,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["mutationResults"].is_array());
         assert_eq!(state.storage.read().entities.len(), 1);
@@ -552,7 +564,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["transaction"].as_str().unwrap().len() > 0);
     }
@@ -611,7 +625,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             v["keys"][0]["path"][0]["id"]
@@ -676,7 +692,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             v["batch"]["aggregationResults"][0]["aggregateProperties"]["total"]["integerValue"],
@@ -709,7 +727,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["missing"].is_array());
         assert!(!v["missing"].as_array().unwrap().is_empty());
@@ -737,7 +757,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["metadata"]["common"]["state"], "FAILED");
 
@@ -825,7 +847,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let bytes = hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], 404);
         assert!(v["error"]["message"].as_str().unwrap().contains("bogus"));
