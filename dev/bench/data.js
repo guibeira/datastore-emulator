@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792604000318,
+  "lastUpdate": 1792604002576,
   "repoUrl": "https://github.com/guibeira/datastore-emulator",
   "entries": {
     "Datastore Emulator Benchmark": [
@@ -4210,6 +4210,78 @@ window.BENCHMARK_DATA = {
             "value": 1643.52,
             "unit": "MB",
             "extra": "10 clients, 20 runs/client, 10 warm-up, median of 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "committer": {
+            "email": "github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "distinct": true,
+          "id": "76097ca1e69fea9abdd28f7b0758c7c222d017cf",
+          "message": "chore(release): v0.1.8",
+          "timestamp": "2026-10-21T17:14:59Z",
+          "tree_id": "3f7c57ef9a4ae4845b18a494fb9d57c73fd4c0fd",
+          "url": "https://github.com/guibeira/datastore-emulator/commit/76097ca1e69fea9abdd28f7b0758c7c222d017cf"
+        },
+        "date": 1792604001927,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "CPU (Rust) - mean %",
+            "value": 116.22,
+            "unit": "%",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "CPU (Rust) - peak %",
+            "value": 175.18,
+            "unit": "%",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Memory (Rust) - peak MB",
+            "value": 75.24,
+            "unit": "MB",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Memory (Rust) - end MB",
+            "value": 75.24,
+            "unit": "MB",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "CPU (Java) - mean %",
+            "value": 148.91,
+            "unit": "%",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "CPU (Java) - peak %",
+            "value": 205.1,
+            "unit": "%",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Memory (Java) - peak MB",
+            "value": 1827.84,
+            "unit": "MB",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
+          },
+          {
+            "name": "Memory (Java) - end MB",
+            "value": 1816.58,
+            "unit": "MB",
+            "extra": "10 clients, 20 runs/client, 5 warm-up, median of 3"
           }
         ]
       }
