@@ -5,10 +5,11 @@
 use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
-        ArrayValue, Entity, Key, KindExpression, PartitionId, Projection, PropertyOrder,
-        PropertyReference, Query, QueryResultBatch, RunQueryRequest, Value,
+        ArrayValue, Entity, Filter, Key, KindExpression, PartitionId, Projection, PropertyFilter,
+        PropertyOrder, PropertyReference, Query, QueryResultBatch, RunQueryRequest, Value,
+        filter::FilterType,
         key::{PathElement, path_element::IdType},
-        property_order,
+        property_filter, property_order,
         query_result_batch::MoreResultsType,
         run_query_request::QueryType,
         value::ValueType,
@@ -253,6 +254,98 @@ async fn projection_resolves_dotted_paths() {
         rows(&batch),
         vec![row("e", vec![("address.city", text("Lisbon"))])]
     );
+}
+
+#[tokio::test]
+async fn projection_preserves_unprojected_sort_properties_until_results_are_built() {
+    let storage = storage_with(vec![
+        entity("a", vec![("rank", int(20)), ("title", text("second"))]),
+        entity("z", vec![("rank", int(10)), ("title", text("first"))]),
+        entity("missing", vec![("title", text("missing rank"))]),
+        entity(
+            "unindexed",
+            vec![
+                ("rank", excluded(int(1))),
+                ("title", text("unindexed rank")),
+            ],
+        ),
+    ]);
+    let batch = run(
+        &storage,
+        with_order(
+            projected(&["title"]),
+            "rank",
+            property_order::Direction::Ascending,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        rows(&batch),
+        vec![
+            row("z", vec![("title", text("first"))]),
+            row("a", vec![("title", text("second"))]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn projection_preserves_implicit_inequality_order_properties() {
+    let storage = storage_with(vec![
+        entity(
+            "z",
+            vec![("author", text("author2")), ("target", text("exp3"))],
+        ),
+        entity(
+            "a",
+            vec![("author", text("author3")), ("target", text("exp1"))],
+        ),
+        entity(
+            "self",
+            vec![("author", text("author1")), ("target", text("exp2"))],
+        ),
+    ]);
+    let mut query = projected(&["target"]);
+    query.filter = Some(Filter {
+        filter_type: Some(FilterType::PropertyFilter(PropertyFilter {
+            property: Some(PropertyReference {
+                name: "author".to_string(),
+            }),
+            op: property_filter::Operator::GreaterThan as i32,
+            value: Some(text("author1")),
+        })),
+    });
+    let batch = run(&storage, query).await;
+
+    assert_eq!(
+        rows(&batch),
+        vec![
+            row("z", vec![("target", text("exp3"))]),
+            row("a", vec![("target", text("exp1"))]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn projection_cursor_keeps_the_unprojected_sort_value() {
+    let storage = storage_with(vec![
+        entity("a", vec![("rank", int(20)), ("title", text("same"))]),
+        entity("z", vec![("rank", int(10)), ("title", text("same"))]),
+    ]);
+    let query = limited(
+        with_order(
+            projected(&["title"]),
+            "rank",
+            property_order::Direction::Ascending,
+        ),
+        1,
+    );
+    let first = run(&storage, query.clone()).await;
+    let mut next = query;
+    next.start_cursor = first.end_cursor;
+    let second = run(&storage, next).await;
+
+    assert_eq!(rows(&second), vec![row("a", vec![("title", text("same"))])]);
 }
 
 /// `e1=[b,d]`, `e2=[a,c]`.

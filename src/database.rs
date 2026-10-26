@@ -1782,10 +1782,27 @@ fn projected_index_values<'a>(
 /// Expands a candidate into one row per combination of the indexed values of
 /// the projected properties, like an index scan. A row holds one value per
 /// projected property. An entity without an indexed value for some projected
-/// property yields no rows.
-fn expand_projection_rows(candidate: QueryCandidate, names: &[&str]) -> Vec<QueryCandidate> {
+/// property yields no rows. Unprojected ordering properties are retained until
+/// sorting and cursor construction finish, then omitted from the response.
+fn expand_projection_rows(
+    candidate: QueryCandidate,
+    names: &[&str],
+    order: &[PropertyOrder],
+) -> Vec<QueryCandidate> {
     let source = candidate.entity_metadata.as_ref();
-    let mut rows: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+    let ordering_properties = order
+        .iter()
+        .filter_map(|order_by| order_by.property.as_ref())
+        .filter(|property| !names.contains(&property.name.as_str()))
+        .filter_map(|property| {
+            source
+                .entity
+                .properties
+                .get(&property.name)
+                .map(|value| (property.name.clone(), value.clone()))
+        })
+        .collect();
+    let mut rows: Vec<HashMap<String, Value>> = vec![ordering_properties];
     for &name in names {
         let values: Vec<Value> = projected_index_values(&source.entity.properties, name)
             .into_iter()
@@ -2968,7 +2985,9 @@ impl DatastoreStorage {
             if !projected_names.is_empty() {
                 filtered_entities = filtered_entities
                     .into_iter()
-                    .flat_map(|candidate| expand_projection_rows(candidate, &projected_names))
+                    .flat_map(|candidate| {
+                        expand_projection_rows(candidate, &projected_names, &order)
+                    })
                     .collect();
             }
             filtered_entities.retain(|candidate| has_indexed_order_values(candidate, &order));
@@ -3032,24 +3051,6 @@ impl DatastoreStorage {
                 break;
             }
 
-            let entity_size_bytes = if is_keys_only {
-                entity_metadata
-                    .entity
-                    .key
-                    .as_ref()
-                    .map_or(0, Message::encoded_len)
-            } else {
-                entity_metadata.entity.encoded_len()
-            };
-            let cursor = encode_cursor(Some(candidate), &order);
-            let result_size_bytes = entity_size_bytes + cursor.len();
-            if !results.is_empty()
-                && (current_entities_payload_size + result_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
-            {
-                new_more_results_state = MoreResultsType::NotFinished;
-                break;
-            }
-
             // Apply projection
             let result_entity = if is_keys_only {
                 Entity {
@@ -3072,6 +3073,20 @@ impl DatastoreStorage {
             } else {
                 entity_metadata.entity.clone()
             };
+
+            let entity_size_bytes = if is_keys_only {
+                result_entity.key.as_ref().map_or(0, Message::encoded_len)
+            } else {
+                result_entity.encoded_len()
+            };
+            let cursor = encode_cursor(Some(candidate), &order);
+            let result_size_bytes = entity_size_bytes + cursor.len();
+            if !results.is_empty()
+                && (current_entities_payload_size + result_size_bytes > MAX_ENTITIES_PAYLOAD_BYTES)
+            {
+                new_more_results_state = MoreResultsType::NotFinished;
+                break;
+            }
 
             let (create_time, update_time, version) = if entity_result_type == 1 {
                 (
