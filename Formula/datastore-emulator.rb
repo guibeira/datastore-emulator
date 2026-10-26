@@ -2,21 +2,21 @@ class DatastoreEmulator < Formula
   desc "Google Cloud Datastore emulator written in Rust"
   homepage "https://github.com/guibeira/datastore-emulator"
   license "MIT"
-  version "0.1.9"
+  version "0.1.10"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.9/datastore-emulator-0.1.9-aarch64-apple-darwin.tar.gz"
-      sha256 "8c32f8a2f9465996d4082dc5892eec77e2354f1cf7961403b18dd2661b3a601b"
+      url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.10/datastore-emulator-0.1.10-aarch64-apple-darwin.tar.gz"
+      sha256 "35cbf99f5da1fb46dac602a2c54c715a40f8bbacf372aa7fda50a3cff8cec442"
     else
-      url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.9/datastore-emulator-0.1.9-x86_64-apple-darwin.tar.gz"
-      sha256 "d9fba57761b66b390df8f40d82083b94f01ed1b306e09f15d4811164e2ea41e6"
+      url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.10/datastore-emulator-0.1.10-x86_64-apple-darwin.tar.gz"
+      sha256 "430abc4e6bb79068806c741c8c54e8e197776bfb1c9ce8266f9db1066c2f77cf"
     end
   end
 
   on_linux do
-    url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.9/datastore-emulator-0.1.9-x86_64-unknown-linux-gnu.tar.gz"
-    sha256 "ea44dcbfa631790c022a90548fa9971a7d394faff93a57705890f18281685d7a"
+    url "https://github.com/guibeira/datastore-emulator/releases/download/v0.1.10/datastore-emulator-0.1.10-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "c65ff1ef7128a21525f4519839816e8df1afb8a11fc336b894230adda135fae5"
   end
 
   def install
