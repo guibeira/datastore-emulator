@@ -1207,8 +1207,12 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
 }
 
 // Transaction state
-#[derive(Debug)]
-pub struct TransactionState;
+#[derive(Debug, Default)]
+pub struct TransactionState {
+    pub read_only: bool,
+    pub reads: HashMap<KeyStruct, Option<Arc<EntityWithMetadata>>>,
+    pub conflicted: bool,
+}
 
 /// A query result candidate. Keys are compared through the entity key with
 /// `compare_keys`, so no per-candidate `KeyStruct` is built.
@@ -2457,6 +2461,8 @@ impl DatastoreStorage {
             None => (Arc::new(key_struct), None),
         };
 
+        self.invalidate_transaction_reads(&key_struct);
+
         self.entities
             .insert(Arc::clone(&key_struct), Arc::clone(&entity_metadata));
         self.upsert_scoped_entity(&key_struct, Arc::clone(&entity_metadata));
@@ -3425,10 +3431,19 @@ impl DatastoreStorage {
 
         let (key_struct, removed_entity_metadata) =
             self.entities.remove_entry(&key_struct_to_delete)?;
+        self.invalidate_transaction_reads(&key_struct);
         self.remove_from_indexes(&key_struct, &removed_entity_metadata.entity);
         self.remove_ancestor_indexes(&key_struct);
         self.remove_scoped_entity(&key_struct);
         Some(removed_entity_metadata)
+    }
+
+    fn invalidate_transaction_reads(&mut self, key: &KeyStruct) {
+        for transaction in self.transactions.values_mut() {
+            if !transaction.read_only && transaction.reads.contains_key(key) {
+                transaction.conflicted = true;
+            }
+        }
     }
 }
 

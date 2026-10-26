@@ -15,6 +15,8 @@ use crate::google::datastore::v1::{
     key::path_element::IdType,
     mutation::Operation,
     property_order,
+    read_options::ConsistencyType,
+    transaction_options,
     value::ValueType,
 };
 use parking_lot::RwLock;
@@ -90,6 +92,52 @@ fn validate_entity_property_names(entity: &Entity) -> Result<(), Status> {
     Ok(())
 }
 
+fn oversized_indexed_property(entity: &Entity) -> Option<&str> {
+    entity
+        .properties
+        .iter()
+        .find_map(|(name, value)| oversized_indexed_value(value, name))
+}
+
+fn oversized_indexed_value<'a>(value: &'a Value, name: &'a str) -> Option<&'a str> {
+    match value.value_type.as_ref() {
+        Some(ValueType::StringValue(s)) if !value.exclude_from_indexes && s.len() > 1500 => {
+            Some(name)
+        }
+        Some(ValueType::BlobValue(b)) if !value.exclude_from_indexes && b.len() > 1500 => {
+            Some(name)
+        }
+        Some(ValueType::EntityValue(entity)) => oversized_indexed_property(entity),
+        Some(ValueType::ArrayValue(array)) => array
+            .values
+            .iter()
+            .find_map(|element| oversized_indexed_value(element, name)),
+        _ => None,
+    }
+}
+
+fn normalize_entity_arrays(entity: &mut Entity) {
+    for value in entity.properties.values_mut() {
+        normalize_value_arrays(value);
+    }
+}
+
+fn normalize_value_arrays(value: &mut Value) {
+    match value.value_type.as_mut() {
+        Some(ValueType::EntityValue(entity)) => normalize_entity_arrays(entity),
+        Some(ValueType::ArrayValue(array)) => {
+            for element in &mut array.values {
+                normalize_value_arrays(element);
+            }
+            // The Google emulator stores indexed elements before unindexed elements.
+            array
+                .values
+                .sort_by_key(|element| element.exclude_from_indexes);
+        }
+        _ => {}
+    }
+}
+
 fn validate_value_property_names(value: &Value) -> Result<(), Status> {
     match value.value_type.as_ref() {
         Some(ValueType::EntityValue(entity)) => validate_entity_property_names(entity),
@@ -116,7 +164,13 @@ fn validate_mutation(operation: &Operation) -> Result<(), Status> {
     }
     match operation {
         Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
-            validate_entity_property_names(entity)
+            validate_entity_property_names(entity)?;
+            if let Some(name) = oversized_indexed_property(entity) {
+                return Err(Status::invalid_argument(format!(
+                    "The value of property \"{name}\" is longer than 1500 bytes."
+                )));
+            }
+            Ok(())
         }
         Operation::Delete(_) => Ok(()),
     }
@@ -287,12 +341,41 @@ pub async fn lookup(
     for key in &req.keys {
         check_request_database(&req.database_id, key.partition_id.as_ref())?;
     }
+    if let Some(ConsistencyType::Transaction(transaction)) = req
+        .read_options
+        .as_ref()
+        .and_then(|options| options.consistency_type.as_ref())
+    {
+        let id = std::str::from_utf8(transaction).map_err(|_| invalid_transaction())?;
+        let mut storage = storage.write();
+        let DatastoreStorage {
+            entities,
+            transactions,
+            ..
+        } = &mut *storage;
+        let transaction = transactions.get_mut(id).ok_or_else(invalid_transaction)?;
+        return Ok(lookup_response(&req.keys, |key| {
+            let key = KeyStruct::from_datastore_key(key);
+            transaction
+                .reads
+                .entry(key.clone())
+                .or_insert_with(|| entities.get(&key).cloned())
+                .clone()
+        }));
+    }
     let storage = storage.read();
+    Ok(lookup_response(&req.keys, |key| storage.get_entity(key)))
+}
+
+fn lookup_response(
+    keys: &[Key],
+    mut get_entity: impl FnMut(&Key) -> Option<Arc<EntityWithMetadata>>,
+) -> LookupResponse {
     let mut found = Vec::new();
     let mut missing = Vec::new();
 
-    for key in &req.keys {
-        let result_entity = storage.get_entity(key);
+    for key in keys {
+        let result_entity = get_entity(key);
         if let Some(entity) = result_entity {
             found.push(EntityResult {
                 entity: Some(entity.entity.clone()),
@@ -315,13 +398,13 @@ pub async fn lookup(
             });
         }
     }
-    Ok(LookupResponse {
+    LookupResponse {
         found,
         missing,
         deferred: vec![],
         transaction: Vec::new(),
         read_time: None,
-    })
+    }
 }
 
 /// Kindless queries may only order by ascending `__key__` and filter on `__key__`.
@@ -483,7 +566,14 @@ pub async fn commit(
                     return Err(Status::invalid_argument("Invalid transaction ID format"));
                 }
             },
-            TransactionSelector::SingleUseTransaction(_) => None,
+            TransactionSelector::SingleUseTransaction(options) => {
+                if matches!(options.mode, Some(transaction_options::Mode::ReadOnly(_))) {
+                    return Err(Status::invalid_argument(
+                        "A single-use commit transaction must be read-write.",
+                    ));
+                }
+                None
+            }
         }
     } else {
         None
@@ -505,11 +595,22 @@ pub async fn commit(
     // Everything above needs no storage; the write lock starts here.
     let mut storage = storage.write();
     if let Some(tx_id) = transaction_id.as_ref() {
-        if storage.transactions.contains_key(tx_id) {
-            tracing::info!("Committing transaction: {}", tx_id);
-        } else {
-            return Err(invalid_transaction());
+        let transaction = storage
+            .transactions
+            .get(tx_id)
+            .ok_or_else(invalid_transaction)?;
+        if transaction.read_only && !req.mutations.is_empty() {
+            return Err(Status::invalid_argument(
+                "Cannot perform mutations in a read-only transaction.",
+            ));
         }
+        if transaction.conflicted {
+            storage.clean_transaction(tx_id);
+            return Err(Status::aborted(
+                "too much contention on these datastore entities",
+            ));
+        }
+        tracing::info!("Committing transaction: {}", tx_id);
     }
     // Non-transactional commits may apply partially, like Datastore.
     if is_transactional || transaction_id.is_some() {
@@ -522,7 +623,8 @@ pub async fn commit(
     for mutation in req.mutations {
         if let Some(mutation) = mutation.operation {
             match mutation {
-                Operation::Insert(entity) => {
+                Operation::Insert(mut entity) => {
+                    normalize_entity_arrays(&mut entity);
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
                     if !allocates_key
                         && let Some(key) = entity.key.as_ref()
@@ -544,7 +646,8 @@ pub async fn commit(
                         }
                     }
                 }
-                Operation::Update(entity) => {
+                Operation::Update(mut entity) => {
+                    normalize_entity_arrays(&mut entity);
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for update"));
                     };
@@ -563,7 +666,8 @@ pub async fn commit(
 
                     mutation_results.push(commit_mutation_result(None, version as i64));
                 }
-                Operation::Upsert(entity) => {
+                Operation::Upsert(mut entity) => {
+                    normalize_entity_arrays(&mut entity);
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for upsert"));
                     };
@@ -633,11 +737,18 @@ pub async fn begin_transaction(
     let transaction_id = next_transaction_id("tx");
 
     let transaction_bytes = transaction_id.as_bytes().to_vec();
+    let read_only = req.transaction_options.as_ref().is_some_and(|options| {
+        matches!(options.mode, Some(transaction_options::Mode::ReadOnly(_)))
+    });
     {
         let mut storage = storage.write();
-        storage
-            .transactions
-            .insert(transaction_id, TransactionState);
+        storage.transactions.insert(
+            transaction_id,
+            TransactionState {
+                read_only,
+                ..Default::default()
+            },
+        );
     }
 
     let transaction_response = BeginTransactionResponse {
