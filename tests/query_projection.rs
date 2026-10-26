@@ -348,6 +348,100 @@ async fn projection_cursor_keeps_the_unprojected_sort_value() {
     assert_eq!(rows(&second), vec![row("a", vec![("title", text("same"))])]);
 }
 
+#[tokio::test]
+async fn projection_pages_by_indexed_values_of_unprojected_arrays() {
+    let storage = storage_with(vec![
+        entity(
+            "a",
+            vec![
+                ("rank", array(vec![int(30), excluded(int(1000)), int(10)])),
+                ("title", text("same")),
+            ],
+        ),
+        entity(
+            "z",
+            vec![
+                ("rank", array(vec![excluded(int(0)), int(50), int(20)])),
+                ("title", text("same")),
+            ],
+        ),
+        entity(
+            "empty",
+            vec![("rank", array(vec![])), ("title", text("same"))],
+        ),
+        entity(
+            "unindexed",
+            vec![
+                ("rank", array(vec![excluded(int(1))])),
+                ("title", text("same")),
+            ],
+        ),
+    ]);
+
+    for (direction, first_name, second_name) in [
+        (property_order::Direction::Ascending, "a", "z"),
+        (property_order::Direction::Descending, "z", "a"),
+    ] {
+        let mut query = limited(with_order(projected(&["title"]), "rank", direction), 1);
+        let first = run(&storage, query.clone()).await;
+        query.start_cursor = first.end_cursor.clone();
+        let second = run(&storage, query).await;
+
+        assert_eq!(
+            rows(&first),
+            vec![row(first_name, vec![("title", text("same"))])]
+        );
+        assert_eq!(
+            rows(&second),
+            vec![row(second_name, vec![("title", text("same"))])]
+        );
+    }
+}
+
+#[tokio::test]
+async fn projection_keeps_full_unprojected_values_for_distinct_groups() {
+    let storage = storage_with(vec![
+        entity(
+            "a",
+            vec![
+                ("rank", array(vec![int(10), int(20)])),
+                ("title", text("same")),
+            ],
+        ),
+        entity(
+            "b",
+            vec![
+                ("rank", array(vec![int(10), int(30)])),
+                ("title", text("same")),
+            ],
+        ),
+        entity(
+            "c",
+            vec![
+                ("rank", array(vec![int(10), int(20)])),
+                ("title", text("same")),
+            ],
+        ),
+    ]);
+    let query = with_distinct_on(
+        with_order(
+            projected(&["title"]),
+            "rank",
+            property_order::Direction::Ascending,
+        ),
+        "rank",
+    );
+    let batch = run(&storage, query).await;
+
+    assert_eq!(
+        rows(&batch),
+        vec![
+            row("a", vec![("title", text("same"))]),
+            row("b", vec![("title", text("same"))]),
+        ]
+    );
+}
+
 /// `e1=[b,d]`, `e2=[a,c]`.
 fn ordered_storage() -> Arc<RwLock<DatastoreStorage>> {
     storage_with(vec![

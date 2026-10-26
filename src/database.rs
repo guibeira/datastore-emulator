@@ -1787,19 +1787,26 @@ fn projected_index_values<'a>(
 fn expand_projection_rows(
     candidate: QueryCandidate,
     names: &[&str],
+    distinct_on: &[PropertyReference],
     order: &[PropertyOrder],
 ) -> Vec<QueryCandidate> {
     let source = candidate.entity_metadata.as_ref();
     let ordering_properties = order
         .iter()
-        .filter_map(|order_by| order_by.property.as_ref())
-        .filter(|property| !names.contains(&property.name.as_str()))
-        .filter_map(|property| {
-            source
-                .entity
-                .properties
-                .get(&property.name)
-                .map(|value| (property.name.clone(), value.clone()))
+        .filter_map(|order_by| {
+            let property = order_by.property.as_ref()?;
+            if names.contains(&property.name.as_str()) {
+                return None;
+            }
+            let value = source.entity.properties.get(&property.name)?;
+            // Ordering needs one indexed value; distinct signatures need the full value.
+            let retained = if distinct_on.iter().any(|p| p.name == property.name) {
+                value
+            } else {
+                let descending = order_by.direction == property_order::Direction::Descending as i32;
+                sort_value(value, descending)?
+            };
+            Some((property.name.clone(), retained.clone()))
         })
         .collect();
     let mut rows: Vec<HashMap<String, Value>> = vec![ordering_properties];
@@ -2986,7 +2993,7 @@ impl DatastoreStorage {
                 filtered_entities = filtered_entities
                     .into_iter()
                     .flat_map(|candidate| {
-                        expand_projection_rows(candidate, &projected_names, &order)
+                        expand_projection_rows(candidate, &projected_names, &distinct_on, &order)
                     })
                     .collect();
             }
