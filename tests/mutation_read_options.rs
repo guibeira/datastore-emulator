@@ -39,6 +39,107 @@ fn int(n: i64) -> Value {
 fn array(values: Vec<Value>) -> Value {
     value(ValueType::ArrayValue(ArrayValue { values }))
 }
+
+fn timestamp(nanos: i32) -> Value {
+    value(ValueType::TimestampValue(pbjson_types::Timestamp {
+        seconds: 1730000000,
+        nanos,
+    }))
+}
+
+#[tokio::test]
+async fn array_append_compares_timestamp_input_at_microsecond_precision() {
+    let storage = Storage::default();
+    let mut mutation = upsert(entity(
+        "one",
+        &[("items", array(vec![timestamp(123456789)]))],
+    ));
+    mutation.property_transforms = vec![transform(
+        "items",
+        TransformType::AppendMissingElements(ArrayValue {
+            values: vec![timestamp(123456000)],
+        }),
+    )];
+    commit(&storage, vec![mutation]).await.unwrap();
+    assert_eq!(
+        stored(&storage, "one").properties["items"],
+        array(vec![timestamp(123456000)])
+    );
+}
+
+#[tokio::test]
+async fn array_remove_compares_timestamp_operands_at_microsecond_precision() {
+    let storage = Storage::default();
+    commit(
+        &storage,
+        vec![upsert(entity(
+            "one",
+            &[("items", array(vec![timestamp(123456000)]))],
+        ))],
+    )
+    .await
+    .unwrap();
+    let mut mutation = upsert(entity("one", &[]));
+    mutation.property_mask = Some(PropertyMask::default());
+    mutation.property_transforms = vec![transform(
+        "items",
+        TransformType::RemoveAllFromArray(ArrayValue {
+            values: vec![timestamp(123456789)],
+        }),
+    )];
+    commit(&storage, vec![mutation]).await.unwrap();
+    assert_eq!(stored(&storage, "one").properties["items"], array(vec![]));
+}
+
+#[tokio::test]
+async fn timestamp_equality_is_consistent_in_indexed_and_historical_queries() {
+    let storage = Storage::default();
+    let time = commit(
+        &storage,
+        vec![upsert(entity("one", &[("time", timestamp(123456000))]))],
+    )
+    .await
+    .unwrap()
+    .commit_time
+    .unwrap();
+    for (op, expected) in [(5, 1), (6, 1), (9, 0), (13, 0)] {
+        for historical in [false, true] {
+            let mut query = query();
+            let filter_value = if matches!(op, 6 | 13) {
+                array(vec![timestamp(123456999)])
+            } else {
+                timestamp(123456999)
+            };
+            query.filter = Some(Filter {
+                filter_type: Some(filter::FilterType::PropertyFilter(PropertyFilter {
+                    property: Some(PropertyReference {
+                        name: "time".into(),
+                    }),
+                    op,
+                    value: Some(filter_value),
+                })),
+            });
+            let response = core::run_query(
+                &storage,
+                RunQueryRequest {
+                    project_id: "p".into(),
+                    read_options: historical.then_some(ReadOptions {
+                        consistency_type: Some(ConsistencyType::ReadTime(time)),
+                    }),
+                    query_type: Some(run_query_request::QueryType::Query(query)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.batch.unwrap().entity_results.len(),
+                expected,
+                "op={op}, historical={historical}"
+            );
+        }
+    }
+}
 fn entity(name: &str, props: &[(&str, Value)]) -> Entity {
     Entity {
         key: Some(key(name)),

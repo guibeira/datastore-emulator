@@ -169,18 +169,23 @@ fn oversized_indexed_value<'a>(value: &'a Value, name: &'a str) -> Option<&'a st
     }
 }
 
-fn normalize_entity_arrays(entity: &mut Entity) {
+pub(crate) fn normalize_entity_values(entity: &mut Entity) {
     for value in entity.properties.values_mut() {
-        normalize_value_arrays(value);
+        normalize_value(value);
     }
 }
 
-fn normalize_value_arrays(value: &mut Value) {
+fn normalize_value(value: &mut Value) {
     match value.value_type.as_mut() {
-        Some(ValueType::EntityValue(entity)) => normalize_entity_arrays(entity),
+        Some(ValueType::TimestampValue(timestamp))
+            if (0..1_000_000_000).contains(&timestamp.nanos) =>
+        {
+            timestamp.nanos = timestamp.nanos / 1000 * 1000;
+        }
+        Some(ValueType::EntityValue(entity)) => normalize_entity_values(entity),
         Some(ValueType::ArrayValue(array)) => {
             for element in &mut array.values {
-                normalize_value_arrays(element);
+                normalize_value(element);
             }
             // The Google emulator stores indexed elements before unindexed elements.
             array
@@ -234,11 +239,26 @@ fn prepare_mutation(
     previous: Option<&Entity>,
     time: &pbjson_types::Timestamp,
 ) -> Result<Vec<Value>, Status> {
+    if let Some(Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity)) =
+        mutation.operation.as_mut()
+    {
+        normalize_entity_values(entity);
+    }
+    for transform in &mut mutation.property_transforms {
+        if let Some(
+            TransformType::AppendMissingElements(array) | TransformType::RemoveAllFromArray(array),
+        ) = transform.transform_type.as_mut()
+        {
+            for value in &mut array.values {
+                normalize_value(value);
+            }
+        }
+    }
     let results = crate::mutation::prepare(mutation, previous, time)?;
     if let Some(operation) = mutation.operation.as_mut() {
         match operation {
             Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
-                normalize_entity_arrays(entity)
+                normalize_entity_values(entity)
             }
             Operation::Delete(_) => {}
         }
@@ -844,7 +864,7 @@ pub async fn commit(
         if let Some(mutation) = mutation.operation {
             match mutation {
                 Operation::Insert(mut entity) => {
-                    normalize_entity_arrays(&mut entity);
+                    normalize_entity_values(&mut entity);
                     let allocates_key = entity.key.as_ref().is_some_and(key_is_incomplete);
                     if !allocates_key
                         && let Some(key) = entity.key.as_ref()
@@ -867,7 +887,7 @@ pub async fn commit(
                     }
                 }
                 Operation::Update(mut entity) => {
-                    normalize_entity_arrays(&mut entity);
+                    normalize_entity_values(&mut entity);
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for update"));
                     };
@@ -887,7 +907,7 @@ pub async fn commit(
                     mutation_results.push(commit_mutation_result(None, version as i64));
                 }
                 Operation::Upsert(mut entity) => {
-                    normalize_entity_arrays(&mut entity);
+                    normalize_entity_values(&mut entity);
                     let Some(key) = entity.key.as_ref() else {
                         return Err(Status::invalid_argument("Entity missing key for upsert"));
                     };
