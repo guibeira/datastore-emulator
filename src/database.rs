@@ -242,7 +242,8 @@ fn push_indexable_value(buf: &mut Vec<u8>, value_type: &ValueType) -> bool {
             if DateTime::from_timestamp(t.seconds, t.nanos as u32).is_none() {
                 return false;
             }
-            write!(buf, "t:{}:{}", t.seconds, t.nanos).expect("write to a Vec");
+            // Match timestamp comparisons and the API's microsecond precision.
+            write!(buf, "t:{}:{}", t.seconds, t.nanos / 1000).expect("write to a Vec");
         }
         ValueType::KeyValue(key) => {
             buf.extend_from_slice(b"k:");
