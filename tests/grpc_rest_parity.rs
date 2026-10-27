@@ -90,3 +90,68 @@ async fn grpc_and_rest_lookup_return_same_data() {
     assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["kind"], "Task");
     assert_eq!(v["found"][0]["entity"]["key"]["path"][0]["name"], "abc");
 }
+
+#[tokio::test]
+async fn rest_commit_and_lookup_normalize_missing_key_projects_from_the_url() {
+    let state = AppState {
+        storage: Arc::new(RwLock::new(DatastoreStorage::default())),
+        operations: Default::default(),
+    };
+    let app = create_router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/projects/p1:commit")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "mode": "NON_TRANSACTIONAL",
+                        "mutations": [{"upsert": {
+                            "key": {"path": [{"kind": "Task", "name": "bare"}]}
+                        }}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    for partition in [
+        serde_json::Value::Null,
+        serde_json::json!({"projectId": "p1"}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/projects/p1:lookup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "keys": [{
+                                "partitionId": partition,
+                                "path": [{"kind": "Task", "name": "bare"}]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            data["found"][0]["entity"]["key"]["partitionId"]["projectId"],
+            "p1"
+        );
+    }
+}
