@@ -155,3 +155,75 @@ async fn rest_commit_and_lookup_normalize_missing_key_projects_from_the_url() {
         );
     }
 }
+
+#[tokio::test]
+async fn rest_masks_transforms_and_historical_reads_share_the_core_behavior() {
+    async fn post(app: axum::Router, method: &str, body: serde_json::Value) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/projects/p1:{method}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let app = create_router(AppState {
+        storage: Default::default(),
+        operations: Default::default(),
+    });
+    let key = serde_json::json!({"path": [{"kind": "Task", "name": "masked"}]});
+    let first = post(
+        app.clone(),
+        "commit",
+        serde_json::json!({
+            "mode": "NON_TRANSACTIONAL", "mutations": [{"upsert": {"key": key,
+                "properties": {"count": {"integerValue": "1"}, "keep": {"stringValue": "yes"}}}}]
+        }),
+    )
+    .await;
+    let response = post(app.clone(), "commit", serde_json::json!({
+        "mode": "NON_TRANSACTIONAL", "mutations": [{"upsert": {"key": key,
+            "properties": {"count": {"integerValue": "4"}}}, "propertyMask": {"paths": ["count"]},
+            "propertyTransforms": [{"property": "count", "increment": {"integerValue": "2"}}]}]
+    })).await;
+    assert_eq!(
+        response["mutationResults"][0]["transformResults"][0]["integerValue"],
+        "6"
+    );
+    let current = post(
+        app.clone(),
+        "lookup",
+        serde_json::json!({"keys": [key],
+        "readOptions": {"newTransaction": {"readOnly": {}}}}),
+    )
+    .await;
+    assert_eq!(
+        current["found"][0]["entity"]["properties"]["count"]["integerValue"],
+        "6"
+    );
+    assert_eq!(
+        current["found"][0]["entity"]["properties"]["keep"]["stringValue"],
+        "yes"
+    );
+    assert!(!current["transaction"].as_str().unwrap().is_empty());
+    let past = post(
+        app,
+        "lookup",
+        serde_json::json!({"keys": [key],
+        "readOptions": {"readTime": first["commitTime"]}}),
+    )
+    .await;
+    assert_eq!(
+        past["found"][0]["entity"]["properties"]["count"]["integerValue"],
+        "1"
+    );
+}

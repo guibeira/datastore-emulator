@@ -1,6 +1,4 @@
-use crate::database::{
-    DatastoreStorage, EntityWithMetadata, KeyStruct, QueryCandidate, TransactionState,
-};
+use crate::database::{DatastoreStorage, EntityWithMetadata, KeyStruct, QueryCandidate};
 use crate::google::datastore::v1::{
     AggregationResult, AggregationResultBatch, AllocateIdsRequest, AllocateIdsResponse,
     BeginTransactionRequest, BeginTransactionResponse, CommitRequest, CommitResponse, Entity,
@@ -15,7 +13,7 @@ use crate::google::datastore::v1::{
     key::path_element::IdType,
     mutation::Operation,
     property_order,
-    read_options::ConsistencyType,
+    property_transform::TransformType,
     transaction_options,
     value::ValueType,
 };
@@ -40,13 +38,13 @@ pub(crate) fn system_time_to_timestamp(time: SystemTime) -> pbjson_types::Timest
     match time.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(duration) => pbjson_types::Timestamp {
             seconds: duration.as_secs() as i64,
-            nanos: duration.subsec_nanos() as i32,
+            nanos: (duration.subsec_nanos() / 1000 * 1000) as i32,
         },
         Err(_) => pbjson_types::Timestamp::default(),
     }
 }
 
-fn next_transaction_id(prefix: &str) -> String {
+pub(crate) fn next_transaction_id(prefix: &str) -> String {
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -231,6 +229,24 @@ fn validate_mutation(operation: &Operation) -> Result<(), Status> {
     }
 }
 
+fn prepare_mutation(
+    mutation: &mut Mutation,
+    previous: Option<&Entity>,
+    time: &pbjson_types::Timestamp,
+) -> Result<Vec<Value>, Status> {
+    let results = crate::mutation::prepare(mutation, previous, time)?;
+    if let Some(operation) = mutation.operation.as_mut() {
+        match operation {
+            Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
+                normalize_entity_arrays(entity)
+            }
+            Operation::Delete(_) => {}
+        }
+        validate_mutation(operation)?;
+    }
+    Ok(results)
+}
+
 /// Transactional commits are all-or-nothing, so the preconditions the apply
 /// loop would hit (insert of an existing key, update of a missing key) are
 /// checked up front. Earlier mutations of the same request count: a key
@@ -397,30 +413,53 @@ pub async fn lookup(
         normalize_key_project(key, &req.project_id);
         check_request_database(&req.database_id, key.partition_id.as_ref())?;
     }
-    if let Some(ConsistencyType::Transaction(transaction)) = req
-        .read_options
-        .as_ref()
-        .and_then(|options| options.consistency_type.as_ref())
-    {
-        let id = std::str::from_utf8(transaction).map_err(|_| invalid_transaction())?;
+    let context = crate::read::context(
+        storage,
+        req.read_options.as_ref(),
+        &req.project_id,
+        &req.database_id,
+    )?;
+    let mut response = if let Some(id) = &context.id {
         let mut storage = storage.write();
-        let DatastoreStorage {
-            entities,
-            transactions,
-            ..
-        } = &mut *storage;
-        let transaction = transactions.get_mut(id).ok_or_else(invalid_transaction)?;
-        return Ok(lookup_response(&req.keys, |key| {
+        if !storage.transactions.contains_key(id) {
+            return Err(invalid_transaction());
+        }
+        lookup_response(&req.keys, |key| {
             let key = KeyStruct::from_datastore_key(key);
-            transaction
-                .reads
-                .entry(key.clone())
-                .or_insert_with(|| entities.get(&key).cloned())
-                .clone()
-        }));
-    }
-    let storage = storage.read();
-    Ok(lookup_response(&req.keys, |key| storage.get_entity(key)))
+            let entity = context.time.as_ref().map_or_else(
+                || storage.entities.get(&key).cloned(),
+                |time| storage.entity_at(&key, time),
+            );
+            let changed = match (storage.entities.get(&key), &entity) {
+                (Some(current), Some(snapshot)) => !Arc::ptr_eq(current, snapshot),
+                (None, None) => false,
+                _ => true,
+            };
+            let transaction = storage
+                .transactions
+                .get_mut(id)
+                .expect("validated transaction");
+            if !transaction.read_only && changed {
+                transaction.conflicted = true;
+            }
+            transaction.reads.entry(key).or_insert(entity).clone()
+        })
+    } else {
+        let storage = storage.read();
+        lookup_response(&req.keys, |key| {
+            context.time.as_ref().map_or_else(
+                || storage.get_entity(key),
+                |time| storage.entity_at(&KeyStruct::from_datastore_key(key), time),
+            )
+        })
+    };
+    response.transaction = context.transaction;
+    response.read_time = Some(
+        context
+            .time
+            .unwrap_or_else(|| system_time_to_timestamp(SystemTime::now())),
+    );
+    Ok(response)
 }
 
 fn lookup_response(
@@ -522,25 +561,57 @@ pub async fn run_query(
         validate_kindless_query(&query_obj)?;
     }
 
+    let context = crate::read::context(
+        storage,
+        req.read_options.as_ref(),
+        &req.project_id,
+        &req.database_id,
+    )?;
+    if let Some(id) = &context.id {
+        storage.write().observe_query(
+            id,
+            &req.project_id,
+            &req.database_id,
+            namespace,
+            query_obj.kind.first().map(|kind| kind.name.as_str()),
+        )?;
+    }
     let storage = storage.read();
     let (candidates, candidates_prefiltered): (
         Box<dyn Iterator<Item = QueryCandidate> + '_>,
         bool,
-    ) = match query_obj.kind.first() {
-        Some(kind) => storage.query_candidates(
-            &req.project_id,
-            &kind.name,
-            &req.database_id,
-            namespace,
-            filter_type.as_ref(),
-        ),
-        None => (
-            Box::new(storage.kindless_candidates(&req.project_id, &req.database_id, namespace)),
+    ) = if let Some(time) = context.time.as_ref().filter(|_| {
+        query_obj
+            .kind
+            .first()
+            .is_none_or(|kind| !crate::database::METADATA_KINDS.contains(&kind.name.as_str()))
+    }) {
+        (
+            Box::new(storage.historical_candidates(
+                &req.project_id,
+                &req.database_id,
+                namespace,
+                query_obj.kind.first().map(|kind| kind.name.as_str()),
+                time,
+            )),
             false,
-        ),
+        )
+    } else {
+        match query_obj.kind.first() {
+            Some(kind) => storage.query_candidates(
+                &req.project_id,
+                &kind.name,
+                &req.database_id,
+                namespace,
+                filter_type.as_ref(),
+            ),
+            None => (
+                Box::new(storage.kindless_candidates(&req.project_id, &req.database_id, namespace)),
+                false,
+            ),
+        }
     };
-
-    let batch = DatastoreStorage::get_entities_from_candidates(
+    let mut batch = DatastoreStorage::get_entities_from_candidates(
         candidates,
         filter_type.as_ref(),
         candidates_prefiltered,
@@ -552,6 +623,11 @@ pub async fn run_query(
         query_obj.distinct_on.clone(),
         order,
     )?;
+    batch.read_time = Some(
+        context
+            .time
+            .unwrap_or_else(|| system_time_to_timestamp(SystemTime::now())),
+    );
     drop(storage);
     let explain_metrics = if let Some(start) = start {
         let mut fields = HashMap::new();
@@ -587,7 +663,7 @@ pub async fn run_query(
     };
 
     Ok(RunQueryResponse {
-        transaction: vec![],
+        transaction: context.transaction,
         query: None,
         batch: Some(batch),
         explain_metrics,
@@ -639,6 +715,24 @@ pub async fn commit(
     };
 
     for mutation in &mut req.mutations {
+        for transform in &mut mutation.property_transforms {
+            match transform.transform_type.as_mut() {
+                Some(
+                    TransformType::Increment(value)
+                    | TransformType::Maximum(value)
+                    | TransformType::Minimum(value),
+                ) => normalize_value_projects(value, &req.project_id),
+                Some(
+                    TransformType::AppendMissingElements(array)
+                    | TransformType::RemoveAllFromArray(array),
+                ) => {
+                    for value in &mut array.values {
+                        normalize_value_projects(value, &req.project_id);
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(operation) = mutation.operation.as_mut() {
             match operation {
                 Operation::Insert(entity)
@@ -666,6 +760,9 @@ pub async fn commit(
             .transactions
             .get(tx_id)
             .ok_or_else(invalid_transaction)?;
+        if transaction.project_id != req.project_id || transaction.database_id != req.database_id {
+            return Err(invalid_transaction());
+        }
         if transaction.read_only && !req.mutations.is_empty() {
             return Err(Status::invalid_argument(
                 "Cannot perform mutations in a read-only transaction.",
@@ -687,7 +784,63 @@ pub async fn commit(
     let mut mutation_results = Vec::with_capacity(req.mutations.len());
     let commit_time = system_time_to_timestamp(SystemTime::now());
 
-    for mutation in req.mutations {
+    // Finish validation before a transactional write can change any index.
+    let transactional = is_transactional || transaction_id.is_some();
+    let mut prepared_results = vec![Vec::new(); req.mutations.len()];
+    if transactional
+        && req.mutations.iter().any(|mutation| {
+            mutation.property_mask.is_some()
+                || !mutation.property_transforms.is_empty()
+                || mutation.operation.is_none()
+        })
+    {
+        let mut staged: HashMap<KeyStruct, Option<Entity>> = HashMap::new();
+        for (index, mutation) in req.mutations.iter_mut().enumerate() {
+            let key = mutation
+                .operation
+                .as_ref()
+                .and_then(mutation_key)
+                .filter(|key| !key_is_incomplete(key))
+                .map(KeyStruct::from_datastore_key);
+            let previous = key.as_ref().and_then(|key| {
+                staged.get(key).cloned().unwrap_or_else(|| {
+                    storage
+                        .entities
+                        .get(key)
+                        .map(|metadata| metadata.entity.clone())
+                })
+            });
+            prepared_results[index] = prepare_mutation(mutation, previous.as_ref(), &commit_time)?;
+            if let Some(key) = key {
+                let entity = match &mutation.operation {
+                    Some(
+                        Operation::Insert(entity)
+                        | Operation::Update(entity)
+                        | Operation::Upsert(entity),
+                    ) => Some(entity.clone()),
+                    _ => None,
+                };
+                staged.insert(key, entity);
+            }
+        }
+    }
+
+    for (index, mut mutation) in req.mutations.into_iter().enumerate() {
+        let transform_results = if transactional {
+            std::mem::take(&mut prepared_results[index])
+        } else {
+            let previous = mutation
+                .operation
+                .as_ref()
+                .and_then(mutation_key)
+                .filter(|key| !key_is_incomplete(key))
+                .and_then(|key| storage.get_entity(key));
+            prepare_mutation(
+                &mut mutation,
+                previous.as_ref().map(|metadata| &metadata.entity),
+                &commit_time,
+            )?
+        };
         if let Some(mutation) = mutation.operation {
             match mutation {
                 Operation::Insert(mut entity) => {
@@ -768,18 +921,22 @@ pub async fn commit(
                     }
                 }
                 Operation::Delete(key_to_delete) => {
-                    let version = match storage.delete_entity(&key_to_delete) {
-                        Some(removed) => removed.version as i64 + 1,
-                        None => {
-                            tracing::warn!(
-                                "Entity not found for deletion with key: {:?}",
-                                key_to_delete.path
-                            );
-                            1
-                        }
-                    };
+                    let version =
+                        match storage.delete_entity_at(&key_to_delete, commit_time.clone()) {
+                            Some(removed) => removed.version as i64 + 1,
+                            None => {
+                                tracing::warn!(
+                                    "Entity not found for deletion with key: {:?}",
+                                    key_to_delete.path
+                                );
+                                1
+                            }
+                        };
                     mutation_results.push(commit_mutation_result(None, version));
                 }
+            }
+            if let Some(result) = mutation_results.last_mut() {
+                result.transform_results = transform_results;
             }
         }
     }
@@ -801,22 +958,12 @@ pub async fn begin_transaction(
     req: BeginTransactionRequest,
 ) -> Result<BeginTransactionResponse, Status> {
     tracing::debug!("Received BeginTransactionRequest: {:?}", req);
-    let transaction_id = next_transaction_id("tx");
-
-    let transaction_bytes = transaction_id.as_bytes().to_vec();
-    let read_only = req.transaction_options.as_ref().is_some_and(|options| {
-        matches!(options.mode, Some(transaction_options::Mode::ReadOnly(_)))
-    });
-    {
-        let mut storage = storage.write();
-        storage.transactions.insert(
-            transaction_id,
-            TransactionState {
-                read_only,
-                ..Default::default()
-            },
-        );
-    }
+    let transaction_bytes = crate::read::start_transaction(
+        &mut storage.write(),
+        req.transaction_options.as_ref(),
+        &req.project_id,
+        &req.database_id,
+    )?;
 
     let transaction_response = BeginTransactionResponse {
         transaction: transaction_bytes,
@@ -838,9 +985,16 @@ pub async fn rollback(
     };
 
     let mut storage = storage.write();
-    if storage.transactions.remove(&transaction_id).is_none() {
+    if storage
+        .transactions
+        .get(&transaction_id)
+        .is_none_or(|transaction| {
+            transaction.project_id != req.project_id || transaction.database_id != req.database_id
+        })
+    {
         return Err(invalid_transaction());
     }
+    storage.clean_transaction(&transaction_id);
     tracing::debug!("Transaction {} rolled back successfully", transaction_id);
 
     Ok(RollbackResponse {})
@@ -966,8 +1120,6 @@ pub async fn run_aggregation_query(
         .partition_id
         .as_ref()
         .map_or("", |p| p.namespace_id.as_str());
-    let storage = storage.read();
-
     // Extract the aggregation query from the request
     let mut aggregation_query = match req.query_type {
         Some(
@@ -1006,8 +1158,28 @@ pub async fn run_aggregation_query(
         aliases.push(alias);
     }
 
-    // Get current time for read_time
-    let read_time = system_time_to_timestamp(SystemTime::now());
+    let context = crate::read::context(
+        storage,
+        req.read_options.as_ref(),
+        &req.project_id,
+        &req.database_id,
+    )?;
+    if let Some(id) = &context.id
+        && let Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) =
+            &aggregation_query.query_type
+    {
+        storage.write().observe_query(
+            id,
+            &req.project_id,
+            &req.database_id,
+            namespace,
+            query.kind.first().map(|kind| kind.name.as_str()),
+        )?;
+    }
+    let storage = storage.read();
+    let read_time = context
+        .time
+        .unwrap_or_else(|| system_time_to_timestamp(SystemTime::now()));
 
     let matching_entities: Vec<QueryCandidate> = match aggregation_query.query_type.as_ref() {
         Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) => {
@@ -1017,23 +1189,40 @@ pub async fn run_aggregation_query(
             let (candidates, candidates_prefiltered): (
                 Box<dyn Iterator<Item = QueryCandidate> + '_>,
                 bool,
-            ) = match query.kind.first() {
-                Some(kind) => storage.query_candidates(
-                    &req.project_id,
-                    &kind.name,
-                    &req.database_id,
-                    namespace,
-                    filter_type.as_ref(),
-                ),
-                // An empty kind list is a kindless query over the whole namespace.
-                None => (
-                    Box::new(storage.kindless_candidates(
+            ) = if let Some(time) = context.time.as_ref().filter(|_| {
+                query.kind.first().is_none_or(|kind| {
+                    !crate::database::METADATA_KINDS.contains(&kind.name.as_str())
+                })
+            }) {
+                (
+                    Box::new(storage.historical_candidates(
                         &req.project_id,
                         &req.database_id,
                         namespace,
+                        query.kind.first().map(|kind| kind.name.as_str()),
+                        time,
                     )),
                     false,
-                ),
+                )
+            } else {
+                match query.kind.first() {
+                    Some(kind) => storage.query_candidates(
+                        &req.project_id,
+                        &kind.name,
+                        &req.database_id,
+                        namespace,
+                        filter_type.as_ref(),
+                    ),
+                    // An empty kind list is a kindless query over the whole namespace.
+                    None => (
+                        Box::new(storage.kindless_candidates(
+                            &req.project_id,
+                            &req.database_id,
+                            namespace,
+                        )),
+                        false,
+                    ),
+                }
             };
             let candidates = candidates.filter(|c| c.entity_metadata.entity.key.is_some());
 
@@ -1069,6 +1258,11 @@ pub async fn run_aggregation_query(
                         .ok_or_else(|| {
                             Status::invalid_argument("Sum aggregation requires a property")
                         })?;
+                if prop_name == "__key__" {
+                    return Err(Status::invalid_argument(
+                        "Aggregations are not supported for the property __key__",
+                    ));
+                }
                 sum_numbers(&indexed_numbers(&matching_entities, prop_name))
             }
             AggregationOperator::Avg(avg) => {
@@ -1079,6 +1273,11 @@ pub async fn run_aggregation_query(
                         .ok_or_else(|| {
                             Status::invalid_argument("Avg aggregation requires a property")
                         })?;
+                if prop_name == "__key__" {
+                    return Err(Status::invalid_argument(
+                        "Aggregations are not supported for the property __key__",
+                    ));
+                }
                 let numbers = indexed_numbers(&matching_entities, prop_name);
                 if numbers.is_empty() {
                     ValueType::NullValue(0)
@@ -1143,7 +1342,7 @@ pub async fn run_aggregation_query(
     Ok(RunAggregationQueryResponse {
         batch: Some(batch),
         query: None,
-        transaction: Vec::new(),
+        transaction: context.transaction,
         explain_metrics,
     })
 }

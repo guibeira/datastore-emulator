@@ -33,7 +33,7 @@ use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
-const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
+pub(crate) const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
 
 fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
     let mut representations = Vec::new();
@@ -1210,7 +1210,11 @@ impl<'de> Deserialize<'de> for EntityWithMetadata {
 #[derive(Debug, Default)]
 pub struct TransactionState {
     pub read_only: bool,
+    pub read_time: Option<pbjson_types::Timestamp>,
+    pub project_id: String,
+    pub database_id: String,
     pub reads: HashMap<KeyStruct, Option<Arc<EntityWithMetadata>>>,
+    pub(crate) query_scopes: HashSet<(String, String, String, Option<String>)>,
     pub conflicted: bool,
 }
 
@@ -1906,12 +1910,123 @@ pub struct DatastoreStorage {
     pub indexes: PropertyIndex,
     // Active transactions
     pub transactions: HashMap<String, TransactionState>,
+    // Versions share entity allocations with the live store. Deleted versions
+    // are tombstones, so a historical read cannot resurrect a deleted entity.
+    history: BTreeMap<Arc<KeyStruct>, Vec<HistoricalVersion>>,
+    history_pruned_at: Option<i64>,
+    pub(crate) history_floor: Option<pbjson_types::Timestamp>,
     // Per-project counters for auto ID allocation. One sequence for all kinds
     // and namespaces, like the Google emulator, so IDs do not repeat across kinds.
     pub entity_id_counters: HashMap<String, AtomicI64>,
 }
 
+#[derive(Debug)]
+struct HistoricalVersion {
+    time: pbjson_types::Timestamp,
+    entity: Option<Arc<EntityWithMetadata>>,
+}
+
+pub(crate) fn timestamp_key(time: &pbjson_types::Timestamp) -> (i64, i32) {
+    (time.seconds, time.nanos)
+}
+
 impl DatastoreStorage {
+    fn record_version(
+        &mut self,
+        key: Arc<KeyStruct>,
+        time: pbjson_types::Timestamp,
+        entity: Option<Arc<EntityWithMetadata>>,
+    ) {
+        let versions = self.history.entry(key).or_default();
+        let position =
+            versions.partition_point(|version| timestamp_key(&version.time) < timestamp_key(&time));
+        let version = HistoricalVersion { time, entity };
+        if versions
+            .get(position)
+            .is_some_and(|old| timestamp_key(&old.time) == timestamp_key(&version.time))
+        {
+            versions[position] = version;
+        } else {
+            versions.insert(position, version);
+        }
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if self.history_pruned_at.is_none_or(|last| now - last >= 60) {
+            let cutoff = now - 3600;
+            self.history.retain(|_, versions| {
+                // Keep the last version preceding the retention window, since
+                // it remains visible until the next write in that window.
+                let before = versions.partition_point(|version| version.time.seconds < cutoff);
+                versions.drain(..before.saturating_sub(1));
+                !(versions.len() == 1
+                    && versions[0].time.seconds < cutoff
+                    && versions[0].entity.is_none())
+            });
+            self.history_pruned_at = Some(now);
+        }
+    }
+
+    pub(crate) fn entity_at(
+        &self,
+        key: &KeyStruct,
+        time: &pbjson_types::Timestamp,
+    ) -> Option<Arc<EntityWithMetadata>> {
+        if let Some(versions) = self.history.get(key) {
+            let end = versions
+                .partition_point(|version| timestamp_key(&version.time) <= timestamp_key(time));
+            return end
+                .checked_sub(1)
+                .and_then(|index| versions[index].entity.clone());
+        }
+        self.entities
+            .get(key)
+            .filter(|entity| timestamp_key(&entity.update_time) <= timestamp_key(time))
+            .cloned()
+    }
+
+    pub(crate) fn historical_candidates<'a>(
+        &'a self,
+        project: &'a str,
+        database: &'a str,
+        namespace: &'a str,
+        kind: Option<&'a str>,
+        time: &'a pbjson_types::Timestamp,
+    ) -> impl Iterator<Item = QueryCandidate> + 'a {
+        // Merge lazily so cursors and limits see key order without collecting
+        // the store's keys. A key present in both maps is yielded only once.
+        let mut live = self.entities.keys().peekable();
+        let mut history = self.history.keys().peekable();
+        std::iter::from_fn(move || match (live.peek(), history.peek()) {
+            (Some(left), Some(right)) => match left.cmp(right) {
+                Ordering::Less => live.next(),
+                Ordering::Greater => history.next(),
+                Ordering::Equal => {
+                    history.next();
+                    live.next()
+                }
+            },
+            (Some(_), None) => live.next(),
+            (None, Some(_)) => history.next(),
+            (None, None) => None,
+        })
+        .filter(move |key| {
+            key.project_id == project
+                && key.database_id == database
+                && key.namespace == namespace
+                && kind.is_none_or(|kind| {
+                    key.path_elements
+                        .last()
+                        .is_some_and(|(name, _)| name == kind)
+                })
+        })
+        .filter_map(move |key| {
+            self.entity_at(key, time)
+                .map(|entity_metadata| QueryCandidate { entity_metadata })
+        })
+    }
+
     fn candidates_from_index_keys<'a, K: Borrow<KeyStruct> + 'a>(
         &'a self,
         project_id_filter: &'a str,
@@ -2288,6 +2403,9 @@ impl DatastoreStorage {
                 Some((Arc::new(key), Arc::new(metadata)))
             })
             .collect();
+        self.history.clear();
+        self.transactions.clear();
+        self.history_floor = Some(crate::core::system_time_to_timestamp(SystemTime::now()));
 
         // Bulk rebuild indexes
         tracing::info!("Rebuilding indexes for {} entities...", self.entities.len());
@@ -2462,6 +2580,22 @@ impl DatastoreStorage {
         };
 
         self.invalidate_transaction_reads(&key_struct);
+
+        // A loaded entity may not have a history entry yet.
+        if !self.history.contains_key(&key_struct)
+            && let Some(previous) = &previous
+        {
+            self.record_version(
+                Arc::clone(&key_struct),
+                previous.update_time.clone(),
+                Some(Arc::clone(previous)),
+            );
+        }
+        self.record_version(
+            Arc::clone(&key_struct),
+            entity_metadata.update_time.clone(),
+            Some(Arc::clone(&entity_metadata)),
+        );
 
         self.entities
             .insert(Arc::clone(&key_struct), Arc::clone(&entity_metadata));
@@ -3435,11 +3569,30 @@ impl DatastoreStorage {
     }
 
     pub fn delete_entity(&mut self, key_to_delete: &Key) -> Option<Arc<EntityWithMetadata>> {
+        self.delete_entity_at(
+            key_to_delete,
+            crate::core::system_time_to_timestamp(SystemTime::now()),
+        )
+    }
+
+    pub(crate) fn delete_entity_at(
+        &mut self,
+        key_to_delete: &Key,
+        time: pbjson_types::Timestamp,
+    ) -> Option<Arc<EntityWithMetadata>> {
         let key_struct_to_delete = KeyStruct::from_datastore_key(key_to_delete);
 
         let (key_struct, removed_entity_metadata) =
             self.entities.remove_entry(&key_struct_to_delete)?;
         self.invalidate_transaction_reads(&key_struct);
+        if !self.history.contains_key(&key_struct) {
+            self.record_version(
+                Arc::clone(&key_struct),
+                removed_entity_metadata.update_time.clone(),
+                Some(Arc::clone(&removed_entity_metadata)),
+            );
+        }
+        self.record_version(Arc::clone(&key_struct), time, None);
         self.remove_from_indexes(&key_struct, &removed_entity_metadata.entity);
         self.remove_ancestor_indexes(&key_struct);
         self.remove_scoped_entity(&key_struct);
@@ -3448,10 +3601,65 @@ impl DatastoreStorage {
 
     fn invalidate_transaction_reads(&mut self, key: &KeyStruct) {
         for transaction in self.transactions.values_mut() {
-            if !transaction.read_only && transaction.reads.contains_key(key) {
+            if !transaction.read_only
+                && (transaction.reads.contains_key(key)
+                    || transaction.query_scopes.iter().any(
+                        |(project, database, namespace, kind)| {
+                            key.project_id == *project
+                                && key.database_id == *database
+                                && key.namespace == *namespace
+                                && kind.as_ref().is_none_or(|kind| {
+                                    key.path_elements
+                                        .last()
+                                        .is_some_and(|(name, _)| name == kind)
+                                })
+                        },
+                    ))
+            {
                 transaction.conflicted = true;
             }
         }
+    }
+
+    pub(crate) fn observe_query(
+        &mut self,
+        id: &str,
+        project: &str,
+        database: &str,
+        namespace: &str,
+        kind: Option<&str>,
+    ) -> Result<(), tonic::Status> {
+        let transaction = self
+            .transactions
+            .get_mut(id)
+            .ok_or_else(|| tonic::Status::invalid_argument("Invalid transaction"))?;
+        if transaction.read_only {
+            return Ok(());
+        }
+        // Changes since the transaction began also conflict when the query is
+        // the first read of its scope. This includes deleted entities.
+        if let Some(time) = &transaction.read_time {
+            transaction.conflicted |= self.history.iter().any(|(key, versions)| {
+                key.project_id == project
+                    && key.database_id == database
+                    && key.namespace == namespace
+                    && kind.is_none_or(|kind| {
+                        key.path_elements
+                            .last()
+                            .is_some_and(|(name, _)| name == kind)
+                    })
+                    && versions
+                        .last()
+                        .is_some_and(|version| timestamp_key(&version.time) > timestamp_key(time))
+            });
+        }
+        transaction.query_scopes.insert((
+            project.to_owned(),
+            database.to_owned(),
+            namespace.to_owned(),
+            kind.map(str::to_owned),
+        ));
+        Ok(())
     }
 }
 
