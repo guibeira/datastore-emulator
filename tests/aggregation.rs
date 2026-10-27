@@ -219,6 +219,23 @@ async fn count_honors_nested_limit_and_offset() {
 }
 
 #[tokio::test]
+async fn count_defaults_projects_in_nested_key_filters() {
+    let storage = storage();
+    let mut target = key("Item", "e2", "");
+    target.partition_id = None;
+    let mut query = kind_query("Item");
+    query.filter = Some(prop_filter(
+        "__key__",
+        property_filter::Operator::Equal,
+        val(ValueType::KeyValue(target)),
+    ));
+    let props = run(&storage, "", query, vec![count_agg("c")])
+        .await
+        .unwrap();
+    assert_eq!(value_of(&props, "c"), Some(ValueType::IntegerValue(1)));
+}
+
+#[tokio::test]
 async fn sum_of_integers_is_integer_and_avg_is_double() {
     let storage = hours_storage(vec![
         ("a", val(ValueType::IntegerValue(5))),

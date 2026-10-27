@@ -545,3 +545,24 @@ async fn delete_returns_non_zero_version() {
     let resp = core::commit(&storage, req).await.expect("delete missing");
     assert_eq!(resp.mutation_results[0].version, 1);
 }
+
+#[tokio::test]
+async fn nontransactional_duplicate_check_uses_normalized_key_projects() {
+    let storage = new_storage();
+    let explicit = key("alias");
+    for partition in [None, Some(PartitionId::default())] {
+        let mut implicit = explicit.clone();
+        implicit.partition_id = partition;
+        let error = commit_non_tx(
+            &storage,
+            vec![
+                upsert(entity(implicit, vec![])),
+                upsert(entity(explicit.clone(), vec![])),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(storage.read().get_entity(&explicit).is_none());
+    }
+}

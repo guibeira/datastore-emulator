@@ -6,7 +6,7 @@ use datastore_emulator::{
     DatastoreStorage, core,
     google::datastore::v1::{
         AllocateIdsRequest, CommitRequest, Entity, Key, KindExpression, LookupRequest, Mutation,
-        PartitionId, Query, RunQueryRequest,
+        PartitionId, Query, ReserveIdsRequest, RunQueryRequest,
         commit_request::Mode,
         key::{PathElement, path_element::IdType},
         mutation::Operation,
@@ -102,6 +102,78 @@ async fn lookup_rejects_a_key_from_another_database() {
         "{}",
         err.message()
     );
+}
+
+#[tokio::test]
+async fn missing_key_projects_use_each_request_project_without_mixing_entities() {
+    let storage = storage();
+    let mut bare_key = key("", "shared");
+    bare_key.partition_id = None;
+    for project in ["first-project", "second-project"] {
+        let mut value = entity("", "shared");
+        value.key = Some(bare_key.clone());
+        let mut request = upsert_request("", vec![value]);
+        request.project_id = project.to_string();
+        core::commit(&storage, request).await.unwrap();
+    }
+    assert_eq!(storage.read().entities.len(), 2);
+
+    for project in ["first-project", "second-project"] {
+        let mut request = lookup_request("", vec![bare_key.clone()]);
+        request.project_id = project.to_string();
+        let response = core::lookup(&storage, request).await.unwrap();
+        let key = response.found[0]
+            .entity
+            .as_ref()
+            .unwrap()
+            .key
+            .as_ref()
+            .unwrap();
+        assert_eq!(key.partition_id.as_ref().unwrap().project_id, project);
+    }
+}
+
+#[tokio::test]
+async fn reserve_ids_defaults_the_project_used_for_later_allocations() {
+    let storage = storage();
+    let reserved = Key {
+        path: vec![PathElement {
+            kind: KIND.to_string(),
+            id_type: Some(IdType::Id(5000)),
+        }],
+        ..Default::default()
+    };
+    core::reserve_ids(
+        &storage,
+        ReserveIdsRequest {
+            project_id: PROJECT.to_string(),
+            keys: vec![reserved],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let response = core::allocate_ids(
+        &storage,
+        AllocateIdsRequest {
+            project_id: PROJECT.to_string(),
+            keys: vec![Key {
+                path: vec![PathElement {
+                    kind: KIND.to_string(),
+                    id_type: None,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response.keys[0].partition_id.as_ref().unwrap().project_id,
+        PROJECT
+    );
+    assert!(matches!(response.keys[0].path[0].id_type, Some(IdType::Id(id)) if id > 5000));
 }
 
 #[tokio::test]

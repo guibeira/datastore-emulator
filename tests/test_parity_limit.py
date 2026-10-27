@@ -99,6 +99,21 @@ def test_highlevel_fetch_limit_zero(rust_client, google_client):
     )
 
 
+@pytest.mark.skipif(USE_REAL_DB, reason="the exact-limit continuation convention targets the Google emulator")
+def test_exact_limit_batch_keeps_a_continuation_cursor(rust_client, google_client):
+    def scenario(c, k):
+        last = _run(c, k, limit=1, offset=4)
+        following = _run(c, k, limit=1, start_cursor=last.end_cursor)
+        return {
+            "count": len(last.entity_results),
+            "more_results": types.QueryResultBatch.MoreResultsType(last.more_results).name,
+            "cursor": bool(last.end_cursor),
+            "following_count": len(following.entity_results),
+        }
+
+    _compare(rust_client, google_client, scenario)
+
+
 # 2
 @more_results_quirk
 def test_raw_limit_equals_count_then_cursor(rust_client, google_client):

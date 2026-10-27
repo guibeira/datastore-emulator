@@ -3121,6 +3121,14 @@ impl DatastoreStorage {
             current_entities_payload_size += result_size_bytes;
         }
 
+        if new_more_results_state == MoreResultsType::NoMoreResults
+            && !cut_by_end_cursor
+            && limit.is_some_and(|limit| limit > 0 && results.len() == limit as usize)
+        {
+            // Like the Google emulator, retain a continuation when the limit is reached.
+            new_more_results_state = MoreResultsType::MoreResultsAfterLimit;
+        }
+
         if new_more_results_state == MoreResultsType::NoMoreResults && cut_by_end_cursor {
             new_more_results_state = MoreResultsType::MoreResultsAfterCursor;
         }
@@ -3964,7 +3972,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_without_order_reports_no_more_results_when_exhausted() {
+    fn limit_without_order_keeps_continuation_when_limit_is_reached() {
         let candidates = (1..=15i64).map(key_only_candidate);
 
         let batch = DatastoreStorage::get_entities_from_candidates(
@@ -3982,7 +3990,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(batch.entity_results.len(), 10);
-        assert_eq!(batch.more_results, MoreResultsType::NoMoreResults as i32);
+        assert_eq!(
+            batch.more_results,
+            MoreResultsType::MoreResultsAfterLimit as i32
+        );
     }
     use crate::google::datastore::import_export::datastore_v3::{
         Path as LegacyPath, Property, PropertyValue, path, property_value,

@@ -65,6 +65,61 @@ fn invalid_transaction() -> Status {
     Status::invalid_argument("Invalid transaction.")
 }
 
+fn normalize_key_project(key: &mut Key, project: &str) {
+    // Fully empty keys are exempt from the API's project normalization rule.
+    if key.path.is_empty()
+        && key.partition_id.as_ref().is_none_or(|partition| {
+            partition.project_id.is_empty()
+                && partition.database_id.is_empty()
+                && partition.namespace_id.is_empty()
+        })
+    {
+        return;
+    }
+    let partition = key.partition_id.get_or_insert_with(Default::default);
+    if partition.project_id.is_empty() {
+        project.clone_into(&mut partition.project_id);
+    }
+}
+
+fn normalize_entity_projects(entity: &mut Entity, project: &str) {
+    if let Some(key) = entity.key.as_mut() {
+        normalize_key_project(key, project);
+    }
+    for value in entity.properties.values_mut() {
+        normalize_value_projects(value, project);
+    }
+}
+
+fn normalize_value_projects(value: &mut Value, project: &str) {
+    match value.value_type.as_mut() {
+        Some(ValueType::KeyValue(key)) => normalize_key_project(key, project),
+        Some(ValueType::EntityValue(entity)) => normalize_entity_projects(entity, project),
+        Some(ValueType::ArrayValue(array)) => {
+            for value in &mut array.values {
+                normalize_value_projects(value, project);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_filter_projects(filter: &mut Filter, project: &str) {
+    match filter.filter_type.as_mut() {
+        Some(FilterType::PropertyFilter(filter)) => {
+            if let Some(value) = filter.value.as_mut() {
+                normalize_value_projects(value, project);
+            }
+        }
+        Some(FilterType::CompositeFilter(filter)) => {
+            for filter in &mut filter.filters {
+                normalize_filter_projects(filter, project);
+            }
+        }
+        None => {}
+    }
+}
+
 fn validate_mutation_key(key: &Key) -> Result<(), Status> {
     if key.path.is_empty() {
         return Err(Status::invalid_argument("Key path is empty."));
@@ -331,14 +386,15 @@ fn effective_query_order(query: &Query) -> Vec<PropertyOrder> {
 
 pub async fn lookup(
     storage: &Arc<RwLock<DatastoreStorage>>,
-    req: LookupRequest,
+    mut req: LookupRequest,
 ) -> Result<LookupResponse, Status> {
     tracing::debug!(
         "Lookup request received: keys={:?} read_options={:?}",
         req.keys,
         req.read_options
     );
-    for key in &req.keys {
+    for key in &mut req.keys {
+        normalize_key_project(key, &req.project_id);
         check_request_database(&req.database_id, key.partition_id.as_ref())?;
     }
     if let Some(ConsistencyType::Transaction(transaction)) = req
@@ -441,10 +497,13 @@ pub async fn run_query(
 ) -> Result<RunQueryResponse, Status> {
     let explain_requested = req.explain_options.is_some();
     let start = explain_requested.then(Instant::now);
-    let query_obj = match req.query_type {
+    let mut query_obj = match req.query_type {
         Some(crate::google::datastore::v1::run_query_request::QueryType::Query(query)) => query,
         _ => return Err(Status::invalid_argument("Missing or invalid query")),
     };
+    if let Some(filter) = query_obj.filter.as_mut() {
+        normalize_filter_projects(filter, &req.project_id);
+    }
     // Datastore requires inequality filters to sort by the inequality
     // property first. If the client did not supply an explicit order,
     // inject an ascending implicit order for each inequality property.
@@ -537,7 +596,7 @@ pub async fn run_query(
 
 pub async fn commit(
     storage: &Arc<RwLock<DatastoreStorage>>,
-    req: CommitRequest,
+    mut req: CommitRequest,
 ) -> Result<CommitResponse, Status> {
     let is_transactional = req.mode == Mode::Transactional as i32;
     let is_non_transactional = req.mode == Mode::NonTransactional as i32;
@@ -579,8 +638,16 @@ pub async fn commit(
         None
     };
 
-    for mutation in &req.mutations {
-        if let Some(operation) = mutation.operation.as_ref() {
+    for mutation in &mut req.mutations {
+        if let Some(operation) = mutation.operation.as_mut() {
+            match operation {
+                Operation::Insert(entity)
+                | Operation::Update(entity)
+                | Operation::Upsert(entity) => {
+                    normalize_entity_projects(entity, &req.project_id);
+                }
+                Operation::Delete(key) => normalize_key_project(key, &req.project_id),
+            }
             validate_mutation(operation)?;
             let partition = mutation_key(operation).and_then(|key| key.partition_id.as_ref());
             check_request_database(&req.database_id, partition)?;
@@ -781,8 +848,11 @@ pub async fn rollback(
 
 pub async fn allocate_ids(
     storage: &Arc<RwLock<DatastoreStorage>>,
-    req: AllocateIdsRequest,
+    mut req: AllocateIdsRequest,
 ) -> Result<AllocateIdsResponse, Status> {
+    for key in &mut req.keys {
+        normalize_key_project(key, &req.project_id);
+    }
     let mut storage = storage.write();
     let mut allocated_keys = Vec::new();
 
@@ -816,8 +886,11 @@ pub async fn allocate_ids(
 
 pub async fn reserve_ids(
     storage: &Arc<RwLock<DatastoreStorage>>,
-    req: ReserveIdsRequest,
+    mut req: ReserveIdsRequest,
 ) -> Result<ReserveIdsResponse, Status> {
+    for key in &mut req.keys {
+        normalize_key_project(key, &req.project_id);
+    }
     let mut storage = storage.write();
     for key in &req.keys {
         if key.path.is_empty() {
@@ -896,7 +969,7 @@ pub async fn run_aggregation_query(
     let storage = storage.read();
 
     // Extract the aggregation query from the request
-    let aggregation_query = match req.query_type {
+    let mut aggregation_query = match req.query_type {
         Some(
             crate::google::datastore::v1::run_aggregation_query_request::QueryType::AggregationQuery(
                 query,
@@ -908,6 +981,13 @@ pub async fn run_aggregation_query(
             ));
         }
     };
+
+    if let Some(crate::google::datastore::v1::aggregation_query::QueryType::NestedQuery(query)) =
+        aggregation_query.query_type.as_mut()
+        && let Some(filter) = query.filter.as_mut()
+    {
+        normalize_filter_projects(filter, &req.project_id);
+    }
 
     // Empty aliases default to `property_N` (1-based position); duplicates are rejected.
     let mut seen_aliases = HashSet::new();

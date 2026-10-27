@@ -226,6 +226,24 @@ async fn more_results_reports_limit_and_exhaustion() {
 }
 
 #[tokio::test]
+async fn exact_limit_keeps_a_cursor_and_empty_continuation_finishes() {
+    let storage = storage_with_things();
+    let mut q = limited(query(), 1);
+    q.offset = (N - 1) as i32;
+    q.order = vec![order("updated", property_order::Direction::Descending)];
+    let last = run(&storage, q.clone()).await.unwrap();
+    assert_eq!(last.entity_results.len(), 1);
+    assert_eq!(more_results(&last), MoreResultsType::MoreResultsAfterLimit);
+
+    q.start_cursor = last.end_cursor.clone();
+    q.offset = 0;
+    let empty = run(&storage, q).await.unwrap();
+    assert!(empty.entity_results.is_empty());
+    assert_eq!(more_results(&empty), MoreResultsType::NoMoreResults);
+    assert_eq!(empty.end_cursor, last.end_cursor);
+}
+
+#[tokio::test]
 async fn mid_page_entity_cursor_resumes_after_that_entity() {
     let storage = storage_with_things();
     for q in [query(), {
