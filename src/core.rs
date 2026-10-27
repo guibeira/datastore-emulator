@@ -133,14 +133,19 @@ fn is_reserved_property_name(name: &str) -> bool {
     name.len() >= 4 && name.starts_with("__") && name.ends_with("__")
 }
 
-fn validate_entity_property_names(entity: &Entity) -> Result<(), Status> {
+fn validate_entity_properties(entity: &Entity, depth: usize) -> Result<(), Status> {
+    if depth > 20 {
+        return Err(Status::invalid_argument(
+            "At most 20 nested entity values are supported.",
+        ));
+    }
     for (name, value) in &entity.properties {
         if is_reserved_property_name(name) {
             return Err(Status::invalid_argument(format!(
                 "The property.name \"{name}\" is reserved."
             )));
         }
-        validate_value_property_names(value)?;
+        validate_value_properties(value, depth)?;
     }
     Ok(())
 }
@@ -196,13 +201,14 @@ fn normalize_value(value: &mut Value) {
     }
 }
 
-fn validate_value_property_names(value: &Value) -> Result<(), Status> {
+fn validate_value_properties(value: &Value, depth: usize) -> Result<(), Status> {
     match value.value_type.as_ref() {
-        Some(ValueType::EntityValue(entity)) => validate_entity_property_names(entity),
+        Some(ValueType::EntityValue(entity)) => validate_entity_properties(entity, depth + 1),
+        // Repeated values share their parent's depth in the Datastore API.
         Some(ValueType::ArrayValue(array)) => array
             .values
             .iter()
-            .try_for_each(validate_value_property_names),
+            .try_for_each(|value| validate_value_properties(value, depth)),
         _ => Ok(()),
     }
 }
@@ -222,7 +228,7 @@ fn validate_mutation(operation: &Operation) -> Result<(), Status> {
     }
     match operation {
         Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity) => {
-            validate_entity_property_names(entity)?;
+            validate_entity_properties(entity, 0)?;
             if let Some(name) = oversized_indexed_property(entity) {
                 return Err(Status::invalid_argument(format!(
                     "The value of property \"{name}\" is longer than 1500 bytes."
