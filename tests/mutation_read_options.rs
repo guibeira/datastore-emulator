@@ -348,6 +348,14 @@ fn query() -> Query {
     }
 }
 async fn count(storage: &Storage, options: ReadOptions) -> RunAggregationQueryResponse {
+    count_query(storage, options, query()).await
+}
+
+async fn count_query(
+    storage: &Storage,
+    options: ReadOptions,
+    query: Query,
+) -> RunAggregationQueryResponse {
     core::run_aggregation_query(
         storage,
         RunAggregationQueryRequest {
@@ -355,7 +363,7 @@ async fn count(storage: &Storage, options: ReadOptions) -> RunAggregationQueryRe
             read_options: Some(options),
             query_type: Some(run_aggregation_query_request::QueryType::AggregationQuery(
                 AggregationQuery {
-                    query_type: Some(aggregation_query::QueryType::NestedQuery(query())),
+                    query_type: Some(aggregation_query::QueryType::NestedQuery(query)),
                     aggregations: vec![aggregation_query::Aggregation {
                         alias: "total".into(),
                         operator: Some(aggregation::Operator::Count(aggregation::Count::default())),
@@ -370,6 +378,150 @@ async fn count(storage: &Storage, options: ReadOptions) -> RunAggregationQueryRe
 }
 fn total(response: &RunAggregationQueryResponse) -> Value {
     response.batch.as_ref().unwrap().aggregation_results[0].aggregate_properties["total"].clone()
+}
+
+#[tokio::test]
+async fn historical_cursor_pages_include_deleted_keys_in_order() {
+    let storage = Storage::default();
+    let time = commit(
+        &storage,
+        vec![
+            upsert(entity("a", &[("x", int(1))])),
+            upsert(entity("b", &[("x", int(2))])),
+            upsert(entity("c", &[("x", int(3))])),
+        ],
+    )
+    .await
+    .unwrap()
+    .commit_time
+    .unwrap();
+    commit(
+        &storage,
+        vec![
+            Mutation {
+                operation: Some(Operation::Delete(key("a"))),
+                ..Default::default()
+            },
+            Mutation {
+                operation: Some(Operation::Delete(key("c"))),
+                ..Default::default()
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let mut cursor = Vec::new();
+    for expected in ["a", "b", "c"] {
+        let mut query = query();
+        query.limit = Some(pbjson_types::Int32Value { value: 1 });
+        query.start_cursor = cursor;
+        let batch = core::run_query(
+            &storage,
+            RunQueryRequest {
+                project_id: "p".into(),
+                read_options: Some(ReadOptions {
+                    consistency_type: Some(ConsistencyType::ReadTime(time)),
+                }),
+                query_type: Some(run_query_request::QueryType::Query(query)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .batch
+        .unwrap();
+        assert_eq!(batch.entity_results.len(), 1);
+        assert_eq!(
+            batch.entity_results[0].entity.as_ref().unwrap().key,
+            Some(key(expected))
+        );
+        cursor = batch.end_cursor;
+    }
+}
+
+#[tokio::test]
+async fn snapshot_queries_and_aggregations_return_metadata() {
+    let storage = Storage::default();
+    let time = commit(&storage, vec![upsert(entity("one", &[("x", int(1))]))])
+        .await
+        .unwrap()
+        .commit_time
+        .unwrap();
+    let transaction = core::begin_transaction(
+        &storage,
+        BeginTransactionRequest {
+            project_id: "p".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .transaction;
+    let mut other = entity("two", &[]);
+    other.key.as_mut().unwrap().path[0].kind = "Other".into();
+    commit(&storage, vec![upsert(other)]).await.unwrap();
+    for consistency in [
+        ConsistencyType::ReadTime(time),
+        ConsistencyType::Transaction(transaction),
+    ] {
+        for kind in ["__kind__", "__namespace__", "__property__"] {
+            let query = Query {
+                kind: vec![KindExpression { name: kind.into() }],
+                ..Default::default()
+            };
+            let options = ReadOptions {
+                consistency_type: Some(consistency.clone()),
+            };
+            let response = core::run_query(
+                &storage,
+                RunQueryRequest {
+                    project_id: "p".into(),
+                    read_options: Some(options.clone()),
+                    query_type: Some(run_query_request::QueryType::Query(query.clone())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!response.batch.unwrap().entity_results.is_empty(), "{kind}");
+            // Metadata remains current even when a historical read is requested.
+            let expected = if kind == "__kind__" { 2 } else { 1 };
+            assert_eq!(
+                total(&count_query(&storage, options, query).await),
+                int(expected)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn masked_incomplete_child_does_not_inherit_parent_fields() {
+    let storage = Storage::default();
+    commit(
+        &storage,
+        vec![upsert(entity(
+            "parent",
+            &[("secret", int(99)), ("x", int(10))],
+        ))],
+    )
+    .await
+    .unwrap();
+    let mut child = entity("parent", &[("own", int(2))]);
+    child.key.as_mut().unwrap().path.push(PathElement {
+        kind: "Child".into(),
+        id_type: None,
+    });
+    let mut mutation = upsert(child);
+    mutation.property_mask = Some(PropertyMask {
+        paths: vec!["own".into()],
+    });
+    mutation.property_transforms = vec![transform("x", TransformType::Increment(int(1)))];
+    let response = commit(&storage, vec![mutation]).await.unwrap();
+    let key = response.mutation_results[0].key.as_ref().unwrap();
+    let child = storage.read().get_entity(key).unwrap();
+    assert!(!child.entity.properties.contains_key("secret"));
+    assert_eq!(child.entity.properties["x"], int(1));
+    assert_eq!(child.entity.properties["own"], int(2));
 }
 
 #[tokio::test]

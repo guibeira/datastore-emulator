@@ -33,7 +33,7 @@ use std::time::SystemTime; // Importing LogReader to read log files
 
 const GRPC_MAX_MESSAGE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const MAX_ENTITIES_PAYLOAD_BYTES: usize = (GRPC_MAX_MESSAGE_SIZE_BYTES as f64 * 0.8) as usize; // 80% of gRPC max message size
-const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
+pub(crate) const METADATA_KINDS: [&str; 3] = ["__kind__", "__namespace__", "__property__"];
 
 fn get_representation_for_value(value: &Value) -> Vec<&'static str> {
     let mut representations = Vec::new();
@@ -1994,27 +1994,37 @@ impl DatastoreStorage {
         kind: Option<&'a str>,
         time: &'a pbjson_types::Timestamp,
     ) -> impl Iterator<Item = QueryCandidate> + 'a {
-        self.entities
-            .keys()
-            .chain(
-                self.history
-                    .keys()
-                    .filter(|key| !self.entities.contains_key(*key)),
-            )
-            .filter(move |key| {
-                key.project_id == project
-                    && key.database_id == database
-                    && key.namespace == namespace
-                    && kind.is_none_or(|kind| {
-                        key.path_elements
-                            .last()
-                            .is_some_and(|(name, _)| name == kind)
-                    })
-            })
-            .filter_map(move |key| {
-                self.entity_at(key, time)
-                    .map(|entity_metadata| QueryCandidate { entity_metadata })
-            })
+        // Merge lazily so cursors and limits see key order without collecting
+        // the store's keys. A key present in both maps is yielded only once.
+        let mut live = self.entities.keys().peekable();
+        let mut history = self.history.keys().peekable();
+        std::iter::from_fn(move || match (live.peek(), history.peek()) {
+            (Some(left), Some(right)) => match left.cmp(right) {
+                Ordering::Less => live.next(),
+                Ordering::Greater => history.next(),
+                Ordering::Equal => {
+                    history.next();
+                    live.next()
+                }
+            },
+            (Some(_), None) => live.next(),
+            (None, Some(_)) => history.next(),
+            (None, None) => None,
+        })
+        .filter(move |key| {
+            key.project_id == project
+                && key.database_id == database
+                && key.namespace == namespace
+                && kind.is_none_or(|kind| {
+                    key.path_elements
+                        .last()
+                        .is_some_and(|(name, _)| name == kind)
+                })
+        })
+        .filter_map(move |key| {
+            self.entity_at(key, time)
+                .map(|entity_metadata| QueryCandidate { entity_metadata })
+        })
     }
 
     fn candidates_from_index_keys<'a, K: Borrow<KeyStruct> + 'a>(

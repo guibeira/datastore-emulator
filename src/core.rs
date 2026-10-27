@@ -580,7 +580,12 @@ pub async fn run_query(
     let (candidates, candidates_prefiltered): (
         Box<dyn Iterator<Item = QueryCandidate> + '_>,
         bool,
-    ) = if let Some(time) = &context.time {
+    ) = if let Some(time) = context.time.as_ref().filter(|_| {
+        query_obj
+            .kind
+            .first()
+            .is_none_or(|kind| !crate::database::METADATA_KINDS.contains(&kind.name.as_str()))
+    }) {
         (
             Box::new(storage.historical_candidates(
                 &req.project_id,
@@ -828,6 +833,7 @@ pub async fn commit(
                 .operation
                 .as_ref()
                 .and_then(mutation_key)
+                .filter(|key| !key_is_incomplete(key))
                 .and_then(|key| storage.get_entity(key));
             prepare_mutation(
                 &mut mutation,
@@ -1183,7 +1189,11 @@ pub async fn run_aggregation_query(
             let (candidates, candidates_prefiltered): (
                 Box<dyn Iterator<Item = QueryCandidate> + '_>,
                 bool,
-            ) = if let Some(time) = &context.time {
+            ) = if let Some(time) = context.time.as_ref().filter(|_| {
+                query.kind.first().is_none_or(|kind| {
+                    !crate::database::METADATA_KINDS.contains(&kind.name.as_str())
+                })
+            }) {
                 (
                     Box::new(storage.historical_candidates(
                         &req.project_id,
@@ -1249,7 +1259,9 @@ pub async fn run_aggregation_query(
                             Status::invalid_argument("Sum aggregation requires a property")
                         })?;
                 if prop_name == "__key__" {
-                    return Err(Status::invalid_argument("Cannot sum the key property"));
+                    return Err(Status::invalid_argument(
+                        "Aggregations are not supported for the property __key__",
+                    ));
                 }
                 sum_numbers(&indexed_numbers(&matching_entities, prop_name))
             }
@@ -1262,7 +1274,9 @@ pub async fn run_aggregation_query(
                             Status::invalid_argument("Avg aggregation requires a property")
                         })?;
                 if prop_name == "__key__" {
-                    return Err(Status::invalid_argument("Cannot average the key property"));
+                    return Err(Status::invalid_argument(
+                        "Aggregations are not supported for the property __key__",
+                    ));
                 }
                 let numbers = indexed_numbers(&matching_entities, prop_name);
                 if numbers.is_empty() {
