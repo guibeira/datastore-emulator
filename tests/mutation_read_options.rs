@@ -204,6 +204,99 @@ fn stored(storage: &Storage, name: &str) -> Entity {
         .clone()
 }
 
+fn nested_entities(levels: usize) -> Value {
+    (0..levels).fold(int(1), |child, _| {
+        value(ValueType::EntityValue(Entity {
+            properties: [("child".into(), child)].into(),
+            ..Default::default()
+        }))
+    })
+}
+
+#[tokio::test]
+async fn nesting_limit_rejects_invalid_entity_before_any_batch_write() {
+    let invalid = entity("one", &[("nested", nested_entities(21))]);
+    for operation in [
+        Operation::Insert(invalid.clone()),
+        Operation::Update(invalid.clone()),
+        Operation::Upsert(invalid),
+    ] {
+        let storage = Storage::default();
+        let original = entity("one", &[("before", int(1))]);
+        commit(&storage, vec![upsert(original.clone())])
+            .await
+            .unwrap();
+        let error = commit(
+            &storage,
+            vec![
+                upsert(entity("other", &[("ok", int(1))])),
+                Mutation {
+                    operation: Some(operation),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "At most 20 nested entity values are supported."
+        );
+        assert!(storage.read().get_entity(&key("other")).is_none());
+        assert_eq!(stored(&storage, "one"), original);
+    }
+}
+
+#[tokio::test]
+async fn nesting_limit_rejects_excessive_depth_created_by_transform() {
+    let storage = Storage::default();
+    let original = entity("one", &[("before", int(1))]);
+    commit(&storage, vec![upsert(original.clone())])
+        .await
+        .unwrap();
+    let mut mutation = upsert(entity("one", &[]));
+    mutation.property_mask = Some(PropertyMask::default());
+    mutation.property_transforms = vec![transform(
+        &vec!["child"; 22].join("."),
+        TransformType::Increment(int(1)),
+    )];
+    let error = commit(&storage, vec![mutation]).await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(stored(&storage, "one"), original);
+}
+
+#[tokio::test]
+async fn nesting_limit_rejects_array_transform_before_transaction_writes() {
+    let storage = Storage::default();
+    let mut mutation = upsert(entity("one", &[]));
+    mutation.property_transforms = vec![transform(
+        "items",
+        TransformType::AppendMissingElements(ArrayValue {
+            values: vec![nested_entities(21)],
+        }),
+    )];
+    let error = core::commit(
+        &storage,
+        CommitRequest {
+            project_id: "p".into(),
+            mode: Mode::Transactional as i32,
+            transaction_selector: Some(TransactionSelector::SingleUseTransaction(
+                TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(Default::default())),
+                },
+            )),
+            mutations: vec![upsert(entity("other", &[("ok", int(1))])), mutation],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(storage.read().get_entity(&key("other")).is_none());
+    assert!(storage.read().get_entity(&key("one")).is_none());
+}
+
 #[tokio::test]
 async fn masks_preserve_other_fields_delete_missing_fields_and_apply_transforms_last() {
     let storage = Storage::default();
