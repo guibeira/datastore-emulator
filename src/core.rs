@@ -169,7 +169,7 @@ fn oversized_indexed_value<'a>(value: &'a Value, name: &'a str) -> Option<&'a st
     }
 }
 
-fn normalize_entity_values(entity: &mut Entity) {
+pub(crate) fn normalize_entity_values(entity: &mut Entity) {
     for value in entity.properties.values_mut() {
         normalize_value(value);
     }
@@ -239,6 +239,21 @@ fn prepare_mutation(
     previous: Option<&Entity>,
     time: &pbjson_types::Timestamp,
 ) -> Result<Vec<Value>, Status> {
+    if let Some(Operation::Insert(entity) | Operation::Update(entity) | Operation::Upsert(entity)) =
+        mutation.operation.as_mut()
+    {
+        normalize_entity_values(entity);
+    }
+    for transform in &mut mutation.property_transforms {
+        if let Some(
+            TransformType::AppendMissingElements(array) | TransformType::RemoveAllFromArray(array),
+        ) = transform.transform_type.as_mut()
+        {
+            for value in &mut array.values {
+                normalize_value(value);
+            }
+        }
+    }
     let results = crate::mutation::prepare(mutation, previous, time)?;
     if let Some(operation) = mutation.operation.as_mut() {
         match operation {

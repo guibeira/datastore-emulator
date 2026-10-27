@@ -544,6 +544,15 @@ fn match_key_against_filter(entity_key: &Key, filter_value: &Value, op: i32) -> 
     }
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (&a.value_type, &b.value_type) {
+        (Some(ValueType::TimestampValue(_)), Some(ValueType::TimestampValue(_))) => {
+            compare_values(a, b).is_eq()
+        }
+        _ => a.value_type == b.value_type,
+    }
+}
+
 fn values_match_filter<'a>(
     entity_values: impl IntoIterator<Item = &'a Value>,
     filter_value: &Value,
@@ -557,27 +566,27 @@ fn values_match_filter<'a>(
         2 => entity_values.any(|v| compare_values(v, filter_value).is_le()),
         3 => entity_values.any(|v| compare_values(v, filter_value).is_gt()),
         4 => entity_values.any(|v| compare_values(v, filter_value).is_ge()),
-        5 => entity_values.any(|v| v.value_type == filter_value.value_type),
+        5 => entity_values.any(|v| values_equal(v, filter_value)),
         6 => {
             if let Some(ValueType::ArrayValue(array_value)) = &filter_value.value_type {
                 entity_values.any(|v| {
                     array_value
                         .values
                         .iter()
-                        .any(|candidate| candidate.value_type == v.value_type)
+                        .any(|candidate| values_equal(candidate, v))
                 })
             } else {
                 false
             }
         }
-        9 => entity_values.any(|v| v.value_type != filter_value.value_type),
+        9 => entity_values.any(|v| !values_equal(v, filter_value)),
         13 => {
             if let Some(ValueType::ArrayValue(array_value)) = &filter_value.value_type {
                 entity_values.any(|v| {
                     !array_value
                         .values
                         .iter()
-                        .any(|candidate| candidate.value_type == v.value_type)
+                        .any(|candidate| values_equal(candidate, v))
                 })
             } else {
                 entity_values.next().is_some()
@@ -2399,7 +2408,8 @@ impl DatastoreStorage {
         tracing::info!("Loading {} entities from '{}'...", entities.len(), path);
         self.entities = entities
             .into_iter()
-            .filter_map(|metadata| {
+            .filter_map(|mut metadata| {
+                crate::core::normalize_entity_values(&mut metadata.entity);
                 let key = KeyStruct::from_datastore_key(metadata.entity.key.as_ref()?);
                 Some((Arc::new(key), Arc::new(metadata)))
             })
@@ -3812,6 +3822,53 @@ mod tests {
         let lowest =
             dedup_distinct_candidates(candidates, &distinct_on, &[order_by("score", false)]);
         assert_eq!(ids(&lowest), vec![1, 4]);
+    }
+
+    #[test]
+    fn loading_older_snapshots_normalizes_timestamp_properties() {
+        let timestamp = |nanos| Value {
+            value_type: Some(ValueType::TimestampValue(pbjson_types::Timestamp {
+                seconds: 1730000000,
+                nanos,
+            })),
+            ..Default::default()
+        };
+        let mut storage = DatastoreStorage::default();
+        let candidate = candidate_with(
+            1,
+            vec![
+                ("time", timestamp(123456789)),
+                ("array", array_value(vec![timestamp(123456789)])),
+                ("nested", entity_value(vec![("time", timestamp(123456789))])),
+            ],
+        );
+        let key = candidate.entity_metadata.entity.key.clone().unwrap();
+        storage.put_entity(candidate.entity_metadata);
+        let path =
+            std::env::temp_dir().join(format!("datastore-timestamp-{}.bin", uuid::Uuid::new_v4()));
+        storage.save_to_disk(path.to_str().unwrap()).unwrap();
+        let mut restored = DatastoreStorage::default();
+        let result = restored.load_from_disk(path.to_str().unwrap());
+        std::fs::remove_file(path).unwrap();
+        result.unwrap();
+        let entity = restored.get_entity(&key).unwrap();
+        assert_eq!(entity.entity.properties["time"], timestamp(123456000));
+        assert_eq!(
+            entity.entity.properties["array"],
+            array_value(vec![timestamp(123456000)])
+        );
+        assert_eq!(
+            entity.entity.properties["nested"],
+            entity_value(vec![("time", timestamp(123456000))])
+        );
+        let filter = equals_filter("time", timestamp(123456999));
+        assert_eq!(
+            restored
+                .query_candidates("p", "Kind", "", "", Some(&filter))
+                .0
+                .count(),
+            1
+        );
     }
 
     fn equals_filter(name: &str, value: Value) -> FilterType {
